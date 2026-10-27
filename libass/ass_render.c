@@ -223,6 +223,7 @@ void ass_renderer_done(ASS_Renderer *render_priv)
     free(render_priv->eimg);
 
     render_context_done(&render_priv->state);
+    ass_aligned_free(render_priv->raster_scratch);
 
     free(render_priv->settings.default_font);
     free(render_priv->settings.default_family);

@@ -197,7 +197,30 @@ bool ass_outline_to_bitmap(RenderContext *state, Bitmap *bm,
             return false;
         window = (ASS_Rect) {left, top, right, bottom};
     }
-    if (!ass_alloc_bitmap(&render_priv->engine, bm, tile_w, tile_h, false))
+    bool crop = clip && (window.x_min || window.y_min ||
+                          window.x_max != tile_w || window.y_max != tile_h);
+    bool borrowed = false;
+    unsigned align = 1 << render_priv->engine.align_order;
+    size_t stride = ass_align(align, tile_w);
+    const size_t scratch_limit = 1024 * 1024;
+    if (crop && stride <= (scratch_limit - align) / tile_h) {
+        size_t needed = stride * tile_h + align;
+        if (needed > render_priv->raster_scratch_size) {
+            size_t capacity = ass_align(65536, needed);
+            uint8_t *buffer = ass_aligned_alloc(align, capacity, false);
+            if (buffer) {
+                ass_aligned_free(render_priv->raster_scratch);
+                render_priv->raster_scratch = buffer;
+                render_priv->raster_scratch_size = capacity;
+            }
+        }
+        if (needed <= render_priv->raster_scratch_size) {
+            *bm = (Bitmap) { .w = tile_w, .h = tile_h, .stride = stride,
+                            .buffer = render_priv->raster_scratch };
+            borrowed = true;
+        }
+    }
+    if (!borrowed && !ass_alloc_bitmap(&render_priv->engine, bm, tile_w, tile_h, false))
         return false;
     bm->left = x_min;
     bm->top  = y_min;
@@ -208,19 +231,18 @@ bool ass_outline_to_bitmap(RenderContext *state, Bitmap *bm,
                              x_min, y_min, bm->stride, tile_h, bm->stride,
                              clip ? &raster_window : NULL)) {
         ass_msg(render_priv->library, MSGL_WARN, "Failed to rasterize glyph!\n");
-        ass_free_bitmap(bm);
+        if (!borrowed) ass_free_bitmap(bm);
         return false;
     }
 
     // Keep the original raster grid and subdivision tree. Moving the raster
     // origin can change edge coverage; discard unused pixels only afterwards.
-    if (clip && (window.x_min || window.y_min ||
-                 window.x_max != tile_w || window.y_max != tile_h)) {
+    if (crop) {
         Bitmap cropped = {0};
         if (!ass_alloc_bitmap(&render_priv->engine, &cropped,
                                window.x_max - window.x_min,
                                window.y_max - window.y_min, false)) {
-            ass_free_bitmap(bm);
+            if (!borrowed) ass_free_bitmap(bm);
             return false;
         }
         cropped.left = bm->left + window.x_min;
@@ -229,7 +251,7 @@ bool ass_outline_to_bitmap(RenderContext *state, Bitmap *bm,
             memcpy(cropped.buffer + y * cropped.stride,
                    bm->buffer + (y + window.y_min) * bm->stride + window.x_min,
                    cropped.stride);
-        ass_free_bitmap(bm);
+        if (!borrowed) ass_free_bitmap(bm);
         *bm = cropped;
     }
 

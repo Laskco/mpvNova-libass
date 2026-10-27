@@ -348,6 +348,8 @@ struct ass_renderer {
     int font_provider;
     bool custom_font_provider;
 #endif
+    uint8_t *raster_scratch;
+    size_t raster_scratch_size;
 };
 
 typedef struct render_priv {
