@@ -81,6 +81,7 @@ jobs:
           ./buildall.sh --arch arm64 -n libass
           # buildall deliberately clears compiler flags. Rebuild only libass with
           # timing enabled after configuration; dependencies remain unchanged.
+          export PATH="$PWD/sdk/android-ndk-r30/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
           cd deps/libass/_build_arm64
           make clean
           make -j2 CPPFLAGS=-DASS_FLE_PROFILE
@@ -97,7 +98,7 @@ jobs:
             profile/fle-bench.c $(pkg-config --cflags --static libass) -c -o collected/fle-bench.o
           "$toolchain/aarch64-linux-android23-clang++" -static-libstdc++ \
             collected/fle-bench.o $(pkg-config --libs --static libass) -o collected/fle-bench
-          cp player/buildscripts/deps/libass/_build_arm64/.libs/libass.a collected/
+          cp player/buildscripts/deps/libass/_build_arm64/libass/.libs/libass.a collected/
           git rev-parse HEAD > collected/revision.txt
           tar -czf collected/subtitle-prefix-arm64.tgz -C player/buildscripts prefix/arm64
       - uses: actions/upload-artifact@v7
