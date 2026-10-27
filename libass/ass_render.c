@@ -1568,6 +1568,10 @@ static inline size_t outline_size(const ASS_Outline* outline)
 size_t ass_bitmap_construct(void *key, void *value, void *priv)
 {
     RenderContext *state = priv;
+#ifdef ASS_FLE_PROFILE
+    ASS_Renderer *render_priv = state->renderer;
+#endif
+    FLE_START;
     BitmapHashKey *k = key;
     Bitmap *bm = value;
 
@@ -1587,6 +1591,10 @@ size_t ass_bitmap_construct(void *key, void *value, void *priv)
         memset(bm, 0, sizeof(*bm));
     ass_outline_free(&outline[0]);
     ass_outline_free(&outline[1]);
+    FLE_PHASE(6);
+#ifdef ASS_FLE_PROFILE
+    render_priv->fle_phase_ns[8] += (uint64_t) bm->w * bm->h;
+#endif
 
     return sizeof(BitmapHashKey) + sizeof(Bitmap) + bitmap_size(bm) +
            sizeof(OutlineHashValue) + outline_size(&k->outline->outline[0]) + outline_size(&k->outline->outline[1]);
@@ -2662,6 +2670,7 @@ int ass_be_padding(int be)
 size_t ass_composite_construct(void *key, void *value, void *priv)
 {
     ASS_Renderer *render_priv = priv;
+    FLE_START;
     CompositeHashKey *k = key;
     CompositeHashValue *v = value;
     memset(v, 0, sizeof(*v));
@@ -2770,6 +2779,11 @@ size_t ass_composite_construct(void *key, void *value, void *priv)
     if ((flags & FILTER_FILL_IN_SHADOW) && !(flags & FILTER_FILL_IN_BORDER))
         ass_fix_outline(&v->bm, &v->bm_o);
 
+    FLE_PHASE(7);
+#ifdef ASS_FLE_PROFILE
+    render_priv->fle_phase_ns[9] += (uint64_t) v->bm.w * v->bm.h +
+            (uint64_t) v->bm_o.w * v->bm_o.h;
+#endif
     return sizeof(CompositeHashKey) + sizeof(CompositeHashValue) +
         k->bitmap_count * sizeof(BitmapRef) +
         bitmap_size(&v->bm) + bitmap_size(&v->bm_o) + bitmap_size(&v->bm_s);
@@ -3471,10 +3485,13 @@ ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
 #ifdef ASS_FLE_PROFILE
     ass_msg(priv->library, MSGL_INFO,
             "FLE_PROFILE,%lld,%d,%" PRIu64 ",%" PRIu64 ",%" PRIu64
-            ",%" PRIu64 ",%" PRIu64 ",%" PRIu64,
+            ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
+            ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64,
             now, cnt, priv->fle_phase_ns[0], priv->fle_phase_ns[1],
             priv->fle_phase_ns[2], priv->fle_phase_ns[3],
-            priv->fle_phase_ns[4], priv->fle_phase_ns[5]);
+            priv->fle_phase_ns[4], priv->fle_phase_ns[5],
+            priv->fle_phase_ns[6], priv->fle_phase_ns[7],
+            priv->fle_phase_ns[8], priv->fle_phase_ns[9]);
 #endif
     return priv->images_root;
 }

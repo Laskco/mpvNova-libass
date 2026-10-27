@@ -339,7 +339,7 @@ struct ass_renderer {
 
     ASS_Style user_override_style;
 #ifdef ASS_FLE_PROFILE
-    uint64_t fle_phase_ns[6];
+    uint64_t fle_phase_ns[10];
 #endif
 };
 
