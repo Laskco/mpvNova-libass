@@ -99,6 +99,9 @@ jobs:
           "$toolchain/aarch64-linux-android23-clang++" -static-libstdc++ \
             collected/fle-bench.o $(pkg-config --libs --static libass) -o collected/fle-bench
           cp player/buildscripts/deps/libass/_build_arm64/libass/.libs/libass.a collected/
+          cp player/buildscripts/deps/libass/_build_arm64/config.h collected/
+          pkg-config --cflags --static libass > collected/cflags.txt
+          pkg-config --libs --static libass > collected/ldflags.txt
           git rev-parse HEAD > collected/revision.txt
           tar -czf collected/subtitle-prefix-arm64.tgz -C player/buildscripts prefix/arm64
       - uses: actions/upload-artifact@v7
