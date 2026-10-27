@@ -174,9 +174,9 @@ void ass_gaussian_blur_bounds(double r2, int *padding, int *alignment)
 {
     BlurMethod blur;
     find_best_method(&blur, r2);
-    // Include the complete shrink/filter/expand support, not merely its
-    // visually significant Gaussian radius. Preserve the sampling grid too.
-    *padding = (2 * blur.radius + 9) << blur.level;
+    // The shrink/expand cascade contributes at most 5 * (2^level - 1)
+    // source pixels per side, in addition to the scaled convolution radius.
+    *padding = ((blur.radius + 5) << blur.level) - 5;
     *alignment = 1 << blur.level;
 }
 
