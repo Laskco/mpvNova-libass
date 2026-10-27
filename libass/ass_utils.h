@@ -181,6 +181,15 @@ static inline long ass_lrint(double x)
     // Unlike GCC and Clang, Visual C++ can't inline lrint() without -fp:fast, so
     // we provide our own implementation
     return _mm_cvtsd_si32(_mm_set_sd(x));
+#elif defined(__arm__) && defined(__ARM_FP) && (__ARM_FP & 8) && (defined(__GNUC__) || defined(__clang__))
+    // VCVTR follows FPSCR rounding, unlike truncating VCVT. Android's 32-bit
+    // libm fallback otherwise saves/restores the FP environment per point.
+    if (x >= INT32_MIN && x <= INT32_MAX) {
+        union { float reg; int32_t value; } rounded;
+        __asm__("vcvtr.s32.f64 %0, %P1" : "=t"(rounded.reg) : "w"(x));
+        return rounded.value;
+    }
+    return lrint(x);
 #else
     return lrint(x);
 #endif
