@@ -6,6 +6,49 @@ on:
 permissions:
   contents: read
 jobs:
+  regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        source: [baseline, candidate]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/checkout@v6
+        with:
+          repository: libass/libass-tests
+          path: art
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y meson ninja-build nasm build-essential pkgconf \
+            libfreetype-dev libfontconfig-dev libharfbuzz-dev libfribidi-dev libpng-dev libunibreak-dev
+      - name: Configure reference or candidate
+        run: |
+          flags=''
+          if [ '${{ matrix.source }}' = baseline ]; then
+            git checkout 0.17.5
+          else
+            flags=-DASS_EVENT_THREADS
+          fi
+          meson setup build --buildtype=debugoptimized -Dc_args="$flags" \
+            -Db_sanitize=address,undefined -Dtest=enabled -Dcompare=enabled \
+            -Dfuzz=enabled -Dcheckasm=enabled -Dart-samples="$PWD/art"
+          meson compile -C build
+      - name: Run upstream regression and malformed-input tests
+        env:
+          LIBASS_RENDER_THREADS: '4'
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: halt_on_error=1
+        run: meson test -C build --timeout-multiplier 4 --print-errorlogs
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: regression-${{ matrix.source }}
+          path: build/meson-logs/testlog.txt
   arm64:
     runs-on: ubuntu-24.04
     timeout-minutes: 30

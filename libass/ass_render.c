@@ -3323,7 +3323,7 @@ static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
         active += event->Start <= now && now < event->Start + event->Duration;
     }
     if (!priv->event_pool) {
-        if (active < 32) return false;
+        if (active < 32 && !getenv("LIBASS_RENDER_THREADS")) return false;
         priv->event_pool = event_pool_init(priv);
         if (!priv->event_pool) return false;
     }
