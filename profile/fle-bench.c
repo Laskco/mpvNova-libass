@@ -17,7 +17,7 @@ static uint64_t clock_ns(void)
 
 static void message(int level, const char *fmt, va_list args, void *data)
 {
-    if (level <= 3 || !strncmp(fmt, "FLE_PROFILE,", 12)) {
+    if (level <= 3 || !strncmp(fmt, "FLE_", 4)) {
         vfprintf(stderr, fmt, args);
         fputc('\n', stderr);
     }

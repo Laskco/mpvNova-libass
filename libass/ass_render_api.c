@@ -212,6 +212,9 @@ void ass_set_cache_limits(ASS_Renderer *render_priv, int glyph_max,
     }
     render_priv->cache.bitmap_max_size = bitmap_cache;
     render_priv->cache.composite_max_size = composite_cache;
+#ifdef ASS_EVENT_THREADS
+    ass_event_pool_cache_limits(render_priv);
+#endif
 }
 
 ASS_FontProvider *
@@ -255,6 +258,7 @@ bool ass_clone_render_settings(ASS_Renderer *dst, const ASS_Renderer *src,
     // These setters do not increment render_id.
     dst->settings.line_spacing = src->settings.line_spacing;
     dst->settings.shaper = src->settings.shaper;
+    dst->settings.use_margins = src->settings.use_margins;
     return true;
 }
 #endif

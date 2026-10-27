@@ -369,6 +369,7 @@ ASS_Vector ass_layout_res(ASS_Renderer *render_priv);
 #ifdef ASS_EVENT_THREADS
 bool ass_clone_render_settings(ASS_Renderer *dst, const ASS_Renderer *src,
                                 unsigned *font_generation, int *render_id);
+void ass_event_pool_cache_limits(ASS_Renderer *renderer);
 #endif
 
 // XXX: this is actually in ass.c, includes should be fixed later on

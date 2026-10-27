@@ -3210,6 +3210,7 @@ typedef struct {
     pthread_t thread;
     unsigned font_generation;
     int render_id, id;
+    uint64_t batch_ns;
 } EventWorker;
 
 struct ass_event_pool {
@@ -3222,10 +3223,35 @@ struct ass_event_pool {
     bool stop;
     ASS_Event **events;
     size_t capacity;
+    size_t glyph_budget, bitmap_budget, composite_budget;
 };
 
-static void event_batch(struct ass_event_pool *pool, ASS_Renderer *renderer, int id)
+static void set_pool_cache_limits(struct ass_event_pool *pool, size_t glyphs,
+                                  size_t bitmaps, size_t composites)
 {
+    pool->glyph_budget = glyphs;
+    pool->bitmap_budget = bitmaps;
+    pool->composite_budget = composites;
+    for (int i = -1; i < pool->count; i++) {
+        ASS_Renderer *renderer = i < 0 ? pool->owner : pool->workers[i].renderer;
+        renderer->cache.glyph_max = glyphs / (pool->count + 1);
+        renderer->cache.bitmap_max_size = bitmaps / (pool->count + 1);
+        renderer->cache.composite_max_size = composites / (pool->count + 1);
+    }
+}
+
+void ass_event_pool_cache_limits(ASS_Renderer *renderer)
+{
+    if (renderer->event_pool)
+        set_pool_cache_limits(renderer->event_pool, renderer->cache.glyph_max,
+                renderer->cache.bitmap_max_size, renderer->cache.composite_max_size);
+}
+
+static uint64_t event_batch(struct ass_event_pool *pool, ASS_Renderer *renderer, int id)
+{
+#ifdef ASS_FLE_PROFILE
+    uint64_t start = fle_clock();
+#endif
     for (int i = 0; i < pool->active; i++) {
         ASS_Event *event = pool->events[i];
         // Stable ownership avoids invalidating the bitmap cache every frame.
@@ -3235,6 +3261,11 @@ static void event_batch(struct ass_event_pool *pool, ASS_Renderer *renderer, int
         if (!ass_render_event(&renderer->state, event, out))
             out->event = NULL;
     }
+#ifdef ASS_FLE_PROFILE
+    return fle_clock() - start;
+#else
+    return 0;
+#endif
 }
 
 static void *event_worker(void *arg)
@@ -3249,7 +3280,7 @@ static void *event_worker(void *arg)
         if (pool->stop) break;
         seen = pool->generation;
         pthread_mutex_unlock(&pool->lock);
-        event_batch(pool, worker->renderer, worker->id);
+        worker->batch_ns = event_batch(pool, worker->renderer, worker->id);
         pthread_mutex_lock(&pool->lock);
         if (!--pool->pending)
             pthread_cond_signal(&pool->done);
@@ -3301,8 +3332,6 @@ static struct ass_event_pool *event_pool_init(ASS_Renderer *owner)
         worker->id = i + 1;
         worker->render_id = -1;
         if (!worker->renderer) { event_pool_done(pool); return NULL; }
-        // Bound additional bitmap/composite caches to 24 MiB per worker.
-        ass_set_cache_limits(worker->renderer, 2500, 24);
         if (pthread_create(&worker->thread, NULL, event_worker, worker)) {
             ass_renderer_done(worker->renderer);
             event_pool_done(pool);
@@ -3310,13 +3339,23 @@ static struct ass_event_pool *event_pool_init(ASS_Renderer *owner)
         }
         pool->count++;
     }
+    // Split, rather than multiply, the caller's original cache budgets.
+    set_pool_cache_limits(pool, owner->cache.glyph_max,
+            owner->cache.bitmap_max_size, owner->cache.composite_max_size);
     return pool;
 }
 
 static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
                                    long long now, int *rendered)
 {
-    if (priv->custom_font_provider) return false;
+    if (priv->custom_font_provider) {
+        if (priv->event_pool) {
+            priv->cache.glyph_max = priv->event_pool->glyph_budget;
+            priv->cache.bitmap_max_size = priv->event_pool->bitmap_budget;
+            priv->cache.composite_max_size = priv->event_pool->composite_budget;
+        }
+        return false;
+    }
     int active = 0;
     for (int i = 0; i < track->n_events; i++) {
         ASS_Event *event = track->events + i;
@@ -3328,6 +3367,7 @@ static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
         if (!priv->event_pool) return false;
     }
     struct ass_event_pool *pool = priv->event_pool;
+    set_pool_cache_limits(pool, pool->glyph_budget, pool->bitmap_budget, pool->composite_budget);
     if (active > pool->capacity) {
         if (!ASS_REALLOC_ARRAY(pool->events, active)) return false;
         pool->capacity = active;
@@ -3359,15 +3399,21 @@ static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
     pool->generation++;
     pthread_cond_broadcast(&pool->work);
     pthread_mutex_unlock(&pool->lock);
-    event_batch(pool, priv, 0);
+    uint64_t main_ns = event_batch(pool, priv, 0);
     pthread_mutex_lock(&pool->lock);
     while (pool->pending)
         pthread_cond_wait(&pool->done, &pool->lock);
     pthread_mutex_unlock(&pool->lock);
 #ifdef ASS_FLE_PROFILE
+    ass_msg(priv->library, MSGL_INFO, "FLE_WORKERS,%lld,%" PRIu64 ",%" PRIu64
+            ",%" PRIu64 ",%" PRIu64, now, main_ns, pool->workers[0].batch_ns,
+            pool->count > 1 ? pool->workers[1].batch_ns : 0,
+            pool->count > 2 ? pool->workers[2].batch_ns : 0);
     for (int i = 0; i < pool->count; i++)
         for (int p = 0; p < 10; p++)
             priv->fle_phase_ns[p] += pool->workers[i].renderer->fle_phase_ns[p];
+#else
+    (void) main_ns;
 #endif
     int cnt = 0;
     for (int i = 0; i < active; i++)
