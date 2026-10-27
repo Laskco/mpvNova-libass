@@ -97,7 +97,8 @@ int main(int argc, char **argv)
     int start = atoi(argv[3]), end = atoi(argv[4]);
     int width = atoi(argv[5]), height = atoi(argv[6]);
     int hash = argc > 7 && !strcmp(argv[7], "hash");
-    int canvas_hash = argc > 7 && !strcmp(argv[7], "canvas");
+    int cycle = argc > 7 && !strcmp(argv[7], "cycle");
+    int canvas_hash = cycle || (argc > 7 && !strcmp(argv[7], "canvas"));
     size_t canvas_size = (size_t) width * height * 4;
     unsigned char *canvas = canvas_hash ? malloc(canvas_size) : NULL;
     if (canvas_hash && !canvas) return 1;
@@ -119,9 +120,23 @@ int main(int argc, char **argv)
     for (int frame = 0; ; frame++) {
         long long pts = start + ((int64_t) frame * 1001000 + 12000) / 24000;
         if (pts >= end) break;
+        if (cycle) {
+            if (frame == 10) { ass_set_margins(renderer, 120, 40, 30, 30); ass_set_use_margins(renderer, 1); }
+            if (frame == 30) ass_set_use_margins(renderer, 0);
+            if (frame == 50) ass_set_line_spacing(renderer, 12);
+            if (frame == 70) ass_set_font_scale(renderer, 1.2);
+            if (frame == 90) ass_set_hinting(renderer, ASS_HINTING_LIGHT);
+            if (frame == 110) ass_set_frame_size(renderer, 1280, 720);
+            if (frame == 130) ass_set_frame_size(renderer, 1920, 1080);
+            if (frame == 150) ass_set_cache_limits(renderer, 1000, 12);
+            if (frame == 170) { ass_set_font_scale(renderer, 1); ass_set_margins(renderer, 0, 0, 0, 0); ass_set_line_spacing(renderer, 0); }
+            if (frame == 190) ass_set_hinting(renderer, ASS_HINTING_NONE);
+            if (frame == 210) ass_set_fonts(renderer, NULL, "sans-serif", ASS_FONTPROVIDER_NONE, NULL, 1);
+        }
+        long long render_pts = cycle && frame >= 120 && frame < 150 ? pts - 2000 : pts;
         int changed;
         uint64_t before = clock_ns();
-        ASS_Image *images = ass_render_frame(renderer, track, pts, &changed);
+        ASS_Image *images = ass_render_frame(renderer, track, render_pts, &changed);
         uint64_t elapsed = clock_ns() - before;
         size_t count = 0, pixels = 0;
         uint64_t digest = UINT64_C(14695981039346656037);
