@@ -23,6 +23,25 @@
 #include <math.h>
 #include <string.h>
 #include <stdbool.h>
+#ifdef ASS_FLE_PROFILE
+#include <stdint.h>
+#include <time.h>
+static uint64_t fle_clock(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+#define FLE_START uint64_t fle_last = fle_clock()
+#define FLE_PHASE(n) do { \
+    uint64_t fle_now = fle_clock(); \
+    render_priv->fle_phase_ns[n] += fle_now - fle_last; \
+    fle_last = fle_now; \
+} while (0)
+#else
+#define FLE_START
+#define FLE_PHASE(n) ((void) 0)
+#endif
 
 #ifdef CONFIG_UNIBREAK
 #include <linebreak.h>
@@ -2811,6 +2830,7 @@ ass_render_event(RenderContext *state, ASS_Event *event,
 
     free_render_context(state);
     init_render_context(state, event);
+    FLE_START;
 
     if (!parse_events(state, event))
         return false;
@@ -2823,6 +2843,7 @@ ass_render_event(RenderContext *state, ASS_Event *event,
     }
 
     split_style_runs(state);
+    FLE_PHASE(0);
 
     // Find shape runs and shape text
     ass_shaper_set_base_direction(state->shaper,
@@ -2836,6 +2857,7 @@ ass_render_event(RenderContext *state, ASS_Event *event,
     }
 
     retrieve_glyphs(state);
+    FLE_PHASE(1);
 
     preliminary_layout(state);
 
@@ -2987,8 +3009,10 @@ ass_render_event(RenderContext *state, ASS_Event *event,
     }
 
     calculate_rotation_params(state, &bbox, device_x, device_y);
+    FLE_PHASE(2);
 
     render_and_combine_glyphs(state, device_x, device_y);
+    FLE_PHASE(3);
 
     memset(event_images, 0, sizeof(*event_images));
     // VSFilter does *not* shift lines with a border > margin to be within the
@@ -3008,9 +3032,11 @@ ass_render_event(RenderContext *state, ASS_Event *event,
 
     if (state->border_style == 4)
         add_background(state, event_images);
+    FLE_PHASE(4);
 
     ass_shaper_cleanup(state->shaper, text_info);
     free_render_context(state);
+    FLE_PHASE(5);
 
     return true;
 }
@@ -3370,6 +3396,9 @@ static ASS_Image *ass_free_image(ASS_Image *img) {
 ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
                             long long now, int *detect_change)
 {
+#ifdef ASS_FLE_PROFILE
+    memset(priv->fle_phase_ns, 0, sizeof(priv->fle_phase_ns));
+#endif
     // init frame
     if (!ass_start_frame(priv, track, now)) {
         if (detect_change)
@@ -3439,6 +3468,14 @@ ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
     if (track->parser_priv->prune_delay >= 0)
         ass_prune_events(track, now - track->parser_priv->prune_delay);
 
+#ifdef ASS_FLE_PROFILE
+    ass_msg(priv->library, MSGL_INFO,
+            "FLE_PROFILE,%lld,%d,%" PRIu64 ",%" PRIu64 ",%" PRIu64
+            ",%" PRIu64 ",%" PRIu64 ",%" PRIu64,
+            now, cnt, priv->fle_phase_ns[0], priv->fle_phase_ns[1],
+            priv->fle_phase_ns[2], priv->fle_phase_ns[3],
+            priv->fle_phase_ns[4], priv->fle_phase_ns[5]);
+#endif
     return priv->images_root;
 }
 

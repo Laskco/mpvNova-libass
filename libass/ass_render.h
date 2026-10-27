@@ -338,6 +338,9 @@ struct ass_renderer {
     BitmapEngine engine;
 
     ASS_Style user_override_style;
+#ifdef ASS_FLE_PROFILE
+    uint64_t fle_phase_ns[6];
+#endif
 };
 
 typedef struct render_priv {
