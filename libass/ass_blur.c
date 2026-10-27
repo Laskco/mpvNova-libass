@@ -170,6 +170,16 @@ static void find_best_method(BlurMethod *blur, double r2)
  * \param r2x in: desired standard deviation along X axis squared
  * \param r2y in: desired standard deviation along Y axis squared
  */
+void ass_gaussian_blur_bounds(double r2, int *padding, int *alignment)
+{
+    BlurMethod blur;
+    find_best_method(&blur, r2);
+    // Include the complete shrink/filter/expand support, not merely its
+    // visually significant Gaussian radius. Preserve the sampling grid too.
+    *padding = (2 * blur.radius + 9) << blur.level;
+    *alignment = 1 << blur.level;
+}
+
 bool ass_gaussian_blur(const BitmapEngine *engine, Bitmap *bm, double r2x, double r2y)
 {
     BlurMethod blur_x, blur_y;

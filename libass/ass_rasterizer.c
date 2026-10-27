@@ -263,7 +263,8 @@ static bool add_cubic(RasterizerData *rst, const ASS_Vector *pt)
 
 
 bool ass_rasterizer_set_outline(RasterizerData *rst,
-                                const ASS_Outline *path, bool extra)
+                                const ASS_Outline *path, bool extra,
+                                const ASS_Rect *clip)
 {
     if (!extra) {
         rectangle_reset(&rst->bbox);
@@ -277,6 +278,7 @@ bool ass_rasterizer_set_outline(RasterizerData *rst,
 #endif
 
     ASS_Vector *start = path->points, *cur = start;
+    size_t contour_start = rst->size[0];
     for (size_t i = 0; i < path->n_segments; i++) {
         int n = path->segments[i] & OUTLINE_COUNT_MASK;
         cur += n;
@@ -313,10 +315,29 @@ bool ass_rasterizer_set_outline(RasterizerData *rst,
         default:
             return false;
         }
+        if (clip && (path->segments[i] & OUTLINE_CONTOUR_END)) {
+            ASS_Rect bounds;
+            rectangle_reset(&bounds);
+            for (size_t k = contour_start; k < rst->size[0]; k++) {
+                struct segment *line = &rst->linebuf[0][k];
+                rectangle_update(&bounds, line->x_min, line->y_min,
+                                  line->x_max, line->y_max);
+            }
+            // Preserve the original overall bounds and raster grid, even for
+            // closed contours that cannot affect a pixel in the window.
+            rectangle_update(&rst->bbox, bounds.x_min, bounds.y_min,
+                              bounds.x_max, bounds.y_max);
+            if ((int64_t) bounds.x_max < (int64_t) clip->x_min * 64 ||
+                (int64_t) bounds.y_max < (int64_t) clip->y_min * 64 ||
+                (int64_t) bounds.x_min > (int64_t) clip->x_max * 64 ||
+                (int64_t) bounds.y_min > (int64_t) clip->y_max * 64)
+                rst->size[0] = contour_start;
+            contour_start = rst->size[0];
+        }
     }
     assert(start == cur && (!cur || cur == path->points + path->n_points));
 
-    for (size_t k = rst->n_first; k < rst->size[0]; k++) {
+    for (size_t k = rst->n_first; !clip && k < rst->size[0]; k++) {
         struct segment *line = &rst->linebuf[0][k];
         rectangle_update(&rst->bbox,
                          line->x_min, line->y_min,
@@ -629,7 +650,8 @@ static inline int get_fill_flags(struct segment *line, size_t n_lines, int windi
  */
 static bool rasterizer_fill_level(const BitmapEngine *engine, RasterizerData *rst,
                                   uint8_t *buf, int width, int height, ptrdiff_t stride,
-                                  int index, const size_t n_lines[2], const int winding[2])
+                                  int index, const size_t n_lines[2], const int winding[2],
+                                  const ASS_Rect *clip, int x0, int y0)
 {
     assert(width > 0 && height > 0);
     assert((unsigned) index < 2u && n_lines[0] + n_lines[1] <= rst->size[index]);
@@ -637,6 +659,11 @@ static bool rasterizer_fill_level(const BitmapEngine *engine, RasterizerData *rs
     assert(!(height & ((1 << engine->tile_order) - 1)));
 
     size_t offs = rst->size[index] - n_lines[0] - n_lines[1];
+    if (clip && (x0 >= clip->x_max || y0 >= clip->y_max ||
+                 x0 + width <= clip->x_min || y0 + height <= clip->y_min)) {
+        rst->size[index] = offs;
+        return true;
+    }
     struct segment *line = rst->linebuf[index] + offs, *line1 = line + n_lines[0];
     int flags0 = get_fill_flags(line,  n_lines[0], winding[0]);
     int flags1 = get_fill_flags(line1, n_lines[1], winding[1]);
@@ -690,11 +717,13 @@ static bool rasterizer_fill_level(const BitmapEngine *engine, RasterizerData *rs
     uint8_t *buf1 = buf;
     int width1  = width;
     int height1 = height;
+    int x1 = x0, y1 = y0;
     size_t n_next0[2], n_next1[2];
     int winding1[2] = { winding[0], winding[1] };
     if (width > height) {
         width = 1 << ilog2(width - 1);
         width1 -= width;
+        x1 += width;
         buf1 += width;
         polyline_split_horz(line, n_lines,
                             dst0, n_next0, dst1, n_next1,
@@ -702,6 +731,7 @@ static bool rasterizer_fill_level(const BitmapEngine *engine, RasterizerData *rs
     } else {
         height = 1 << ilog2(height - 1);
         height1 -= height;
+        y1 += height;
         buf1 += height * stride;
         polyline_split_vert(line, n_lines,
                             dst0, n_next0, dst1, n_next1,
@@ -710,10 +740,12 @@ static bool rasterizer_fill_level(const BitmapEngine *engine, RasterizerData *rs
     rst->size[index ^ 0] = offs  + n_next0[0] + n_next0[1];
     rst->size[index ^ 1] = offs1 + n_next1[0] + n_next1[1];
 
-    if (!rasterizer_fill_level(engine, rst, buf,  width,  height,  stride, index ^ 0, n_next0,  winding))
+    if (!rasterizer_fill_level(engine, rst, buf, width, height, stride,
+                               index ^ 0, n_next0, winding, clip, x0, y0))
         return false;
     assert(rst->size[index ^ 0] == offs);
-    if (!rasterizer_fill_level(engine, rst, buf1, width1, height1, stride, index ^ 1, n_next1, winding1))
+    if (!rasterizer_fill_level(engine, rst, buf1, width1, height1, stride,
+                               index ^ 1, n_next1, winding1, clip, x1, y1))
         return false;
     assert(rst->size[index ^ 1] == offs1);
     return true;
@@ -721,7 +753,8 @@ static bool rasterizer_fill_level(const BitmapEngine *engine, RasterizerData *rs
 
 bool ass_rasterizer_fill(const BitmapEngine *engine, RasterizerData *rst,
                          uint8_t *buf, int x0, int y0,
-                         int width, int height, ptrdiff_t stride)
+                         int width, int height, ptrdiff_t stride,
+                         const ASS_Rect *clip)
 {
     assert(width > 0 && height > 0);
     assert(!(width  & ((1 << engine->tile_order) - 1)));
@@ -781,5 +814,5 @@ bool ass_rasterizer_fill(const BitmapEngine *engine, RasterizerData *rst,
     rst->size[1] = 0;
     return rasterizer_fill_level(engine, rst,
                                  buf, width, height, stride,
-                                 0, n_lines, winding);
+                                 0, n_lines, winding, clip, 0, 0);
 }

@@ -147,15 +147,16 @@ bool ass_copy_bitmap(const BitmapEngine *engine, Bitmap *dst, const Bitmap *src)
 }
 
 bool ass_outline_to_bitmap(RenderContext *state, Bitmap *bm,
-                           ASS_Outline *outline1, ASS_Outline *outline2)
+                           ASS_Outline *outline1, ASS_Outline *outline2,
+                           const ASS_Rect *clip, int clip_align)
 {
     ASS_Renderer *render_priv = state->renderer;
     RasterizerData *rst = &state->rasterizer;
-    if (outline1 && !ass_rasterizer_set_outline(rst, outline1, false)) {
+    if (outline1 && !ass_rasterizer_set_outline(rst, outline1, false, clip)) {
         ass_msg(render_priv->library, MSGL_WARN, "Failed to process glyph outline!\n");
         return false;
     }
-    if (outline2 && !ass_rasterizer_set_outline(rst, outline2, !!outline1)) {
+    if (outline2 && !ass_rasterizer_set_outline(rst, outline2, !!outline1, clip)) {
         ass_msg(render_priv->library, MSGL_WARN, "Failed to process glyph outline!\n");
         return false;
     }
@@ -181,16 +182,55 @@ bool ass_outline_to_bitmap(RenderContext *state, Bitmap *bm,
 
     int32_t tile_w = (w + mask) & ~mask;
     int32_t tile_h = (h + mask) & ~mask;
+    ASS_Rect window = {0, 0, tile_w, tile_h};
+    if (clip) {
+        int align = FFMAX(1 << render_priv->engine.align_order, clip_align);
+        int64_t dx0 = (int64_t) clip->x_min - x_min;
+        int64_t dy0 = (int64_t) clip->y_min - y_min;
+        int64_t dx1 = (int64_t) clip->x_max - x_min;
+        int64_t dy1 = (int64_t) clip->y_max - y_min;
+        int32_t left = FFMINMAX(dx0 & -(int64_t) align, 0, tile_w);
+        int32_t top = FFMINMAX(dy0 & -(int64_t) align, 0, tile_h);
+        int32_t right = FFMINMAX((dx1 + align - 1) & -(int64_t) align, 0, tile_w);
+        int32_t bottom = FFMINMAX((dy1 + align - 1) & -(int64_t) align, 0, tile_h);
+        if (right <= left || bottom <= top)
+            return false;
+        window = (ASS_Rect) {left, top, right, bottom};
+    }
     if (!ass_alloc_bitmap(&render_priv->engine, bm, tile_w, tile_h, false))
         return false;
     bm->left = x_min;
     bm->top  = y_min;
 
+    ASS_Rect raster_window = window;
+    raster_window.x_max = ass_align(1 << render_priv->engine.align_order, window.x_max);
     if (!ass_rasterizer_fill(&render_priv->engine, rst, bm->buffer,
-                             x_min, y_min, bm->stride, tile_h, bm->stride)) {
+                             x_min, y_min, bm->stride, tile_h, bm->stride,
+                             clip ? &raster_window : NULL)) {
         ass_msg(render_priv->library, MSGL_WARN, "Failed to rasterize glyph!\n");
         ass_free_bitmap(bm);
         return false;
+    }
+
+    // Keep the original raster grid and subdivision tree. Moving the raster
+    // origin can change edge coverage; discard unused pixels only afterwards.
+    if (clip && (window.x_min || window.y_min ||
+                 window.x_max != tile_w || window.y_max != tile_h)) {
+        Bitmap cropped = {0};
+        if (!ass_alloc_bitmap(&render_priv->engine, &cropped,
+                               window.x_max - window.x_min,
+                               window.y_max - window.y_min, false)) {
+            ass_free_bitmap(bm);
+            return false;
+        }
+        cropped.left = bm->left + window.x_min;
+        cropped.top = bm->top + window.y_min;
+        for (int y = 0; y < cropped.h; y++)
+            memcpy(cropped.buffer + y * cropped.stride,
+                   bm->buffer + (y + window.y_min) * bm->stride + window.x_min,
+                   cropped.stride);
+        ass_free_bitmap(bm);
+        *bm = cropped;
     }
 
     return true;

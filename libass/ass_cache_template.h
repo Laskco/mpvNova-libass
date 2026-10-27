@@ -66,6 +66,10 @@ START(bitmap, bitmap_hash_key)
     VECTOR(matrix_x)
     VECTOR(matrix_y)
     VECTOR(matrix_z)
+    // Optional pixel-space raster window, relative to the quantized origin.
+    VECTOR(clip_min)
+    VECTOR(clip_max)
+    GENERIC(int, clip_align)
 END(BitmapHashKey)
 
 // font is refed when inserted and unrefed when dropped

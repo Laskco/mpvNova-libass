@@ -716,10 +716,10 @@ static inline size_t bitmap_size(const Bitmap *bm)
  * applicable. The blended bitmaps are added to a free list which is freed
  * at the start of a new frame.
  */
-static void blend_vector_clip(RenderContext *state, ASS_Image *head)
+static Bitmap *get_vector_clip(RenderContext *state, ASS_Vector *pos)
 {
     if (!state->clip_drawing_text.str)
-        return;
+        return NULL;
 
     ASS_Renderer *render_priv = state->renderer;
 
@@ -737,16 +737,22 @@ static void blend_vector_clip(RenderContext *state, ASS_Image *head)
     m[0][2] = int_to_d6(render_priv->settings.left_margin);
     m[1][2] = int_to_d6(render_priv->settings.top_margin);
 
-    ASS_Vector pos;
-    BitmapHashKey key;
+    BitmapHashKey key = {0};
     key.outline = ass_cache_get(render_priv->cache.outline_cache, &ol_key, render_priv);
     if (!key.outline || !key.outline->valid ||
-            !quantize_transform(m, &pos, NULL, true, &key))
-        return;
+            !quantize_transform(m, pos, NULL, true, &key))
+        return NULL;
 
-    Bitmap *clip_bm = ass_cache_get(render_priv->cache.bitmap_cache, &key, state);
+    return ass_cache_get(render_priv->cache.bitmap_cache, &key, state);
+}
+
+static void blend_vector_clip(RenderContext *state, ASS_Image *head)
+{
+    ASS_Vector pos;
+    Bitmap *clip_bm = get_vector_clip(state, &pos);
     if (!clip_bm)
         return;
+    ASS_Renderer *render_priv = state->renderer;
 
     // Iterate through bitmaps and blend/clip them
     for (ASS_Image *cur = head; cur; cur = cur->next) {
@@ -1399,6 +1405,52 @@ static void calc_transform_matrix(RenderContext *state,
  * After that, bitmaps are added to the cache.
  * They are returned in info->bm (glyph), info->bm_o (outline).
  */
+static int quantize_blur(double radius, int32_t *shadow_mask);
+static double restore_blur(int qblur);
+
+static void set_bitmap_clip(RenderContext *state, GlyphInfo *info,
+                            ASS_Vector pos, BitmapHashKey *key)
+{
+    key->clip_align = 0;
+    key->clip_min = key->clip_max = (ASS_Vector) {0, 0};
+#ifndef ASS_DISABLE_CLIP_CULLING
+    // Collision shifts, inverse clipping, backgrounds and shadows need their
+    // own dependency bounds. Keep their established rendering path unchanged.
+    if (!state->clip_drawing_text.str || state->clip_drawing_mode ||
+        state->clip_mode || state->detect_collisions ||
+        state->evt_type != EVENT_POSITIONED ||
+        info->shadow_x || info->shadow_y || info->border_style != 1 ||
+        info->be > 16)
+        return;
+
+    ASS_Vector clip_pos;
+    Bitmap *clip = get_vector_clip(state, &clip_pos);
+    if (!clip || !clip->buffer)
+        return;
+
+    int pad_x = 0, pad_y = 0, align_x = 1, align_y = 1;
+    int32_t ignored;
+    double scale = 2 / sqrt(log(256));
+    double r2x = restore_blur(quantize_blur(info->blur * state->blur_scale_x * scale, &ignored));
+    double r2y = restore_blur(quantize_blur(info->blur * state->blur_scale_y * scale, &ignored));
+    if (r2x > 0.001 || r2y > 0.001) {
+        ass_gaussian_blur_bounds(r2x, &pad_x, &align_x);
+        ass_gaussian_blur_bounds(r2y, &pad_y, &align_y);
+    }
+    pad_x += info->be + 4;
+    pad_y += info->be + 4;
+    int64_t x0 = (int64_t) clip_pos.x + clip->left - pos.x - pad_x;
+    int64_t y0 = (int64_t) clip_pos.y + clip->top - pos.y - pad_y;
+    int64_t x1 = (int64_t) clip_pos.x + clip->left + clip->w - pos.x + pad_x;
+    int64_t y1 = (int64_t) clip_pos.y + clip->top + clip->h - pos.y + pad_y;
+    if (x0 < INT32_MIN || y0 < INT32_MIN || x1 > INT32_MAX || y1 > INT32_MAX)
+        return;
+    key->clip_min = (ASS_Vector) {x0, y0};
+    key->clip_max = (ASS_Vector) {x1, y1};
+    key->clip_align = FFMAX(align_x, align_y);
+#endif
+}
+
 static void
 get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
                  int32_t *leftmost_x,
@@ -1423,11 +1475,12 @@ get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
     if (info->effect_type == EF_KARAOKE_KF)
         ass_outline_update_min_transformed_x(&info->outline->outline[0], m, leftmost_x);
 
-    BitmapHashKey key;
+    BitmapHashKey key = {0};
     key.outline = info->outline;
     if (!quantize_transform(m, pos, offset, first, &key))
         return;
 
+    set_bitmap_clip(state, info, *pos, &key);
     info->bm = ass_cache_get(render_priv->cache.bitmap_cache, &key, state);
     if (!info->bm || !info->bm->buffer)
         info->bm = NULL;
@@ -1552,6 +1605,7 @@ get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
             !quantize_transform(m, pos_o, offset, false, &key))
         return;
 
+    set_bitmap_clip(state, info, *pos_o, &key);
     info->bm_o = ass_cache_get(render_priv->cache.bitmap_cache, &key, state);
     if (!info->bm_o || !info->bm_o->buffer) {
         info->bm_o = NULL;
@@ -1587,7 +1641,9 @@ size_t ass_bitmap_construct(void *key, void *value, void *priv)
         ass_outline_transform_2d(&outline[1], &k->outline->outline[1], m);
     }
 
-    if (!ass_outline_to_bitmap(state, bm, &outline[0], &outline[1]))
+    ASS_Rect clip = {k->clip_min.x, k->clip_min.y, k->clip_max.x, k->clip_max.y};
+    if (!ass_outline_to_bitmap(state, bm, &outline[0], &outline[1],
+                               k->clip_align ? &clip : NULL, k->clip_align))
         memset(bm, 0, sizeof(*bm));
     ass_outline_free(&outline[0]);
     ass_outline_free(&outline[1]);

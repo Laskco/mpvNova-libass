@@ -66,7 +66,8 @@ void ass_rasterizer_done(RasterizerData *rst);
  * \return false on error
  */
 bool ass_rasterizer_set_outline(RasterizerData *rst,
-                                const ASS_Outline *path, bool extra);
+                                const ASS_Outline *path, bool extra,
+                                const ASS_Rect *clip);
 
 /**
  * \brief Polyline rasterization function
@@ -78,7 +79,8 @@ bool ass_rasterizer_set_outline(RasterizerData *rst,
  */
 bool ass_rasterizer_fill(const BitmapEngine *engine, RasterizerData *rst,
                          uint8_t *buf, int x0, int y0,
-                         int width, int height, ptrdiff_t stride);
+                         int width, int height, ptrdiff_t stride,
+                         const ASS_Rect *clip);
 
 
 #endif /* LIBASS_RASTERIZER_H */
