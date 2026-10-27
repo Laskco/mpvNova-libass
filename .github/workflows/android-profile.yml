@@ -84,7 +84,7 @@ jobs:
           export PATH="$PWD/sdk/android-ndk-r30/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
           cd deps/libass/_build_arm64
           make clean
-          make -j2 CPPFLAGS=-DASS_FLE_PROFILE
+          make -j2 CPPFLAGS='-DASS_FLE_PROFILE -DASS_EVENT_THREADS'
           make DESTDIR="$GITHUB_WORKSPACE/player/buildscripts/prefix/arm64" install
       - name: Link standalone benchmark
         run: |

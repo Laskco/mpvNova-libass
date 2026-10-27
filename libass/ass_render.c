@@ -23,6 +23,12 @@
 #include <math.h>
 #include <string.h>
 #include <stdbool.h>
+#ifdef ASS_EVENT_THREADS
+#include <pthread.h>
+#include <unistd.h>
+struct ass_event_pool;
+static void event_pool_done(struct ass_event_pool *pool);
+#endif
 #ifdef ASS_FLE_PROFILE
 #include <stdint.h>
 #include <time.h>
@@ -198,6 +204,10 @@ void ass_renderer_done(ASS_Renderer *render_priv)
 
     ass_frame_unref(render_priv->images_root);
     ass_frame_unref(render_priv->prev_images_root);
+#ifdef ASS_EVENT_THREADS
+    event_pool_done(render_priv->event_pool);
+    free(render_priv->font_config);
+#endif
 
     ass_cache_done(render_priv->cache.composite_cache);
     ass_cache_done(render_priv->cache.bitmap_cache);
@@ -3193,6 +3203,181 @@ ass_start_frame(ASS_Renderer *render_priv, ASS_Track *track,
     return true;
 }
 
+#ifdef ASS_EVENT_THREADS
+typedef struct {
+    struct ass_event_pool *pool;
+    ASS_Renderer *renderer;
+    pthread_t thread;
+    unsigned font_generation;
+    int render_id, id;
+} EventWorker;
+
+struct ass_event_pool {
+    ASS_Renderer *owner;
+    EventWorker workers[3];
+    pthread_mutex_t lock;
+    pthread_cond_t work, done;
+    uint64_t generation;
+    int count, pending, active;
+    bool stop;
+    ASS_Event **events;
+    size_t capacity;
+};
+
+static void event_batch(struct ass_event_pool *pool, ASS_Renderer *renderer, int id)
+{
+    for (int i = 0; i < pool->active; i++) {
+        ASS_Event *event = pool->events[i];
+        // Stable ownership avoids invalidating the bitmap cache every frame.
+        if ((unsigned) event->ReadOrder % (pool->count + 1) != id)
+            continue;
+        EventImages *out = pool->owner->eimg + i;
+        if (!ass_render_event(&renderer->state, event, out))
+            out->event = NULL;
+    }
+}
+
+static void *event_worker(void *arg)
+{
+    EventWorker *worker = arg;
+    struct ass_event_pool *pool = worker->pool;
+    uint64_t seen = 0;
+    pthread_mutex_lock(&pool->lock);
+    while (!pool->stop) {
+        while (!pool->stop && seen == pool->generation)
+            pthread_cond_wait(&pool->work, &pool->lock);
+        if (pool->stop) break;
+        seen = pool->generation;
+        pthread_mutex_unlock(&pool->lock);
+        event_batch(pool, worker->renderer, worker->id);
+        pthread_mutex_lock(&pool->lock);
+        if (!--pool->pending)
+            pthread_cond_signal(&pool->done);
+    }
+    pthread_mutex_unlock(&pool->lock);
+    return NULL;
+}
+
+static void event_pool_done(struct ass_event_pool *pool)
+{
+    if (!pool) return;
+    pthread_mutex_lock(&pool->lock);
+    pool->stop = true;
+    pthread_cond_broadcast(&pool->work);
+    pthread_mutex_unlock(&pool->lock);
+    for (int i = 0; i < pool->count; i++) {
+        pthread_join(pool->workers[i].thread, NULL);
+        ass_renderer_done(pool->workers[i].renderer);
+    }
+    pthread_cond_destroy(&pool->done);
+    pthread_cond_destroy(&pool->work);
+    pthread_mutex_destroy(&pool->lock);
+    free(pool->events);
+    free(pool);
+}
+
+static struct ass_event_pool *event_pool_init(ASS_Renderer *owner)
+{
+    const char *value = getenv("LIBASS_RENDER_THREADS");
+    long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    int threads = value ? atoi(value) : 4;
+    threads = FFMIN(FFMIN(threads, 4), cpus);
+    if (threads <= 1) return NULL;
+    struct ass_event_pool *pool = calloc(1, sizeof(*pool));
+    if (!pool) return NULL;
+    pool->owner = owner;
+    if (pthread_mutex_init(&pool->lock, NULL)) { free(pool); return NULL; }
+    if (pthread_cond_init(&pool->work, NULL)) {
+        pthread_mutex_destroy(&pool->lock); free(pool); return NULL;
+    }
+    if (pthread_cond_init(&pool->done, NULL)) {
+        pthread_cond_destroy(&pool->work);
+        pthread_mutex_destroy(&pool->lock); free(pool); return NULL;
+    }
+    for (int i = 0; i < threads - 1; i++) {
+        EventWorker *worker = pool->workers + i;
+        worker->renderer = ass_renderer_init(owner->library);
+        worker->pool = pool;
+        worker->id = i + 1;
+        worker->render_id = -1;
+        if (!worker->renderer) { event_pool_done(pool); return NULL; }
+        // Bound additional bitmap/composite caches to 24 MiB per worker.
+        ass_set_cache_limits(worker->renderer, 2500, 24);
+        if (pthread_create(&worker->thread, NULL, event_worker, worker)) {
+            ass_renderer_done(worker->renderer);
+            event_pool_done(pool);
+            return NULL;
+        }
+        pool->count++;
+    }
+    return pool;
+}
+
+static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
+                                   long long now, int *rendered)
+{
+    if (priv->custom_font_provider) return false;
+    int active = 0;
+    for (int i = 0; i < track->n_events; i++) {
+        ASS_Event *event = track->events + i;
+        active += event->Start <= now && now < event->Start + event->Duration;
+    }
+    if (!priv->event_pool) {
+        if (active < 32) return false;
+        priv->event_pool = event_pool_init(priv);
+        if (!priv->event_pool) return false;
+    }
+    struct ass_event_pool *pool = priv->event_pool;
+    if (active > pool->capacity) {
+        if (!ASS_REALLOC_ARRAY(pool->events, active)) return false;
+        pool->capacity = active;
+    }
+    if (active > priv->eimg_size) {
+        EventImages *images = ass_realloc_array(priv->eimg, active, sizeof(*images));
+        if (!images) return false;
+        priv->eimg = images;
+        priv->eimg_size = active;
+    }
+    pool->active = 0;
+    for (int i = 0; i < track->n_events; i++) {
+        ASS_Event *event = track->events + i;
+        if (event->Start <= now && now < event->Start + event->Duration)
+            pool->events[pool->active++] = event;
+    }
+    for (int i = 0; i < pool->count; i++) {
+        EventWorker *worker = pool->workers + i;
+        if (!ass_clone_render_settings(worker->renderer, priv,
+                &worker->font_generation, &worker->render_id) ||
+            !ass_start_frame(worker->renderer, track, now))
+            return false;
+#ifdef ASS_FLE_PROFILE
+        memset(worker->renderer->fle_phase_ns, 0, sizeof(priv->fle_phase_ns));
+#endif
+    }
+    pthread_mutex_lock(&pool->lock);
+    pool->pending = pool->count;
+    pool->generation++;
+    pthread_cond_broadcast(&pool->work);
+    pthread_mutex_unlock(&pool->lock);
+    event_batch(pool, priv, 0);
+    pthread_mutex_lock(&pool->lock);
+    while (pool->pending)
+        pthread_cond_wait(&pool->done, &pool->lock);
+    pthread_mutex_unlock(&pool->lock);
+#ifdef ASS_FLE_PROFILE
+    for (int i = 0; i < pool->count; i++)
+        for (int p = 0; p < 10; p++)
+            priv->fle_phase_ns[p] += pool->workers[i].renderer->fle_phase_ns[p];
+#endif
+    int cnt = 0;
+    for (int i = 0; i < active; i++)
+        if (priv->eimg[i].event)
+            priv->eimg[cnt++] = priv->eimg[i];
+    *rendered = cnt;
+    return true;
+}
+#endif
+
 static int cmp_event_layer(const void *p1, const void *p2)
 {
     ASS_Event *e1 = ((EventImages *) p1)->event;
@@ -3478,6 +3663,11 @@ ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
 
     // render events separately
     int cnt = 0;
+    bool parallel = false;
+#ifdef ASS_EVENT_THREADS
+    parallel = render_events_parallel(priv, track, now, &cnt);
+#endif
+    if (!parallel)
     for (int i = 0; i < track->n_events; i++) {
         ASS_Event *event = track->events + i;
         if ((event->Start <= now)

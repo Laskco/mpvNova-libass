@@ -149,6 +149,13 @@ void ass_set_fonts(ASS_Renderer *priv, const char *default_font,
                    const char *default_family, int dfp,
                    const char *config, int update)
 {
+#ifdef ASS_EVENT_THREADS
+    free(priv->font_config);
+    priv->font_config = config ? strdup(config) : NULL;
+    priv->font_provider = dfp;
+    priv->font_generation++;
+    priv->custom_font_provider = config && !priv->font_config;
+#endif
     free(priv->settings.default_font);
     free(priv->settings.default_family);
     priv->settings.default_font = default_font ? strdup(default_font) : 0;
@@ -211,5 +218,43 @@ ASS_FontProvider *
 ass_create_font_provider(ASS_Renderer *priv, ASS_FontProviderFuncs *funcs,
                          void *data)
 {
+#ifdef ASS_EVENT_THREADS
+    priv->custom_font_provider = true;
+#endif
     return ass_font_provider_new(priv->fontselect, funcs, data);
 }
+
+#ifdef ASS_EVENT_THREADS
+bool ass_clone_render_settings(ASS_Renderer *dst, const ASS_Renderer *src,
+                                unsigned *font_generation, int *render_id)
+{
+    if (*font_generation != src->font_generation) {
+        ass_set_fonts(dst, src->settings.default_font, src->settings.default_family,
+                      src->font_provider, src->font_config, 1);
+        if (!dst->fontselect ||
+            (src->settings.default_font && !dst->settings.default_font) ||
+            (src->settings.default_family && !dst->settings.default_family) ||
+            (src->font_config && !dst->font_config))
+            return false;
+        *font_generation = src->font_generation;
+    }
+    if (*render_id != src->render_id) {
+        char *font = src->user_override_style.FontName ?
+                     strdup(src->user_override_style.FontName) : NULL;
+        if (src->user_override_style.FontName && !font) return false;
+        ASS_Settings settings = src->settings;
+        settings.default_font = dst->settings.default_font;
+        settings.default_family = dst->settings.default_family;
+        dst->settings = settings;
+        free(dst->user_override_style.FontName);
+        dst->user_override_style = src->user_override_style;
+        dst->user_override_style.FontName = font;
+        ass_reconfigure(dst);
+        *render_id = src->render_id;
+    }
+    // These setters do not increment render_id.
+    dst->settings.line_spacing = src->settings.line_spacing;
+    dst->settings.shaper = src->settings.shaper;
+    return true;
+}
+#endif

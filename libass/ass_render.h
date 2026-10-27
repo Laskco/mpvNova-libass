@@ -341,6 +341,13 @@ struct ass_renderer {
 #ifdef ASS_FLE_PROFILE
     uint64_t fle_phase_ns[10];
 #endif
+#ifdef ASS_EVENT_THREADS
+    struct ass_event_pool *event_pool;
+    char *font_config;
+    unsigned font_generation;
+    int font_provider;
+    bool custom_font_provider;
+#endif
 };
 
 typedef struct render_priv {
@@ -359,6 +366,10 @@ void ass_reset_render_context(RenderContext *state, ASS_Style *style);
 void ass_frame_ref(ASS_Image *img);
 void ass_frame_unref(ASS_Image *img);
 ASS_Vector ass_layout_res(ASS_Renderer *render_priv);
+#ifdef ASS_EVENT_THREADS
+bool ass_clone_render_settings(ASS_Renderer *dst, const ASS_Renderer *src,
+                                unsigned *font_generation, int *render_id);
+#endif
 
 // XXX: this is actually in ass.c, includes should be fixed later on
 void ass_lazy_track_init(ASS_Library *lib, ASS_Track *track);
