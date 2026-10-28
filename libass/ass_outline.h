@@ -113,6 +113,11 @@ bool ass_outline_transform_2d_clipped(ASS_Outline *outline, const ASS_Outline *s
                                       const double m[2][3], const ASS_Rect *clip);
 bool ass_outline_transform_3d(ASS_Outline *outline, const ASS_Outline *source,
                               const double m[3][3]);
+// Reuse variants require a zero-initialized or previously valid destination.
+bool ass_outline_transform_2d_reuse(ASS_Outline *outline, const ASS_Outline *source,
+                                    const double m[2][3]);
+bool ass_outline_transform_3d_reuse(ASS_Outline *outline, const ASS_Outline *source,
+                                    const double m[3][3]);
 
 // info queries
 void ass_outline_update_min_transformed_x(const ASS_Outline *outline,

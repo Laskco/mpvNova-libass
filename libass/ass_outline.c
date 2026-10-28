@@ -397,16 +397,24 @@ bool ass_outline_scale_pow2(ASS_Outline *outline, const ASS_Outline *source,
  * Result outline should be uninitialized or empty.
  * Source outline can be NULL.
  */
-bool ass_outline_transform_2d(ASS_Outline *outline, const ASS_Outline *source,
-                              const double m[2][3])
+static bool reserve_temporary_outline(ASS_Outline *outline, size_t points, size_t segments);
+
+static bool outline_transform_2d(ASS_Outline *outline, const ASS_Outline *source,
+                                  const double m[2][3], bool reuse)
 {
     if (!source || !source->n_points) {
-        ass_outline_clear(outline);
+        if (reuse) outline->n_points = outline->n_segments = 0;
+        else ass_outline_clear(outline);
         return true;
     }
 
-    if (!ass_outline_alloc(outline, source->n_points, source->n_segments))
+    bool allocated = reuse ?
+        reserve_temporary_outline(outline, source->n_points, source->n_segments) :
+        ass_outline_alloc(outline, source->n_points, source->n_segments);
+    if (!allocated) {
+        if (reuse) ass_outline_free(outline);
         return false;
+    }
 
     const ASS_Vector *pt = source->points;
     for (size_t i = 0; i < source->n_points; i++) {
@@ -425,6 +433,18 @@ bool ass_outline_transform_2d(ASS_Outline *outline, const ASS_Outline *source,
     outline->n_points = source->n_points;
     outline->n_segments = source->n_segments;
     return true;
+}
+
+bool ass_outline_transform_2d(ASS_Outline *outline, const ASS_Outline *source,
+                              const double m[2][3])
+{
+    return outline_transform_2d(outline, source, m, false);
+}
+
+bool ass_outline_transform_2d_reuse(ASS_Outline *outline, const ASS_Outline *source,
+                                    const double m[2][3])
+{
+    return outline_transform_2d(outline, source, m, true);
 }
 
 static inline bool append_affine_point(ASS_Outline *outline, ASS_Vector p,
@@ -596,16 +616,22 @@ invalid:
  * Result outline should be uninitialized or empty.
  * Source outline can be NULL.
  */
-bool ass_outline_transform_3d(ASS_Outline *outline, const ASS_Outline *source,
-                              const double m[3][3])
+static bool outline_transform_3d(ASS_Outline *outline, const ASS_Outline *source,
+                                  const double m[3][3], bool reuse)
 {
     if (!source || !source->n_points) {
-        ass_outline_clear(outline);
+        if (reuse) outline->n_points = outline->n_segments = 0;
+        else ass_outline_clear(outline);
         return true;
     }
 
-    if (!ass_outline_alloc(outline, source->n_points, source->n_segments))
+    bool allocated = reuse ?
+        reserve_temporary_outline(outline, source->n_points, source->n_segments) :
+        ass_outline_alloc(outline, source->n_points, source->n_segments);
+    if (!allocated) {
+        if (reuse) ass_outline_free(outline);
         return false;
+    }
 
     const ASS_Vector *pt = source->points;
     for (size_t i = 0; i < source->n_points; i++) {
@@ -628,6 +654,18 @@ bool ass_outline_transform_3d(ASS_Outline *outline, const ASS_Outline *source,
     outline->n_points = source->n_points;
     outline->n_segments = source->n_segments;
     return true;
+}
+
+bool ass_outline_transform_3d(ASS_Outline *outline, const ASS_Outline *source,
+                              const double m[3][3])
+{
+    return outline_transform_3d(outline, source, m, false);
+}
+
+bool ass_outline_transform_3d_reuse(ASS_Outline *outline, const ASS_Outline *source,
+                                    const double m[3][3])
+{
+    return outline_transform_3d(outline, source, m, true);
 }
 
 /*

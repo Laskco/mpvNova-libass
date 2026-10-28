@@ -1656,17 +1656,24 @@ size_t ass_bitmap_construct(void *key, void *value, void *priv)
 
     ASS_Rect clip = {k->clip_min.x, k->clip_min.y, k->clip_max.x, k->clip_max.y};
     ASS_Outline temporary[2] = {{0}};
-    bool reuse = state->renderer->experimental_edges && k->clip_align &&
-        !k->matrix_z.x && !k->matrix_z.y &&
+    bool reuse = state->renderer->experimental_edges &&
         outline_size(&k->outline->outline[0]) <= 512 * 1024 &&
         outline_size(&k->outline->outline[1]) <= 512 * 1024;
     ASS_Outline *outline = reuse ? state->renderer->raster_outline : temporary;
     if (k->matrix_z.x || k->matrix_z.y) {
-        ass_outline_transform_3d(&outline[0], &k->outline->outline[0], m);
-        ass_outline_transform_3d(&outline[1], &k->outline->outline[1], m);
+        if (reuse) {
+            ass_outline_transform_3d_reuse(&outline[0], &k->outline->outline[0], m);
+            ass_outline_transform_3d_reuse(&outline[1], &k->outline->outline[1], m);
+        } else {
+            ass_outline_transform_3d(&outline[0], &k->outline->outline[0], m);
+            ass_outline_transform_3d(&outline[1], &k->outline->outline[1], m);
+        }
     } else if (state->renderer->experimental_edges && k->clip_align) {
         ass_outline_transform_2d_clipped(&outline[0], &k->outline->outline[0], m, &clip);
         ass_outline_transform_2d_clipped(&outline[1], &k->outline->outline[1], m, &clip);
+    } else if (reuse) {
+        ass_outline_transform_2d_reuse(&outline[0], &k->outline->outline[0], m);
+        ass_outline_transform_2d_reuse(&outline[1], &k->outline->outline[1], m);
     } else {
         ass_outline_transform_2d(&outline[0], &k->outline->outline[0], m);
         ass_outline_transform_2d(&outline[1], &k->outline->outline[1], m);
