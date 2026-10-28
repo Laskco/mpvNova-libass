@@ -2570,6 +2570,49 @@ static double restore_blur(int qblur)
 }
 
 // Convert glyphs to bitmaps, combine them, apply blur, generate shadows.
+static void set_composite_viewport(RenderContext *state, CombinedBitmapInfo *info,
+                                    CompositeHashKey *key)
+{
+    ASS_Renderer *renderer = state->renderer;
+    if (!renderer->experimental_edges || state->detect_collisions ||
+        !(state->evt_type & EVENT_POSITIONED) ||
+        (info->filter.flags & FILTER_BORDER_STYLE_3) ||
+        info->filter.be < 0 || info->filter.be > 16 ||
+        renderer->settings.frame_width <= 0 || renderer->settings.frame_height <= 0)
+        return;
+    double r2x = restore_blur(info->filter.blur_x);
+    double r2y = restore_blur(info->filter.blur_y);
+    if (!isfinite(r2x) || !isfinite(r2y) || r2x > 65536 || r2y > 65536)
+        return;
+    int px = 0, py = 0, ax = 1, ay = 1;
+    ass_gaussian_blur_bounds(r2x, &px, &ax);
+    ass_gaussian_blur_bounds(r2y, &py, &ay);
+    int64_t pad_x = px + info->filter.be + 4 + llabs((int64_t)info->filter.shadow.x) / 64;
+    int64_t pad_y = py + info->filter.be + 4 + llabs((int64_t)info->filter.shadow.y) / 64;
+    int64_t x0 = -(int64_t)info->x - pad_x;
+    int64_t y0 = -(int64_t)info->y - pad_y;
+    int64_t x1 = (int64_t)renderer->settings.frame_width - info->x + pad_x;
+    int64_t y1 = (int64_t)renderer->settings.frame_height - info->y + pad_y;
+    if (x0 < INT32_MIN || y0 < INT32_MIN || x1 > INT32_MAX || y1 > INT32_MAX)
+        return;
+    bool outside = false;
+    for (int i = 0; i < info->bitmap_count; i++) {
+        BitmapRef *ref = info->bitmaps + i;
+        Bitmap *bm[2] = {ref->bm, ref->bm_o};
+        ASS_Vector pos[2] = {ref->pos, ref->pos_o};
+        for (int j = 0; j < 2; j++) {
+            if (!bm[j]) continue;
+            int64_t left = (int64_t)pos[j].x + bm[j]->left;
+            int64_t top = (int64_t)pos[j].y + bm[j]->top;
+            outside |= left < x0 || top < y0 || left + bm[j]->w > x1 || top + bm[j]->h > y1;
+        }
+    }
+    if (outside) {
+        key->viewport = (ASS_Rect){x0, y0, x1, y1};
+        key->viewport_align = FFMAX(1 << renderer->engine.align_order, FFMAX(ax, ay));
+    }
+}
+
 static void render_and_combine_glyphs(RenderContext *state,
                                       double device_x, double device_y)
 {
@@ -2710,10 +2753,11 @@ static void render_and_combine_glyphs(RenderContext *state,
             info->bitmaps[j].pos_o.y -= info->y;
         }
 
-        CompositeHashKey key;
+        CompositeHashKey key = {0};
         key.filter = info->filter;
         key.bitmap_count = info->bitmap_count;
         key.bitmaps = info->bitmaps;
+        set_composite_viewport(state, info, &key);
         CompositeHashValue *val = ass_cache_get(render_priv->cache.composite_cache, &key, render_priv);
         if (!val)
             continue;
@@ -2765,6 +2809,36 @@ int ass_be_padding(int be)
     return 5;
 }
 
+
+static void crop_composite_bitmap(const BitmapEngine *engine, Bitmap *bm,
+                                  const CompositeHashKey *key)
+{
+    if (!bm->buffer || !key->viewport_align)
+        return;
+    // Preserve the original blur cascade and ordered-dither sampling origin.
+    int64_t mask = -(int64_t)key->viewport_align;
+    int x0 = FFMINMAX(((int64_t)key->viewport.x_min - bm->left) & mask, 0, bm->w);
+    int y0 = FFMINMAX(((int64_t)key->viewport.y_min - bm->top) & mask, 0, bm->h);
+    int x1 = FFMINMAX(((int64_t)key->viewport.x_max - bm->left + key->viewport_align - 1) & mask, 0, bm->w);
+    int y1 = FFMINMAX(((int64_t)key->viewport.y_max - bm->top + key->viewport_align - 1) & mask, 0, bm->h);
+    if (x1 <= x0 || y1 <= y0) {
+        ass_free_bitmap(bm);
+        memset(bm, 0, sizeof(*bm));
+        return;
+    }
+    if (!x0 && !y0 && x1 == bm->w && y1 == bm->h)
+        return;
+    Bitmap cropped = {0};
+    if (!ass_alloc_bitmap(engine, &cropped, x1 - x0, y1 - y0, true))
+        return;
+    cropped.left = bm->left + x0;
+    cropped.top = bm->top + y0;
+    for (int y = 0; y < cropped.h; y++)
+        memcpy(cropped.buffer + y * cropped.stride,
+               bm->buffer + (y + y0) * bm->stride + x0, cropped.w);
+    ass_free_bitmap(bm);
+    *bm = cropped;
+}
 
 size_t ass_composite_construct(void *key, void *value, void *priv)
 {
@@ -2845,6 +2919,9 @@ size_t ass_composite_construct(void *key, void *value, void *priv)
                                             src->w, src->h);
         }
     }
+
+    crop_composite_bitmap(&render_priv->engine, &v->bm, k);
+    crop_composite_bitmap(&render_priv->engine, &v->bm_o, k);
 
     int flags = k->filter.flags;
     double r2x = restore_blur(k->filter.blur_x);

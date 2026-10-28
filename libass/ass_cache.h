@@ -85,6 +85,8 @@ typedef struct {
     FilterDesc filter;
     size_t bitmap_count;
     BitmapRef *bitmaps;
+    ASS_Rect viewport;
+    int viewport_align;
 } CompositeHashKey;
 
 typedef struct

@@ -115,6 +115,8 @@ static ass_hashcode composite_hash(void *key, ass_hashcode hval)
 {
     CompositeHashKey *k = key;
     hval = filter_hash(&k->filter, hval);
+    hval = ass_hash_buf(&k->viewport, sizeof(k->viewport), hval);
+    hval = ass_hash_buf(&k->viewport_align, sizeof(k->viewport_align), hval);
     for (size_t i = 0; i < k->bitmap_count; i++)
         hval = bitmap_ref_hash(&k->bitmaps[i], hval);
     return hval;
@@ -127,6 +129,9 @@ static bool composite_compare(void *a, void *b)
     if (!filter_compare(&ak->filter, &bk->filter))
         return false;
     if (ak->bitmap_count != bk->bitmap_count)
+        return false;
+    if (ak->viewport_align != bk->viewport_align ||
+        memcmp(&ak->viewport, &bk->viewport, sizeof(ak->viewport)))
         return false;
     for (size_t i = 0; i < ak->bitmap_count; i++)
         if (!bitmap_ref_compare(&ak->bitmaps[i], &bk->bitmaps[i]))
