@@ -30,7 +30,7 @@ jobs:
         run: |
           flags=''
           if [ '${{ matrix.source }}' = baseline ]; then
-            git checkout 0.17.5
+            git checkout f61db567e6593df3470e91594bcd4ad2d0473aff
           else
             flags=-DASS_EVENT_THREADS
           fi
