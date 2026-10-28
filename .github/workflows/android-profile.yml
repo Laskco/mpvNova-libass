@@ -46,6 +46,14 @@ jobs:
             $(pkg-config --cflags freetype2) profile/edge-check.c \
             libass/ass_outline.c libass/ass_utils.c -Wl,--gc-sections -lm -o build/edge-check
           ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 build/edge-check
+      - name: Exercise experimental mode with malformed subtitle inputs
+        if: matrix.source == 'candidate'
+        env:
+          LIBASS_EXPERIMENTAL_EDGES: '1'
+          LIBASS_RENDER_THREADS: '4'
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: halt_on_error=1
+        run: meson test -C build checkasm art-fuzz --timeout-multiplier 4 --print-errorlogs
       - name: Run upstream regression and malformed-input tests
         env:
           LIBASS_RENDER_THREADS: '4'
