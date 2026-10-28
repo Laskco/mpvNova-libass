@@ -186,7 +186,7 @@ static inline long ass_lrint(double x)
     // libm fallback otherwise saves/restores the FP environment per point.
     if (x >= INT32_MIN && x <= INT32_MAX) {
         union { float reg; int32_t value; } rounded;
-        __asm__("vcvtr.s32.f64 %0, %P1" : "=t"(rounded.reg) : "w"(x));
+        __asm__ volatile("vcvtr.s32.f64 %0, %P1" : "=t"(rounded.reg) : "w"(x));
         return rounded.value;
     }
     return lrint(x);
