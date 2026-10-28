@@ -176,7 +176,8 @@ void ass_gaussian_blur_bounds(double r2, int *padding, int *alignment)
     find_best_method(&blur, r2);
     // The shrink/expand cascade contributes at most 5 * (2^level - 1)
     // source pixels per side, in addition to the scaled convolution radius.
-    *padding = ((blur.radius + 5) << blur.level) - 5;
+    // Keep a two-pixel guard at the integer bitmap/clip boundaries.
+    *padding = ((blur.radius + 5) << blur.level) - 3;
     *alignment = 1 << blur.level;
 }
 
