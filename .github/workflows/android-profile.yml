@@ -1,7 +1,7 @@
 name: Android libass profile
 on:
   push:
-    branches: [fle-performance]
+    branches: [fle-performance, noucome-ass-drift]
   workflow_dispatch:
 permissions:
   contents: read

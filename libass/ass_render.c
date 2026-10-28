@@ -29,15 +29,18 @@
 struct ass_event_pool;
 static void event_pool_done(struct ass_event_pool *pool);
 #endif
-#ifdef ASS_FLE_PROFILE
+#if defined(ASS_FLE_PROFILE) || defined(ASS_EVENT_THREADS)
 #include <stdint.h>
 #include <time.h>
 static uint64_t fle_clock(void)
 {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    if (clock_gettime(CLOCK_MONOTONIC, &ts))
+        return 0;
     return (uint64_t) ts.tv_sec * 1000000000 + ts.tv_nsec;
 }
+#endif
+#ifdef ASS_FLE_PROFILE
 #define FLE_START uint64_t fle_last = fle_clock()
 #define FLE_PHASE(n) do { \
     uint64_t fle_now = fle_clock(); \
@@ -229,6 +232,7 @@ void ass_renderer_done(ASS_Renderer *render_priv)
 
     render_context_done(&render_priv->state);
     ass_aligned_free(render_priv->raster_scratch);
+    ass_aligned_free(render_priv->blur_scratch);
     ass_outline_free(&render_priv->raster_outline[0]);
     ass_outline_free(&render_priv->raster_outline[1]);
 
@@ -2846,8 +2850,8 @@ size_t ass_composite_construct(void *key, void *value, void *priv)
     double r2x = restore_blur(k->filter.blur_x);
     double r2y = restore_blur(k->filter.blur_y);
     if (!(flags & FILTER_NONZERO_BORDER) || (flags & FILTER_BORDER_STYLE_3))
-        ass_synth_blur(&render_priv->engine, &v->bm, k->filter.be, r2x, r2y);
-    ass_synth_blur(&render_priv->engine, &v->bm_o, k->filter.be, r2x, r2y);
+        ass_synth_blur(render_priv, &v->bm, k->filter.be, r2x, r2y);
+    ass_synth_blur(render_priv, &v->bm_o, k->filter.be, r2x, r2y);
 
     if (!(flags & FILTER_FILL_IN_BORDER) && !(flags & FILTER_FILL_IN_SHADOW))
         ass_fix_outline(&v->bm, &v->bm_o);
@@ -3391,7 +3395,11 @@ static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
         active += event->Start <= now && now < event->Start + event->Duration;
     }
     if (!priv->event_pool) {
-        if (active < 32 && !getenv("LIBASS_RENDER_THREADS")) return false;
+        // A few large animated effects can cost more than many small events.
+        bool expensive = priv->experimental_edges && active >= 2 &&
+            priv->last_event_render_ns > 4000000;
+        if (active < 32 && !expensive && !getenv("LIBASS_RENDER_THREADS"))
+            return false;
         priv->event_pool = event_pool_init(priv);
         if (!priv->event_pool) return false;
     }
@@ -3741,6 +3749,7 @@ ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
     bool parallel = false;
 #ifdef ASS_EVENT_THREADS
     parallel = render_events_parallel(priv, track, now, &cnt);
+    uint64_t event_start = !parallel && priv->experimental_edges ? fle_clock() : 0;
 #endif
     if (!parallel)
     for (int i = 0; i < track->n_events; i++) {
@@ -3757,6 +3766,11 @@ ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
                 cnt++;
         }
     }
+
+#ifdef ASS_EVENT_THREADS
+    if (event_start)
+        priv->last_event_render_ns = fle_clock() - event_start;
+#endif
 
     // sort by layer
     if (cnt > 0)

@@ -24,6 +24,7 @@
 
 #include "ass_utils.h"
 #include "ass_bitmap.h"
+#include "ass_render.h"
 
 
 /*
@@ -181,8 +182,9 @@ void ass_gaussian_blur_bounds(double r2, int *padding, int *alignment)
     *alignment = 1 << blur.level;
 }
 
-bool ass_gaussian_blur(const BitmapEngine *engine, Bitmap *bm, double r2x, double r2y)
+bool ass_gaussian_blur(ASS_Renderer *renderer, Bitmap *bm, double r2x, double r2y)
 {
+    const BitmapEngine *engine = &renderer->engine;
     BlurMethod blur_x, blur_y;
     find_best_method(&blur_x, r2x);
     if (r2y == r2x)
@@ -200,7 +202,22 @@ bool ass_gaussian_blur(const BitmapEngine *engine, Bitmap *bm, double r2x, doubl
     if (size > INT_MAX / 4)
         return false;
 
-    int16_t *tmp = ass_aligned_alloc(2 * stripe_width, 4 * size, false);
+    size_t bytes = 4 * size;
+    // Each event worker owns its renderer and scratch; never share this buffer.
+    bool borrowed = renderer->experimental_edges && bytes <= 32 * 1024 * 1024;
+    if (borrowed && bytes > renderer->blur_scratch_size) {
+        size_t capacity = ass_align(1024 * 1024, bytes);
+        void *buffer = ass_aligned_alloc(2 * stripe_width, capacity, false);
+        if (buffer) {
+            ass_aligned_free(renderer->blur_scratch);
+            renderer->blur_scratch = buffer;
+            renderer->blur_scratch_size = capacity;
+        } else {
+            borrowed = false;
+        }
+    }
+    int16_t *tmp = borrowed ? renderer->blur_scratch :
+        ass_aligned_alloc(2 * stripe_width, bytes, false);
     if (!tmp)
         return false;
 
@@ -239,14 +256,14 @@ bool ass_gaussian_blur(const BitmapEngine *engine, Bitmap *bm, double r2x, doubl
     assert(w == end_w && h == end_h);
 
     if (!ass_realloc_bitmap(engine, bm, w, h)) {
-        ass_aligned_free(tmp);
+        if (!borrowed) ass_aligned_free(tmp);
         return false;
     }
     bm->left -= ((blur_x.radius + 4) << blur_x.level) - 4;
     bm->top  -= ((blur_y.radius + 4) << blur_y.level) - 4;
 
     engine->stripe_pack(bm->buffer, bm->stride, buf[index], w, h);
-    ass_aligned_free(tmp);
+    if (!borrowed) ass_aligned_free(tmp);
     return true;
 }
 

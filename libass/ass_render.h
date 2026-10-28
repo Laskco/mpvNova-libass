@@ -352,6 +352,9 @@ struct ass_renderer {
     size_t raster_scratch_size;
     bool experimental_edges;
     ASS_Outline raster_outline[2];
+    void *blur_scratch;
+    size_t blur_scratch_size;
+    uint64_t last_event_render_ns;
 };
 
 typedef struct render_priv {
