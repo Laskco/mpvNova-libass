@@ -20,6 +20,10 @@
 #include "ass_compat.h"
 
 #include <assert.h>
+#include <stdint.h>
+#if defined(__ARM_NEON) && UINTPTR_MAX == UINT32_MAX
+#include <arm_neon.h>
+#endif
 #ifdef _MSC_VER
 #include <intrin.h>
 #pragma intrinsic(_BitScanReverse)
@@ -262,6 +266,101 @@ static bool add_cubic(RasterizerData *rst, const ASS_Vector *pt)
 }
 
 
+#if UINTPTR_MAX == UINT32_MAX
+static size_t contour_split32(const ASS_Vector *points, size_t begin,
+                              size_t end, int tolerance)
+{
+    int32_t dx = points[end].x - points[begin].x;
+    int32_t dy = points[end].y - points[begin].y;
+    int32_t length2 = dx * dx + dy * dy;
+    int32_t error = tolerance * FFMAX(abs(dx), abs(dy));
+    int32_t largest = 0;
+    size_t split = begin;
+    size_t i = begin + 1;
+#if defined(__ARM_NEON)
+    if (length2) {
+        int32x4_t best = vdupq_n_s32(0);
+        uint32x4_t indices = vdupq_n_u32(begin);
+        const uint32_t offsets[4] = {0, 1, 2, 3};
+        uint32x4_t lanes = vld1q_u32(offsets);
+        for (; i + 4 <= end; i += 4) {
+            int32x4x2_t p = vld2q_s32((const int32_t *) (points + i));
+            int32x4_t x = vsubq_s32(p.val[0], vdupq_n_s32(points[begin].x));
+            int32x4_t y = vsubq_s32(p.val[1], vdupq_n_s32(points[begin].y));
+            int32x4_t dot = vmlaq_n_s32(vmulq_n_s32(x, dx), y, dy);
+            int32x4_t cross = vmlsq_n_s32(vmulq_n_s32(y, dx), x, dy);
+            // Saturation only clamps negative candidates; those cannot beat zero.
+            int32x4_t score = vmaxq_s32(
+                vsubq_s32(vabsq_s32(cross), vdupq_n_s32(error)),
+                vmaxq_s32(vsubq_s32(vnegq_s32(dot), vdupq_n_s32(error)),
+                          vqsubq_s32(dot, vdupq_n_s32(length2 + error))));
+            uint32x4_t larger = vcgtq_s32(score, best);
+            best = vmaxq_s32(score, best);
+            indices = vbslq_u32(larger, vaddq_u32(lanes, vdupq_n_u32(i)), indices);
+        }
+        int32_t scores[4];
+        uint32_t positions[4];
+        vst1q_s32(scores, best);
+        vst1q_u32(positions, indices);
+        // Equal scores must retain the first contour point, not the first lane.
+        for (int lane = 0; lane < 4; lane++) {
+            if (scores[lane] > largest ||
+                (scores[lane] == largest && positions[lane] < split)) {
+                largest = scores[lane];
+                split = positions[lane];
+            }
+        }
+    }
+#endif
+    for (; i < end; i++) {
+        int32_t x = points[i].x - points[begin].x;
+        int32_t y = points[i].y - points[begin].y;
+        int32_t score;
+        if (!length2) {
+            score = abs(x) + abs(y);
+        } else {
+            int32_t dot = dx * x + dy * y;
+            int32_t cross = dx * y - dy * x;
+            score = abs(cross) - error;
+            // Avoid subtracting length2 from a negative dot: that unused
+            // negative score could overflow even with the bounded products.
+            if (dot < -error) score = FFMAX(score, -dot - error);
+            if (dot > length2 + error) score = FFMAX(score, dot - length2 - error);
+        }
+        if (score > largest) {
+            largest = score;
+            split = i;
+        }
+    }
+    return split;
+}
+
+#if defined(__ARM_NEON)
+static bool contour_fits32(const ASS_Vector *points, size_t begin, size_t end)
+{
+    if (abs(points[end].x - points[begin].x) > 32700 ||
+        abs(points[end].y - points[begin].y) > 32700)
+        return false;
+    int32x4_t extent = vdupq_n_s32(0);
+    size_t i = begin + 1;
+    for (; i + 4 <= end + 1; i += 4) {
+        int32x4x2_t p = vld2q_s32((const int32_t *) (points + i));
+        int32x4_t x = vsubq_s32(p.val[0], vdupq_n_s32(points[begin].x));
+        int32x4_t y = vsubq_s32(p.val[1], vdupq_n_s32(points[begin].y));
+        extent = vmaxq_s32(extent, vmaxq_s32(vabsq_s32(x), vabsq_s32(y)));
+    }
+    int32_t lanes[4];
+    vst1q_s32(lanes, extent);
+    int32_t bound = FFMAX(FFMAX(lanes[0], lanes[1]), FFMAX(lanes[2], lanes[3]));
+    for (; i <= end; i++) {
+        bound = FFMAX(bound, abs(points[i].x - points[begin].x));
+        bound = FFMAX(bound, abs(points[i].y - points[begin].y));
+    }
+    return bound <= 32700;
+}
+#endif
+#endif
+
 static bool simplify_contour(RasterizerData *rst, size_t first, int tolerance)
 {
     size_t count = rst->size[0] - first;
@@ -281,6 +380,9 @@ static bool simplify_contour(RasterizerData *rst, size_t first, int tolerance)
         line->b > 0 ? line->x_max : line->x_min,
         line->a < 0 ? line->y_max : line->y_min
     };
+#if UINTPTR_MAX == UINT32_MAX
+    ASS_Rect bounds = {points[0].x, points[0].y, points[0].x, points[0].y};
+#endif
     size_t corner = 0;
     int64_t furthest = 0;
     for (size_t i = 0; i < count; i++) {
@@ -289,6 +391,10 @@ static bool simplify_contour(RasterizerData *rst, size_t first, int tolerance)
             line->b > 0 ? line->x_min : line->x_max,
             line->a < 0 ? line->y_min : line->y_max
         };
+#if UINTPTR_MAX == UINT32_MAX
+        rectangle_update(&bounds, points[i + 1].x, points[i + 1].y,
+                          points[i + 1].x, points[i + 1].y);
+#endif
         int64_t dx = (int64_t) points[i + 1].x - points[0].x;
         int64_t dy = (int64_t) points[i + 1].y - points[0].y;
         int64_t distance = llabs(dx) + llabs(dy);
@@ -301,6 +407,19 @@ static bool simplify_contour(RasterizerData *rst, size_t first, int tolerance)
         !corner || corner == count)
         return true;
 
+#if UINTPTR_MAX == UINT32_MAX
+    // 2 * 32700^2 + 16 * 32700 fits INT32_MAX. Keep the original
+    // wide arithmetic for larger contours or tolerances.
+    bool narrow = tolerance >= 0 && tolerance <= 16 &&
+        (int64_t) bounds.x_max - bounds.x_min <= 32700 &&
+        (int64_t) bounds.y_max - bounds.y_min <= 32700;
+#if defined(__ARM_NEON)
+    bool bounded = tolerance >= 0 && tolerance <= 16 &&
+        (int64_t) bounds.x_max - bounds.x_min <= (1 << 29) &&
+        (int64_t) bounds.y_max - bounds.y_min <= (1 << 29);
+#endif
+#endif
+
     memset(keep, 0, count + 1);
     keep[0] = keep[corner] = keep[count] = 1;
     size_t used = 0;
@@ -310,22 +429,34 @@ static bool simplify_contour(RasterizerData *rst, size_t first, int tolerance)
     stack[used++] = count;
     while (used) {
         size_t end = stack[--used], begin = stack[--used], split = begin;
-        int64_t dx = (int64_t) points[end].x - points[begin].x;
-        int64_t dy = (int64_t) points[end].y - points[begin].y;
-        int64_t length2 = dx * dx + dy * dy;
-        int64_t error = tolerance * FFMAX(llabs(dx), llabs(dy));
-        int64_t largest = 0;
-        for (size_t i = begin + 1; i < end; i++) {
-            int64_t x = (int64_t) points[i].x - points[begin].x;
-            int64_t y = (int64_t) points[i].y - points[begin].y;
-            int64_t dot = dx * x + dy * y;
-            int64_t cross = dx * y - dy * x;
-            int64_t score = FFMAX(llabs(cross) - error,
-                                  FFMAX(-dot - error, dot - length2 - error));
-            if (!length2) score = llabs(x) + llabs(y);
-            if (score > largest) {
-                largest = score;
-                split = i;
+#if UINTPTR_MAX == UINT32_MAX
+        bool use_narrow = narrow;
+#if defined(__ARM_NEON)
+        use_narrow = use_narrow ||
+            (bounded && end - begin >= 8 && contour_fits32(points, begin, end));
+#endif
+        if (use_narrow) {
+            split = contour_split32(points, begin, end, tolerance);
+        } else
+#endif
+        {
+            int64_t dx = (int64_t) points[end].x - points[begin].x;
+            int64_t dy = (int64_t) points[end].y - points[begin].y;
+            int64_t length2 = dx * dx + dy * dy;
+            int64_t error = tolerance * FFMAX(llabs(dx), llabs(dy));
+            int64_t largest = 0;
+            for (size_t i = begin + 1; i < end; i++) {
+                int64_t x = (int64_t) points[i].x - points[begin].x;
+                int64_t y = (int64_t) points[i].y - points[begin].y;
+                int64_t dot = dx * x + dy * y;
+                int64_t cross = dx * y - dy * x;
+                int64_t score = FFMAX(llabs(cross) - error,
+                                      FFMAX(-dot - error, dot - length2 - error));
+                if (!length2) score = llabs(x) + llabs(y);
+                if (score > largest) {
+                    largest = score;
+                    split = i;
+                }
             }
         }
         if (split != begin) {
