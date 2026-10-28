@@ -427,6 +427,170 @@ bool ass_outline_transform_2d(ASS_Outline *outline, const ASS_Outline *source,
     return true;
 }
 
+static inline bool append_affine_point(ASS_Outline *outline, ASS_Vector p,
+                                       const double m[2][3])
+{
+    double x = m[0][0] * p.x + m[0][1] * p.y + m[0][2];
+    double y = m[1][0] * p.x + m[1][1] * p.y + m[1][2];
+    if (!(fabs(x) < OUTLINE_MAX && fabs(y) < OUTLINE_MAX))
+        return false;
+    outline->points[outline->n_points++] = (ASS_Vector) {ass_lrint(x), ass_lrint(y)};
+    return true;
+}
+
+static bool reserve_temporary_outline(ASS_Outline *outline, size_t points, size_t segments)
+{
+    if (!points || !segments || points > SIZE_MAX - 255 || segments > SIZE_MAX - 255)
+        return false;
+    if (points > outline->max_points) {
+        size_t capacity = (points + 255) & ~(size_t) 255;
+        ASS_Vector *buffer = ass_realloc_array(outline->points, capacity, sizeof(*buffer));
+        if (!buffer) return false;
+        outline->points = buffer;
+        outline->max_points = capacity;
+    }
+    if (segments > outline->max_segments) {
+        size_t capacity = (segments + 255) & ~(size_t) 255;
+        char *buffer = realloc(outline->segments, capacity);
+        if (!buffer) return false;
+        outline->segments = buffer;
+        outline->max_segments = capacity;
+    }
+    outline->n_points = outline->n_segments = 0;
+    return true;
+}
+
+bool ass_outline_transform_2d_clipped(ASS_Outline *outline, const ASS_Outline *source,
+                                      const double m[2][3], const ASS_Rect *clip)
+{
+    if (!source || !source->n_points) {
+        outline->n_points = outline->n_segments = 0;
+        return true;
+    }
+    if (!reserve_temporary_outline(outline, source->n_points, source->n_segments)) {
+        ass_outline_free(outline);
+        return false;
+    }
+
+    bool axis_aligned = !m[0][1] && !m[1][0] && m[0][0] && m[1][1];
+    ASS_Rect local_clip = {0};
+    if (axis_aligned) {
+        double x0 = ((double) clip->x_min * 64 - 1 - m[0][2]) / m[0][0];
+        double x1 = ((double) clip->x_max * 64 + 1 - m[0][2]) / m[0][0];
+        double y0 = ((double) clip->y_min * 64 - 1 - m[1][2]) / m[1][1];
+        double y1 = ((double) clip->y_max * 64 + 1 - m[1][2]) / m[1][1];
+        local_clip.x_min = FFMINMAX(floor(FFMIN(x0, x1)) - 1, -OUTLINE_MAX, OUTLINE_MAX);
+        local_clip.x_max = FFMINMAX(ceil(FFMAX(x0, x1)) + 1, -OUTLINE_MAX, OUTLINE_MAX);
+        local_clip.y_min = FFMINMAX(floor(FFMIN(y0, y1)) - 1, -OUTLINE_MAX, OUTLINE_MAX);
+        local_clip.y_max = FFMINMAX(ceil(FFMAX(y0, y1)) + 1, -OUTLINE_MAX, OUTLINE_MAX);
+    }
+
+    size_t point = 0, segment = 0;
+    while (segment < source->n_segments) {
+        size_t first_point = point, first_segment = segment;
+        ASS_Rect hull;
+        rectangle_reset(&hull);
+        bool closed = false;
+        do {
+            unsigned flags = source->segments[segment++];
+            unsigned count = flags & OUTLINE_COUNT_MASK;
+            if (count < 1 || count > 3 || count > source->n_points - point)
+                goto invalid;
+            for (unsigned j = 0; j < count; j++) {
+                ASS_Vector p = source->points[point++];
+                rectangle_update(&hull, p.x, p.y, p.x, p.y);
+            }
+            closed = flags & OUTLINE_CONTOUR_END;
+        } while (!closed && segment < source->n_segments);
+        if (!closed) goto invalid;
+
+        // An affine transform maps the control hull inside this corner box.
+        // Only reject closed contours wholly outside the padded clip.
+        double lower[2] = {OUTLINE_MAX, OUTLINE_MAX};
+        double upper[2] = {-OUTLINE_MAX, -OUTLINE_MAX};
+        for (int corner = 0; corner < 4; corner++) {
+            int32_t x = corner & 1 ? hull.x_max : hull.x_min;
+            int32_t y = corner & 2 ? hull.y_max : hull.y_min;
+            for (int k = 0; k < 2; k++) {
+                double v = m[k][0] * x + m[k][1] * y + m[k][2];
+                if (!(fabs(v) < OUTLINE_MAX)) {
+                    ass_outline_free(outline);
+                    return ass_outline_transform_2d(outline, source, m);
+                }
+                lower[k] = FFMIN(lower[k], v);
+                upper[k] = FFMAX(upper[k], v);
+            }
+        }
+        if (upper[0] < (double) clip->x_min * 64 - 1 ||
+            upper[1] < (double) clip->y_min * 64 - 1 ||
+            lower[0] > (double) clip->x_max * 64 + 1 ||
+            lower[1] > (double) clip->y_max * 64 + 1)
+            continue;
+
+        if (axis_aligned) {
+            // A run sharing an outside half-plane can be replaced by its
+            // endpoint connection without changing winding inside the clip.
+            unsigned pending_sides = 0;
+            ASS_Vector pending = {0};
+            size_t offset = first_point, first_output = outline->n_segments;
+            for (size_t i = first_segment; i < segment; i++) {
+                unsigned flags = source->segments[i], count = flags & OUTLINE_COUNT_MASK;
+                ASS_Vector end = source->points[flags & OUTLINE_CONTOUR_END ? first_point : offset + count];
+                ASS_Rect bounds = {end.x, end.y, end.x, end.y};
+                for (unsigned j = 0; j < count; j++) {
+                    ASS_Vector p = source->points[offset + j];
+                    rectangle_update(&bounds, p.x, p.y, p.x, p.y);
+                }
+                unsigned sides = (bounds.x_max < local_clip.x_min ? 1u : 0u) |
+                    (bounds.x_min > local_clip.x_max ? 2u : 0u) |
+                    (bounds.y_max < local_clip.y_min ? 4u : 0u) |
+                    (bounds.y_min > local_clip.y_max ? 8u : 0u);
+                if (sides) {
+                    if (pending_sides && (pending_sides & sides)) {
+                        pending_sides &= sides;
+                    } else {
+                        if (pending_sides) {
+                            if (!append_affine_point(outline, pending, m)) goto invalid;
+                            outline->segments[outline->n_segments++] = OUTLINE_LINE_SEGMENT;
+                        }
+                        pending = source->points[offset];
+                        pending_sides = sides;
+                    }
+                } else {
+                    if (pending_sides) {
+                        if (!append_affine_point(outline, pending, m)) goto invalid;
+                        outline->segments[outline->n_segments++] = OUTLINE_LINE_SEGMENT;
+                        pending_sides = 0;
+                    }
+                    for (unsigned j = 0; j < count; j++)
+                        if (!append_affine_point(outline, source->points[offset + j], m)) goto invalid;
+                    outline->segments[outline->n_segments++] = count;
+                }
+                offset += count;
+            }
+            if (pending_sides) {
+                if (!append_affine_point(outline, pending, m)) goto invalid;
+                outline->segments[outline->n_segments++] = OUTLINE_LINE_SEGMENT;
+            }
+            if (outline->n_segments > first_output)
+                outline->segments[outline->n_segments - 1] |= OUTLINE_CONTOUR_END;
+        } else {
+            for (size_t i = first_point; i < point; i++)
+                if (!append_affine_point(outline, source->points[i], m)) goto invalid;
+            size_t count = segment - first_segment;
+            memcpy(outline->segments + outline->n_segments,
+                   source->segments + first_segment, count);
+            outline->n_segments += count;
+        }
+    }
+    if (point != source->n_points) goto invalid;
+    return true;
+
+invalid:
+    ass_outline_free(outline);
+    return false;
+}
+
 /*
  * \brief Apply perspective transform by 3x3 matrix to the outline
  * Result outline should be uninitialized or empty.

@@ -111,7 +111,8 @@ static bool render_context_init(RenderContext *state, ASS_Renderer *priv)
     if (!(state->shaper = ass_shaper_new(priv->cache.metrics_cache, priv->cache.face_size_metrics_cache)))
         return false;
 
-    return ass_rasterizer_init(&priv->engine, &state->rasterizer, RASTERIZER_PRECISION);
+    int tolerance = priv->experimental_edges ? 2 * RASTERIZER_PRECISION : RASTERIZER_PRECISION;
+    return ass_rasterizer_init(&priv->engine, &state->rasterizer, tolerance);
 }
 
 static void render_context_done(RenderContext *state)
@@ -152,6 +153,10 @@ ASS_Renderer *ass_renderer_init(ASS_Library *library)
 
     priv->library = library;
     priv->ftlibrary = ft;
+    const char *edges = getenv("LIBASS_EXPERIMENTAL_EDGES");
+    priv->experimental_edges = edges && !strcmp(edges, "1");
+    if (priv->experimental_edges)
+        ass_msg(library, MSGL_INFO, "Experimental ASS edge processing enabled");
     // images_root and related stuff is zero-filled in calloc
 
     unsigned flags = ASS_CPU_FLAG_ALL;
@@ -224,6 +229,8 @@ void ass_renderer_done(ASS_Renderer *render_priv)
 
     render_context_done(&render_priv->state);
     ass_aligned_free(render_priv->raster_scratch);
+    ass_outline_free(&render_priv->raster_outline[0]);
+    ass_outline_free(&render_priv->raster_outline[1]);
 
     free(render_priv->settings.default_font);
     free(render_priv->settings.default_family);
@@ -1435,7 +1442,8 @@ static void set_bitmap_clip(RenderContext *state, GlyphInfo *info,
         return;
     // Cropping individual glyphs can move a multi-glyph composite's blur
     // sampling origin. Keep that path unchanged, including shaped clusters.
-    if (state->text_info.length != 1 || state->text_info.glyphs[0].next)
+    if (!state->renderer->experimental_edges &&
+        (state->text_info.length != 1 || state->text_info.glyphs[0].next))
         return;
 
     ASS_Vector clip_pos;
@@ -1646,21 +1654,31 @@ size_t ass_bitmap_construct(void *key, void *value, void *priv)
     double m[3][3];
     restore_transform(m, k);
 
-    ASS_Outline outline[2];
+    ASS_Rect clip = {k->clip_min.x, k->clip_min.y, k->clip_max.x, k->clip_max.y};
+    ASS_Outline temporary[2] = {{0}};
+    bool reuse = state->renderer->experimental_edges && k->clip_align &&
+        !k->matrix_z.x && !k->matrix_z.y &&
+        outline_size(&k->outline->outline[0]) <= 512 * 1024 &&
+        outline_size(&k->outline->outline[1]) <= 512 * 1024;
+    ASS_Outline *outline = reuse ? state->renderer->raster_outline : temporary;
     if (k->matrix_z.x || k->matrix_z.y) {
         ass_outline_transform_3d(&outline[0], &k->outline->outline[0], m);
         ass_outline_transform_3d(&outline[1], &k->outline->outline[1], m);
+    } else if (state->renderer->experimental_edges && k->clip_align) {
+        ass_outline_transform_2d_clipped(&outline[0], &k->outline->outline[0], m, &clip);
+        ass_outline_transform_2d_clipped(&outline[1], &k->outline->outline[1], m, &clip);
     } else {
         ass_outline_transform_2d(&outline[0], &k->outline->outline[0], m);
         ass_outline_transform_2d(&outline[1], &k->outline->outline[1], m);
     }
 
-    ASS_Rect clip = {k->clip_min.x, k->clip_min.y, k->clip_max.x, k->clip_max.y};
     if (!ass_outline_to_bitmap(state, bm, &outline[0], &outline[1],
                                k->clip_align ? &clip : NULL, k->clip_align))
         memset(bm, 0, sizeof(*bm));
-    ass_outline_free(&outline[0]);
-    ass_outline_free(&outline[1]);
+    if (!reuse) {
+        ass_outline_free(&outline[0]);
+        ass_outline_free(&outline[1]);
+    }
     FLE_PHASE(6);
 #ifdef ASS_FLE_PROFILE
     render_priv->fle_phase_ns[8] += (uint64_t) bm->w * bm->h;

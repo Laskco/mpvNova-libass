@@ -350,6 +350,8 @@ struct ass_renderer {
 #endif
     uint8_t *raster_scratch;
     size_t raster_scratch_size;
+    bool experimental_edges;
+    ASS_Outline raster_outline[2];
 };
 
 typedef struct render_priv {

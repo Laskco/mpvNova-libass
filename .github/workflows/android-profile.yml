@@ -38,6 +38,14 @@ jobs:
             -Db_sanitize=address,undefined -Dtest=enabled -Dcompare=enabled \
             -Dfuzz=enabled -Dcheckasm=enabled -Dart-samples="$PWD/art"
           meson compile -C build
+      - name: Check experimental outline clipping under sanitizers
+        if: matrix.source == 'candidate'
+        run: |
+          cc -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -ffunction-sections -fdata-sections -Ibuild -Ilibass \
+            $(pkg-config --cflags freetype2) profile/edge-check.c \
+            libass/ass_outline.c libass/ass_utils.c -Wl,--gc-sections -lm -o build/edge-check
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 build/edge-check
       - name: Run upstream regression and malformed-input tests
         env:
           LIBASS_RENDER_THREADS: '4'
