@@ -2595,7 +2595,8 @@ static void set_composite_viewport(RenderContext *state, CombinedBitmapInfo *inf
     int64_t y1 = (int64_t)renderer->settings.frame_height - info->y + pad_y;
     if (x0 < INT32_MIN || y0 < INT32_MIN || x1 > INT32_MAX || y1 > INT32_MAX)
         return;
-    bool outside = false;
+    int64_t bx0 = INT64_MAX, by0 = INT64_MAX;
+    int64_t bx1 = INT64_MIN, by1 = INT64_MIN;
     for (int i = 0; i < info->bitmap_count; i++) {
         BitmapRef *ref = info->bitmaps + i;
         Bitmap *bm[2] = {ref->bm, ref->bm_o};
@@ -2604,10 +2605,19 @@ static void set_composite_viewport(RenderContext *state, CombinedBitmapInfo *inf
             if (!bm[j]) continue;
             int64_t left = (int64_t)pos[j].x + bm[j]->left;
             int64_t top = (int64_t)pos[j].y + bm[j]->top;
-            outside |= left < x0 || top < y0 || left + bm[j]->w > x1 || top + bm[j]->h > y1;
+            bx0 = FFMIN(bx0, left);
+            by0 = FFMIN(by0, top);
+            bx1 = FFMAX(bx1, left + bm[j]->w);
+            by1 = FFMAX(by1, top + bm[j]->h);
         }
     }
-    if (outside) {
+    if (bx1 <= bx0 || by1 <= by0)
+        return;
+    double area = (double)(bx1 - bx0) * (by1 - by0);
+    double visible = (double)FFMAX(0, FFMIN(bx1, x1) - FFMAX(bx0, x0)) *
+        FFMAX(0, FFMIN(by1, y1) - FFMAX(by0, y0));
+    // Preserve position-independent cache reuse for small or mostly visible runs.
+    if (area >= 1024 * 1024 && area - visible >= FFMAX(256 * 1024, area / 4)) {
         key->viewport = (ASS_Rect){x0, y0, x1, y1};
         key->viewport_align = FFMAX(1 << renderer->engine.align_order, FFMAX(ax, ay));
     }
