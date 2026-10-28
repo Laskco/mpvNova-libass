@@ -262,9 +262,93 @@ static bool add_cubic(RasterizerData *rst, const ASS_Vector *pt)
 }
 
 
+static bool simplify_contour(RasterizerData *rst, size_t first, int tolerance)
+{
+    size_t count = rst->size[0] - first;
+    if (count < 64 || count > 65536)
+        return true;
+    if (!check_capacity(rst, 1, count + 1))
+        return false;
+
+    // The second segment buffer is scratch until raster subdivision starts.
+    // Its storage is large and aligned enough for points, an interval stack,
+    // and a keep mask, even when size_t is 64 bits.
+    ASS_Vector *points = (void *) rst->linebuf[1];
+    size_t *stack = (void *) (points + count + 1);
+    uint8_t *keep = (void *) (stack + 2 * (count + 1));
+    struct segment *line = rst->linebuf[0] + first;
+    points[0] = (ASS_Vector) {
+        line->b > 0 ? line->x_max : line->x_min,
+        line->a < 0 ? line->y_max : line->y_min
+    };
+    size_t corner = 0;
+    int64_t furthest = 0;
+    for (size_t i = 0; i < count; i++) {
+        line = rst->linebuf[0] + first + i;
+        points[i + 1] = (ASS_Vector) {
+            line->b > 0 ? line->x_min : line->x_max,
+            line->a < 0 ? line->y_min : line->y_max
+        };
+        int64_t dx = (int64_t) points[i + 1].x - points[0].x;
+        int64_t dy = (int64_t) points[i + 1].y - points[0].y;
+        int64_t distance = llabs(dx) + llabs(dy);
+        if (distance > furthest) {
+            furthest = distance;
+            corner = i + 1;
+        }
+    }
+    if (points[count].x != points[0].x || points[count].y != points[0].y ||
+        !corner || corner == count)
+        return true;
+
+    memset(keep, 0, count + 1);
+    keep[0] = keep[corner] = keep[count] = 1;
+    size_t used = 0;
+    stack[used++] = 0;
+    stack[used++] = corner;
+    stack[used++] = corner;
+    stack[used++] = count;
+    while (used) {
+        size_t end = stack[--used], begin = stack[--used], split = begin;
+        int64_t dx = (int64_t) points[end].x - points[begin].x;
+        int64_t dy = (int64_t) points[end].y - points[begin].y;
+        int64_t length2 = dx * dx + dy * dy;
+        int64_t error = tolerance * FFMAX(llabs(dx), llabs(dy));
+        int64_t largest = 0;
+        for (size_t i = begin + 1; i < end; i++) {
+            int64_t x = (int64_t) points[i].x - points[begin].x;
+            int64_t y = (int64_t) points[i].y - points[begin].y;
+            int64_t dot = dx * x + dy * y;
+            int64_t cross = dx * y - dy * x;
+            int64_t score = FFMAX(llabs(cross) - error,
+                                  FFMAX(-dot - error, dot - length2 - error));
+            if (!length2) score = llabs(x) + llabs(y);
+            if (score > largest) {
+                largest = score;
+                split = i;
+            }
+        }
+        if (split != begin) {
+            keep[split] = 1;
+            stack[used++] = begin;
+            stack[used++] = split;
+            stack[used++] = split;
+            stack[used++] = end;
+        }
+    }
+    rst->size[0] = first;
+    ASS_Vector previous = points[0];
+    for (size_t i = 1; i <= count; i++) {
+        if (!keep[i]) continue;
+        if (!add_line(rst, previous, points[i])) return false;
+        previous = points[i];
+    }
+    return true;
+}
+
 bool ass_rasterizer_set_outline(RasterizerData *rst,
                                 const ASS_Outline *path, bool extra,
-                                const ASS_Rect *clip)
+                                const ASS_Rect *clip, int simplify)
 {
     if (!extra) {
         rectangle_reset(&rst->bbox);
@@ -315,6 +399,10 @@ bool ass_rasterizer_set_outline(RasterizerData *rst,
         default:
             return false;
         }
+        if (path->segments[i] & OUTLINE_CONTOUR_END) {
+            if (simplify && !simplify_contour(rst, contour_start, simplify))
+                return false;
+        }
         if (clip && (path->segments[i] & OUTLINE_CONTOUR_END)) {
             ASS_Rect bounds;
             rectangle_reset(&bounds);
@@ -332,6 +420,8 @@ bool ass_rasterizer_set_outline(RasterizerData *rst,
                 rst->size[0] = contour_start;
             contour_start = rst->size[0];
         }
+        if (path->segments[i] & OUTLINE_CONTOUR_END)
+            contour_start = rst->size[0];
     }
     assert(start == cur && (!cur || cur == path->points + path->n_points));
 

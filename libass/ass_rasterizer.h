@@ -67,7 +67,7 @@ void ass_rasterizer_done(RasterizerData *rst);
  */
 bool ass_rasterizer_set_outline(RasterizerData *rst,
                                 const ASS_Outline *path, bool extra,
-                                const ASS_Rect *clip);
+                                const ASS_Rect *clip, int simplify);
 
 /**
  * \brief Polyline rasterization function

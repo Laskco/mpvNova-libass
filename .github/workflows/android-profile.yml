@@ -44,7 +44,8 @@ jobs:
           cc -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
             -ffunction-sections -fdata-sections -Ibuild -Ilibass \
             $(pkg-config --cflags freetype2) profile/edge-check.c \
-            libass/ass_outline.c libass/ass_utils.c -Wl,--gc-sections -lm -o build/edge-check
+            libass/ass_outline.c libass/ass_rasterizer.c libass/ass_utils.c \
+            -Wl,--gc-sections -lm -o build/edge-check
           ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 build/edge-check
       - name: Exercise experimental mode with malformed subtitle inputs
         if: matrix.source == 'candidate'

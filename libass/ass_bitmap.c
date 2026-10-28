@@ -154,11 +154,15 @@ bool ass_outline_to_bitmap(RenderContext *state, Bitmap *bm,
     RasterizerData *rst = &state->rasterizer;
     // Contour rejection is opt-in because it can change edge rounding.
     const ASS_Rect *contour_clip = render_priv->experimental_edges ? clip : NULL;
-    if (outline1 && !ass_rasterizer_set_outline(rst, outline1, false, contour_clip)) {
-        ass_msg(render_priv->library, MSGL_WARN, "Failed to process glyph outline!\n");
-        return false;
-    }
-    if (outline2 && !ass_rasterizer_set_outline(rst, outline2, !!outline1, contour_clip)) {
+    bool complex = (outline1 && outline1->n_points >= 256) ||
+                   (outline2 && outline2->n_points >= 256);
+    int simplify = render_priv->experimental_edges && !clip && complex ? 16 : 0;
+    int original_error = rst->outline_error;
+    if (simplify) rst->outline_error = 16;
+    bool valid = (!outline1 || ass_rasterizer_set_outline(rst, outline1, false, contour_clip, simplify)) &&
+                 (!outline2 || ass_rasterizer_set_outline(rst, outline2, !!outline1, contour_clip, simplify));
+    rst->outline_error = original_error;
+    if (!valid) {
         ass_msg(render_priv->library, MSGL_WARN, "Failed to process glyph outline!\n");
         return false;
     }
