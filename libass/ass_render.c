@@ -1433,6 +1433,10 @@ static void set_bitmap_clip(RenderContext *state, GlyphInfo *info,
         info->shadow_x || info->shadow_y || info->border_style != 1 ||
         info->be > 16)
         return;
+    // Cropping individual glyphs can move a multi-glyph composite's blur
+    // sampling origin. Keep that path unchanged, including shaped clusters.
+    if (state->text_info.length != 1 || state->text_info.glyphs[0].next)
+        return;
 
     ASS_Vector clip_pos;
     Bitmap *clip = get_vector_clip(state, &clip_pos);
