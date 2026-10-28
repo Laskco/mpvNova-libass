@@ -152,11 +152,13 @@ bool ass_outline_to_bitmap(RenderContext *state, Bitmap *bm,
 {
     ASS_Renderer *render_priv = state->renderer;
     RasterizerData *rst = &state->rasterizer;
-    if (outline1 && !ass_rasterizer_set_outline(rst, outline1, false, clip)) {
+    // Keep every contour: removing invisible contours can change the
+    // fixed-point rasterizer's subdivision and edge-coverage rounding.
+    if (outline1 && !ass_rasterizer_set_outline(rst, outline1, false)) {
         ass_msg(render_priv->library, MSGL_WARN, "Failed to process glyph outline!\n");
         return false;
     }
-    if (outline2 && !ass_rasterizer_set_outline(rst, outline2, !!outline1, clip)) {
+    if (outline2 && !ass_rasterizer_set_outline(rst, outline2, !!outline1)) {
         ass_msg(render_priv->library, MSGL_WARN, "Failed to process glyph outline!\n");
         return false;
     }

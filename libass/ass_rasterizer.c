@@ -263,8 +263,7 @@ static bool add_cubic(RasterizerData *rst, const ASS_Vector *pt)
 
 
 bool ass_rasterizer_set_outline(RasterizerData *rst,
-                                const ASS_Outline *path, bool extra,
-                                const ASS_Rect *clip)
+                                const ASS_Outline *path, bool extra)
 {
     if (!extra) {
         rectangle_reset(&rst->bbox);
@@ -278,7 +277,6 @@ bool ass_rasterizer_set_outline(RasterizerData *rst,
 #endif
 
     ASS_Vector *start = path->points, *cur = start;
-    size_t contour_start = rst->size[0];
     for (size_t i = 0; i < path->n_segments; i++) {
         int n = path->segments[i] & OUTLINE_COUNT_MASK;
         cur += n;
@@ -315,29 +313,10 @@ bool ass_rasterizer_set_outline(RasterizerData *rst,
         default:
             return false;
         }
-        if (clip && (path->segments[i] & OUTLINE_CONTOUR_END)) {
-            ASS_Rect bounds;
-            rectangle_reset(&bounds);
-            for (size_t k = contour_start; k < rst->size[0]; k++) {
-                struct segment *line = &rst->linebuf[0][k];
-                rectangle_update(&bounds, line->x_min, line->y_min,
-                                  line->x_max, line->y_max);
-            }
-            // Preserve the original overall bounds and raster grid, even for
-            // closed contours that cannot affect a pixel in the window.
-            rectangle_update(&rst->bbox, bounds.x_min, bounds.y_min,
-                              bounds.x_max, bounds.y_max);
-            if ((int64_t) bounds.x_max < (int64_t) clip->x_min * 64 ||
-                (int64_t) bounds.y_max < (int64_t) clip->y_min * 64 ||
-                (int64_t) bounds.x_min > (int64_t) clip->x_max * 64 ||
-                (int64_t) bounds.y_min > (int64_t) clip->y_max * 64)
-                rst->size[0] = contour_start;
-            contour_start = rst->size[0];
-        }
     }
     assert(start == cur && (!cur || cur == path->points + path->n_points));
 
-    for (size_t k = rst->n_first; !clip && k < rst->size[0]; k++) {
+    for (size_t k = rst->n_first; k < rst->size[0]; k++) {
         struct segment *line = &rst->linebuf[0][k];
         rectangle_update(&rst->bbox,
                          line->x_min, line->y_min,

@@ -1416,11 +1416,11 @@ static void calc_transform_matrix(RenderContext *state,
  * After that, bitmaps are added to the cache.
  * They are returned in info->bm (glyph), info->bm_o (outline).
  */
-static int quantize_blur(double radius, int32_t *shadow_mask);
 static double restore_blur(int qblur);
 
 static void set_bitmap_clip(RenderContext *state, GlyphInfo *info,
-                            ASS_Vector pos, BitmapHashKey *key)
+                            ASS_Vector pos, BitmapHashKey *key,
+                            const FilterDesc *filter)
 {
     key->clip_align = 0;
     key->clip_min = key->clip_max = (ASS_Vector) {0, 0};
@@ -1444,10 +1444,8 @@ static void set_bitmap_clip(RenderContext *state, GlyphInfo *info,
         return;
 
     int pad_x = 0, pad_y = 0, align_x = 1, align_y = 1;
-    int32_t ignored;
-    double scale = 2 / sqrt(log(256));
-    double r2x = restore_blur(quantize_blur(info->blur * state->blur_scale_x * scale, &ignored));
-    double r2y = restore_blur(quantize_blur(info->blur * state->blur_scale_y * scale, &ignored));
+    double r2x = restore_blur(filter->blur_x);
+    double r2y = restore_blur(filter->blur_y);
     if (r2x > 0.001 || r2y > 0.001) {
         ass_gaussian_blur_bounds(r2x, &pad_x, &align_x);
         ass_gaussian_blur_bounds(r2y, &pad_y, &align_y);
@@ -1470,7 +1468,8 @@ static void
 get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
                  int32_t *leftmost_x,
                  ASS_Vector *pos, ASS_Vector *pos_o,
-                 ASS_DVector *offset, bool first, int flags)
+                 ASS_DVector *offset, bool first, int flags,
+                 const FilterDesc *filter)
 {
     ASS_Renderer *render_priv = state->renderer;
 
@@ -1495,7 +1494,7 @@ get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
     if (!quantize_transform(m, pos, offset, first, &key))
         return;
 
-    set_bitmap_clip(state, info, *pos, &key);
+    set_bitmap_clip(state, info, *pos, &key, filter);
     info->bm = ass_cache_get(render_priv->cache.bitmap_cache, &key, state);
     if (!info->bm || !info->bm->buffer)
         info->bm = NULL;
@@ -1620,7 +1619,7 @@ get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
             !quantize_transform(m, pos_o, offset, false, &key))
         return;
 
-    set_bitmap_clip(state, info, *pos_o, &key);
+    set_bitmap_clip(state, info, *pos_o, &key, filter);
     info->bm_o = ass_cache_get(render_priv->cache.bitmap_cache, &key, state);
     if (!info->bm_o || !info->bm_o->buffer) {
         info->bm_o = NULL;
@@ -2641,7 +2640,7 @@ static void render_and_combine_glyphs(RenderContext *state,
             info->pos.x = double_to_d6(device_x + d6_to_double(info->pos.x) * render_priv->par_scale_x);
             info->pos.y = double_to_d6(device_y) + info->pos.y;
             get_bitmap_glyph(state, info, &current_info->leftmost_x, &pos, &pos_o,
-                             &offset, !current_info->bitmap_count, flags);
+                             &offset, !current_info->bitmap_count, flags, &current_info->filter);
 
             if (!info->bm && !info->bm_o)
                 continue;
