@@ -319,8 +319,8 @@ void ass_shift_bitmap(Bitmap *bm, int shift_x, int shift_y)
 
     // Shift in y direction
     if (shift_y)
-        for (int32_t x = 0; x < w; x++) {
-            for (int32_t y = h - 1; y > 0; y--) {
+        for (int32_t y = h - 1; y > 0; y--) {
+            for (int32_t x = 0; x < w; x++) {
                 uint8_t b = buf[x + y * s - s] * shift_y >> 6;
                 buf[x + y * s - s] -= b;
                 buf[x + y * s] += b;
