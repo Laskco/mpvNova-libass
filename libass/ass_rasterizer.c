@@ -21,7 +21,7 @@
 
 #include <assert.h>
 #include <stdint.h>
-#if defined(__ARM_NEON) && UINTPTR_MAX == UINT32_MAX
+#if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
 #ifdef _MSC_VER
@@ -266,7 +266,7 @@ static bool add_cubic(RasterizerData *rst, const ASS_Vector *pt)
 }
 
 
-#if UINTPTR_MAX == UINT32_MAX
+#if UINTPTR_MAX == UINT32_MAX || defined(__aarch64__)
 static size_t contour_split32(const ASS_Vector *points, size_t begin,
                               size_t end, int tolerance)
 {
@@ -380,7 +380,7 @@ static bool simplify_contour(RasterizerData *rst, size_t first, int tolerance)
         line->b > 0 ? line->x_max : line->x_min,
         line->a < 0 ? line->y_max : line->y_min
     };
-#if UINTPTR_MAX == UINT32_MAX
+#if UINTPTR_MAX == UINT32_MAX || defined(__aarch64__)
     ASS_Rect bounds = {points[0].x, points[0].y, points[0].x, points[0].y};
 #endif
     size_t corner = 0;
@@ -391,7 +391,7 @@ static bool simplify_contour(RasterizerData *rst, size_t first, int tolerance)
             line->b > 0 ? line->x_min : line->x_max,
             line->a < 0 ? line->y_min : line->y_max
         };
-#if UINTPTR_MAX == UINT32_MAX
+#if UINTPTR_MAX == UINT32_MAX || defined(__aarch64__)
         rectangle_update(&bounds, points[i + 1].x, points[i + 1].y,
                           points[i + 1].x, points[i + 1].y);
 #endif
@@ -407,7 +407,7 @@ static bool simplify_contour(RasterizerData *rst, size_t first, int tolerance)
         !corner || corner == count)
         return true;
 
-#if UINTPTR_MAX == UINT32_MAX
+#if UINTPTR_MAX == UINT32_MAX || defined(__aarch64__)
     // 2 * 32700^2 + 16 * 32700 fits INT32_MAX. Keep the original
     // wide arithmetic for larger contours or tolerances.
     bool narrow = tolerance >= 0 && tolerance <= 16 &&
@@ -429,7 +429,7 @@ static bool simplify_contour(RasterizerData *rst, size_t first, int tolerance)
     stack[used++] = count;
     while (used) {
         size_t end = stack[--used], begin = stack[--used], split = begin;
-#if UINTPTR_MAX == UINT32_MAX
+#if UINTPTR_MAX == UINT32_MAX || defined(__aarch64__)
         bool use_narrow = narrow;
 #if defined(__ARM_NEON)
         use_narrow = use_narrow ||
