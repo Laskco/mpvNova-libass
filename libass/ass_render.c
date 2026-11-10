@@ -3359,6 +3359,10 @@ ass_start_frame(ASS_Renderer *render_priv, ASS_Track *track,
 
 #ifdef ASS_EVENT_THREADS
 typedef struct {
+    int event_index, next;
+} EventTask;
+
+typedef struct {
     struct ass_event_pool *pool;
     ASS_Renderer *renderer;
     pthread_t thread;
@@ -3373,9 +3377,10 @@ struct ass_event_pool {
     pthread_mutex_t lock;
     pthread_cond_t work, done;
     uint64_t generation;
-    int count, pending, active;
+    int count, pending;
     bool stop;
-    ASS_Event **events;
+    EventTask *events;
+    int first[4];
     size_t capacity;
     size_t glyph_budget, bitmap_budget, composite_budget;
 };
@@ -3401,16 +3406,23 @@ void ass_event_pool_cache_limits(ASS_Renderer *renderer)
                 renderer->cache.bitmap_max_size, renderer->cache.composite_max_size);
 }
 
+static void queue_event(struct ass_event_pool *pool, int event_index,
+                        int index, int **tail)
+{
+    ASS_Event *event = pool->owner->track->events + event_index;
+    unsigned id = (unsigned) event->ReadOrder % (pool->count + 1);
+    pool->events[index] = (EventTask) {event_index, -1};
+    *tail[id] = index;
+    tail[id] = &pool->events[index].next;
+}
+
 static uint64_t event_batch(struct ass_event_pool *pool, ASS_Renderer *renderer, int id)
 {
 #ifdef ASS_FLE_PROFILE
     uint64_t start = fle_clock();
 #endif
-    for (int i = 0; i < pool->active; i++) {
-        ASS_Event *event = pool->events[i];
-        // Stable ownership avoids invalidating the bitmap cache every frame.
-        if ((unsigned) event->ReadOrder % (pool->count + 1) != id)
-            continue;
+    for (int i = pool->first[id]; i >= 0; i = pool->events[i].next) {
+        ASS_Event *event = pool->owner->track->events + pool->events[i].event_index;
         EventImages *out = pool->owner->eimg + i;
         if (!ass_render_event(&renderer->state, event, out))
             out->event = NULL;
@@ -3510,12 +3522,24 @@ static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
         }
         return false;
     }
+    struct ass_event_pool *pool = priv->event_pool;
+    int *tail[4];
+    if (pool)
+        for (int i = 0; i <= pool->count; i++) {
+            pool->first[i] = -1;
+            tail[i] = &pool->first[i];
+        }
     int active = 0;
     for (int i = 0; i < track->n_events; i++) {
         ASS_Event *event = track->events + i;
-        active += event->Start <= now && now < event->Start + event->Duration;
+        if (event->Start <= now && now < event->Start + event->Duration) {
+            if (pool && active < pool->capacity)
+                queue_event(pool, i, active, tail);
+            active++;
+        }
     }
-    if (!priv->event_pool) {
+    bool queued = pool && active <= pool->capacity;
+    if (!pool) {
         // A few large animated effects can cost more than many small events.
         bool expensive = priv->experimental_edges && active >= 2 &&
             priv->last_event_render_ns > 4000000;
@@ -3523,8 +3547,8 @@ static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
             return false;
         priv->event_pool = event_pool_init(priv);
         if (!priv->event_pool) return false;
+        pool = priv->event_pool;
     }
-    struct ass_event_pool *pool = priv->event_pool;
     set_pool_cache_limits(pool, pool->glyph_budget, pool->bitmap_budget, pool->composite_budget);
     if (active > pool->capacity) {
         if (!ASS_REALLOC_ARRAY(pool->events, active)) return false;
@@ -3536,11 +3560,18 @@ static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
         priv->eimg = images;
         priv->eimg_size = active;
     }
-    pool->active = 0;
-    for (int i = 0; i < track->n_events; i++) {
-        ASS_Event *event = track->events + i;
-        if (event->Start <= now && now < event->Start + event->Duration)
-            pool->events[pool->active++] = event;
+    if (!queued) {
+        // Rebuild only after pool creation or growth, which can move tail pointers.
+        for (int i = 0; i <= pool->count; i++) {
+            pool->first[i] = -1;
+            tail[i] = &pool->first[i];
+        }
+        int index = 0;
+        for (int i = 0; i < track->n_events; i++) {
+            ASS_Event *event = track->events + i;
+            if (event->Start <= now && now < event->Start + event->Duration)
+                queue_event(pool, i, index++, tail);
+        }
     }
     for (int i = 0; i < pool->count; i++) {
         EventWorker *worker = pool->workers + i;
