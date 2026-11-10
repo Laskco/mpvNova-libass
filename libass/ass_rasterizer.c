@@ -682,7 +682,8 @@ static inline int segment_check_bottom(const struct segment *line, int32_t y)
  * \brief Split list of segments horizontally
  * \param src in: input array, can coincide with *dst0 or *dst1
  * \param n_src in: numbers of input segments for both groups
- * \param dst0, dst1 out: output arrays of at least n_src[0] + n_src[1] size
+ * \param dst0, dst1 out: output arrays of at least n_src[0] + n_src[1] size;
+ *                      dst1 may be NULL to discard the second output
  * \param n_dst0, n_dst1 out: numbers of output segments for both groups
  * \param winding out: resulting winding of bottom-split point
  * \param x in: split coordinate
@@ -713,20 +714,29 @@ static void polyline_split_horz(const struct segment *src, const size_t n_src[2]
             continue;
         }
         if (segment_check_left(src, x)) {
-            *dst1 = *src;
-            segment_move_x(dst1, x);
+            if (dst1) {
+                *dst1 = *src;
+                segment_move_x(dst1, x);
+                dst1++;
+            }
             n_dst1[group]++;
-            dst1++;
             continue;
         }
         if (src->flags & SEGFLAG_UL_DR)
             winding[group] += delta;
         *dst0 = *src;
-        segment_split_horz(dst0, dst1, x);
+        if (dst1) {
+            segment_split_horz(dst0, dst1, x);
+            dst1++;
+        } else {
+            dst0->x_max = x;
+            dst0->flags &= ~(dst0->flags & SEGFLAG_UL_DR ?
+                             SEGFLAG_EXACT_BOTTOM : SEGFLAG_EXACT_TOP);
+            dst0->flags |= SEGFLAG_EXACT_RIGHT;
+        }
         n_dst0[group]++;
         dst0++;
         n_dst1[group]++;
-        dst1++;
     }
 }
 
@@ -759,20 +769,29 @@ static void polyline_split_vert(const struct segment *src, const size_t n_src[2]
             continue;
         }
         if (segment_check_top(src, y)) {
-            *dst1 = *src;
-            segment_move_y(dst1, y);
+            if (dst1) {
+                *dst1 = *src;
+                segment_move_y(dst1, y);
+                dst1++;
+            }
             n_dst1[group]++;
-            dst1++;
             continue;
         }
         if (src->flags & SEGFLAG_UL_DR)
             winding[group] += delta;
         *dst0 = *src;
-        segment_split_vert(dst0, dst1, y);
+        if (dst1) {
+            segment_split_vert(dst0, dst1, y);
+            dst1++;
+        } else {
+            dst0->y_max = y;
+            dst0->flags &= ~(dst0->flags & SEGFLAG_UL_DR ?
+                             SEGFLAG_EXACT_RIGHT : SEGFLAG_EXACT_LEFT);
+            dst0->flags |= SEGFLAG_EXACT_BOTTOM;
+        }
         n_dst0[group]++;
         dst0++;
         n_dst1[group]++;
-        dst1++;
     }
 }
 
@@ -944,6 +963,9 @@ static bool rasterizer_fill_level(const BitmapEngine *engine, RasterizerData *rs
         width1 -= width;
         x1 += width;
         buf1 += width;
+        // The second child would be rejected before reading its segments.
+        if (clip && x1 >= clip->x_max)
+            dst1 = NULL;
         polyline_split_horz(line, n_lines,
                             dst0, n_next0, dst1, n_next1,
                             winding1, (int32_t) width << 6);
@@ -952,18 +974,21 @@ static bool rasterizer_fill_level(const BitmapEngine *engine, RasterizerData *rs
         height1 -= height;
         y1 += height;
         buf1 += height * stride;
+        if (clip && y1 >= clip->y_max)
+            dst1 = NULL;
         polyline_split_vert(line, n_lines,
                             dst0, n_next0, dst1, n_next1,
                             winding1, (int32_t) height << 6);
     }
+    bool keep1 = dst1 != NULL;
     rst->size[index ^ 0] = offs  + n_next0[0] + n_next0[1];
-    rst->size[index ^ 1] = offs1 + n_next1[0] + n_next1[1];
+    rst->size[index ^ 1] = offs1 + (keep1 ? n_next1[0] + n_next1[1] : 0);
 
     if (!rasterizer_fill_level(engine, rst, buf, width, height, stride,
                                index ^ 0, n_next0, winding, clip, x0, y0))
         return false;
     assert(rst->size[index ^ 0] == offs);
-    if (!rasterizer_fill_level(engine, rst, buf1, width1, height1, stride,
+    if (keep1 && !rasterizer_fill_level(engine, rst, buf1, width1, height1, stride,
                                index ^ 1, n_next1, winding1, clip, x1, y1))
         return false;
     assert(rst->size[index ^ 1] == offs1);
