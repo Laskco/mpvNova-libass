@@ -182,7 +182,8 @@ void ass_gaussian_blur_bounds(double r2, int *padding, int *alignment)
     *alignment = 1 << blur.level;
 }
 
-bool ass_gaussian_blur(ASS_Renderer *renderer, Bitmap *bm, double r2x, double r2y)
+bool ass_gaussian_blur(ASS_Renderer *renderer, Bitmap *bm, const Bitmap *src,
+                       double r2x, double r2y)
 {
     const BitmapEngine *engine = &renderer->engine;
     BlurMethod blur_x, blur_y;
@@ -191,7 +192,8 @@ bool ass_gaussian_blur(ASS_Renderer *renderer, Bitmap *bm, double r2x, double r2
         memcpy(&blur_y, &blur_x, sizeof(blur_y));
     else find_best_method(&blur_y, r2y);
 
-    uint32_t w = bm->w, h = bm->h;
+    uint32_t w = src->w, h = src->h;
+    int left = src->left, top = src->top;
     int offset_x = ((2 * blur_x.radius + 9) << blur_x.level) - 5;
     int offset_y = ((2 * blur_y.radius + 9) << blur_y.level) - 5;
     uint32_t end_w = ((w + offset_x) & ~((1 << blur_x.level) - 1)) - 4;
@@ -221,7 +223,7 @@ bool ass_gaussian_blur(ASS_Renderer *renderer, Bitmap *bm, double r2x, double r2
     if (!tmp)
         return false;
 
-    engine->stripe_unpack(tmp, bm->buffer, bm->stride, w, h);
+    engine->stripe_unpack(tmp, src->buffer, src->stride, w, h);
     int16_t *buf[2] = {tmp, tmp + size};
     int index = 0;
 
@@ -259,8 +261,8 @@ bool ass_gaussian_blur(ASS_Renderer *renderer, Bitmap *bm, double r2x, double r2
         if (!borrowed) ass_aligned_free(tmp);
         return false;
     }
-    bm->left -= ((blur_x.radius + 4) << blur_x.level) - 4;
-    bm->top  -= ((blur_y.radius + 4) << blur_y.level) - 4;
+    bm->left = left - (((blur_x.radius + 4) << blur_x.level) - 4);
+    bm->top  = top - (((blur_y.radius + 4) << blur_y.level) - 4);
 
     engine->stripe_pack(bm->buffer, bm->stride, buf[index], w, h);
     if (!borrowed) ass_aligned_free(tmp);

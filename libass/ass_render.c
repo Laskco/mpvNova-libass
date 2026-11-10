@@ -2880,8 +2880,19 @@ size_t ass_composite_construct(void *key, void *value, void *priv)
     }
 
     int bord = ass_be_padding(k->filter.be);
+    int flags = k->filter.flags;
+    double r2x = restore_blur(k->filter.blur_x);
+    double r2y = restore_blur(k->filter.blur_y);
+    bool gaussian = r2x > 0.001 || r2y > 0.001;
+    bool blur_fill = !(flags & FILTER_NONZERO_BORDER) || (flags & FILTER_BORDER_STYLE_3);
+    bool fill_blurred = false, outline_blurred = false;
     if (!bord && n_bm == 1) {
-        ass_copy_bitmap(&render_priv->engine, &v->bm, last->bm);
+        // Gaussian blur unpacks the source before allocating its output. Read
+        // immutable cached bitmaps directly when no pre-blur cropping is needed.
+        if (gaussian && blur_fill && !k->viewport_align)
+            fill_blurred = ass_gaussian_blur(render_priv, &v->bm, last->bm, r2x, r2y);
+        if (!fill_blurred)
+            ass_copy_bitmap(&render_priv->engine, &v->bm, last->bm);
         v->bm.left += last->pos.x;
         v->bm.top  += last->pos.y;
     } else if (n_bm && ass_alloc_bitmap(&render_priv->engine, &v->bm,
@@ -2906,7 +2917,10 @@ size_t ass_composite_construct(void *key, void *value, void *priv)
         }
     }
     if (!bord && n_bm_o == 1) {
-        ass_copy_bitmap(&render_priv->engine, &v->bm_o, last_o->bm_o);
+        if (gaussian && !k->viewport_align)
+            outline_blurred = ass_gaussian_blur(render_priv, &v->bm_o, last_o->bm_o, r2x, r2y);
+        if (!outline_blurred)
+            ass_copy_bitmap(&render_priv->engine, &v->bm_o, last_o->bm_o);
         v->bm_o.left += last_o->pos_o.x;
         v->bm_o.top  += last_o->pos_o.y;
     } else if (n_bm_o && ass_alloc_bitmap(&render_priv->engine, &v->bm_o,
@@ -2934,12 +2948,10 @@ size_t ass_composite_construct(void *key, void *value, void *priv)
     crop_composite_bitmap(&render_priv->engine, &v->bm, k);
     crop_composite_bitmap(&render_priv->engine, &v->bm_o, k);
 
-    int flags = k->filter.flags;
-    double r2x = restore_blur(k->filter.blur_x);
-    double r2y = restore_blur(k->filter.blur_y);
-    if (!(flags & FILTER_NONZERO_BORDER) || (flags & FILTER_BORDER_STYLE_3))
+    if (blur_fill && !fill_blurred)
         ass_synth_blur(render_priv, &v->bm, k->filter.be, r2x, r2y);
-    ass_synth_blur(render_priv, &v->bm_o, k->filter.be, r2x, r2y);
+    if (!outline_blurred)
+        ass_synth_blur(render_priv, &v->bm_o, k->filter.be, r2x, r2y);
 
     if (!(flags & FILTER_FILL_IN_BORDER) && !(flags & FILTER_FILL_IN_SHADOW))
         ass_fix_outline(&v->bm, &v->bm_o);
@@ -3009,6 +3021,27 @@ static void add_background(RenderContext *state, EventImages *event_images)
     }
 }
 
+static bool event_is_transparent(RenderContext *state)
+{
+    // Unpositioned events still need layout for collision avoidance. Style 4
+    // also paints a separate background using the final render-context color.
+    if (state->detect_collisions || !(state->evt_type & EVENT_POSITIONED) ||
+        state->border_style == 4)
+        return false;
+    for (int i = 0; i < state->text_info.length; i++) {
+        GlyphInfo *info = state->text_info.glyphs + i;
+        if (info->border_style == 4)
+            return false;
+        for (int j = 0; j < 4; j++) {
+            uint32_t color = info->c[j];
+            ass_apply_fade(&color, info->fade);
+            if ((color & 255) != 255)
+                return false;
+        }
+    }
+    return true;
+}
+
 /**
  * \brief Main ass rendering function, glues everything together
  * \param event event to render
@@ -3037,8 +3070,8 @@ ass_render_event(RenderContext *state, ASS_Event *event,
         return false;
 
     TextInfo *text_info = &state->text_info;
-    if (text_info->length == 0) {
-        // no valid symbols in the event; this can be smth like {comment}
+    if (text_info->length == 0 || event_is_transparent(state)) {
+        // No visible output, and no collision layout to preserve.
         free_render_context(state);
         return false;
     }

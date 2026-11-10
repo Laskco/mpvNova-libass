@@ -50,7 +50,8 @@ void ass_gaussian_blur_bounds(double r2, int *padding, int *alignment);
 void ass_synth_blur(ASS_Renderer *renderer, Bitmap *bm,
                     int be, double blur_r2x, double blur_r2y);
 
-bool ass_gaussian_blur(ASS_Renderer *renderer, Bitmap *bm, double r2x, double r2y);
+bool ass_gaussian_blur(ASS_Renderer *renderer, Bitmap *dst, const Bitmap *src,
+                       double r2x, double r2y);
 void ass_shift_bitmap(Bitmap *bm, int shift_x, int shift_y);
 void ass_fix_outline(Bitmap *bm_g, Bitmap *bm_o);
 

@@ -74,7 +74,7 @@ void ass_synth_blur(ASS_Renderer *renderer, Bitmap *bm,
 
     // Apply gaussian blur
     if (blur_r2x > 0.001 || blur_r2y > 0.001)
-        ass_gaussian_blur(renderer, bm, blur_r2x, blur_r2y);
+        ass_gaussian_blur(renderer, bm, bm, blur_r2x, blur_r2y);
 
     if (!be)
         return;
