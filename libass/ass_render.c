@@ -217,6 +217,8 @@ void ass_renderer_done(ASS_Renderer *render_priv)
     free(render_priv->font_config);
 #endif
 
+    render_context_done(&render_priv->state);
+
     ass_cache_done(render_priv->cache.composite_cache);
     ass_cache_done(render_priv->cache.bitmap_cache);
     ass_cache_done(render_priv->cache.outline_cache);
@@ -230,7 +232,6 @@ void ass_renderer_done(ASS_Renderer *render_priv)
         FT_Done_FreeType(render_priv->ftlibrary);
     free(render_priv->eimg);
 
-    render_context_done(&render_priv->state);
     ass_aligned_free(render_priv->raster_scratch);
     ass_aligned_free(render_priv->blur_scratch);
     ass_outline_free(&render_priv->raster_outline[0]);
