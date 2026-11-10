@@ -2837,6 +2837,8 @@ static void crop_composite_bitmap(const BitmapEngine *engine, Bitmap *bm,
         memset(bm, 0, sizeof(*bm));
         return;
     }
+    if (key->filter.be && (x1 - x0 < 2 || y1 - y0 < 2))
+        return;
     if (!x0 && !y0 && x1 == bm->w && y1 == bm->h)
         return;
     Bitmap cropped = {0};
@@ -3363,6 +3365,15 @@ typedef struct {
 } EventTask;
 
 typedef struct {
+    FilterFunc *plain;
+    ParamFilterFunc *param_filter;
+    int16_t *dst;
+    const int16_t *src, *coeff;
+    size_t width, src_h, dst_h, stripe;
+    unsigned lanes;
+} VerticalTask;
+
+typedef struct {
     struct ass_event_pool *pool;
     ASS_Renderer *renderer;
     pthread_t thread;
@@ -3378,7 +3389,9 @@ struct ass_event_pool {
     pthread_cond_t work, done;
     uint64_t generation;
     int count, pending;
-    bool stop;
+    bool stop, event_ready;
+    enum { JOB_IDLE, JOB_EVENTS, JOB_VERTICAL } job_kind;
+    VerticalTask vertical;
     EventTask *events;
     int first[4];
     size_t capacity;
@@ -3401,7 +3414,7 @@ static void set_pool_cache_limits(struct ass_event_pool *pool, size_t glyphs,
 
 void ass_event_pool_cache_limits(ASS_Renderer *renderer)
 {
-    if (renderer->event_pool)
+    if (renderer->event_pool && renderer->event_pool->event_ready)
         set_pool_cache_limits(renderer->event_pool, renderer->cache.glyph_max,
                 renderer->cache.bitmap_max_size, renderer->cache.composite_max_size);
 }
@@ -3434,6 +3447,27 @@ static uint64_t event_batch(struct ass_event_pool *pool, ASS_Renderer *renderer,
 #endif
 }
 
+static void vertical_batch(const VerticalTask *task, unsigned id)
+{
+    if (id >= task->lanes)
+        return;
+    size_t stripes = (task->width + task->stripe - 1) / task->stripe;
+    size_t begin = stripes / task->lanes * id + stripes % task->lanes * id / task->lanes;
+    size_t end = stripes / task->lanes * (id + 1) +
+                 stripes % task->lanes * (id + 1) / task->lanes;
+    if (begin == end)
+        return;
+    size_t x = begin * task->stripe;
+    // Keep full-height stripes intact: vertical kernels need no cross-stripe halo.
+    size_t width = end == stripes ? task->width - x : (end - begin) * task->stripe;
+    const int16_t *src = task->src + x * task->src_h;
+    int16_t *dst = task->dst + x * task->dst_h;
+    if (task->param_filter)
+        task->param_filter(dst, src, width, task->src_h, task->coeff);
+    else
+        task->plain(dst, src, width, task->src_h);
+}
+
 static void *event_worker(void *arg)
 {
     EventWorker *worker = arg;
@@ -3446,7 +3480,10 @@ static void *event_worker(void *arg)
         if (pool->stop) break;
         seen = pool->generation;
         pthread_mutex_unlock(&pool->lock);
-        worker->batch_ns = event_batch(pool, worker->renderer, worker->id);
+        if (pool->job_kind == JOB_VERTICAL)
+            vertical_batch(&pool->vertical, worker->id);
+        else
+            worker->batch_ns = event_batch(pool, worker->renderer, worker->id);
         pthread_mutex_lock(&pool->lock);
         if (!--pool->pending)
             pthread_cond_signal(&pool->done);
@@ -3493,29 +3530,95 @@ static struct ass_event_pool *event_pool_init(ASS_Renderer *owner)
     }
     for (int i = 0; i < threads - 1; i++) {
         EventWorker *worker = pool->workers + i;
-        worker->renderer = ass_renderer_init(owner->library);
         worker->pool = pool;
         worker->id = i + 1;
         worker->render_id = -1;
-        if (!worker->renderer) { event_pool_done(pool); return NULL; }
         if (pthread_create(&worker->thread, NULL, event_worker, worker)) {
-            ass_renderer_done(worker->renderer);
             event_pool_done(pool);
             return NULL;
         }
         pool->count++;
     }
-    // Split, rather than multiply, the caller's original cache budgets.
+    return pool;
+}
+
+static bool event_pool_prepare_events(struct ass_event_pool *pool)
+{
+    if (pool->event_ready)
+        return true;
+    for (int i = 0; i < pool->count; i++) {
+        ASS_Renderer *renderer = ass_renderer_init(pool->owner->library);
+        if (!renderer) {
+            for (int j = 0; j < i; j++) {
+                ass_renderer_done(pool->workers[j].renderer);
+                pool->workers[j].renderer = NULL;
+            }
+            return false;
+        }
+        renderer->is_event_worker = true;
+        pool->workers[i].renderer = renderer;
+    }
+    pool->event_ready = true;
+    ASS_Renderer *owner = pool->owner;
+    // Stage-only pools do not own renderer caches or split caller budgets.
     set_pool_cache_limits(pool, owner->cache.glyph_max,
             owner->cache.bitmap_max_size, owner->cache.composite_max_size);
-    return pool;
+    return true;
+}
+
+bool ass_run_vertical_filter(ASS_Renderer *renderer, FilterFunc *plain,
+                             ParamFilterFunc *param_filter, int16_t *dst,
+                             const int16_t *src, size_t width, size_t src_h,
+                             size_t dst_h, const int16_t *coeff)
+{
+    if (renderer->is_event_worker || !width || !src_h || !dst_h ||
+        !src || !dst || src == dst || !!plain == !!param_filter ||
+        (param_filter && !coeff))
+        return false;
+    if (width < 128 * 1024 && src_h < (128 * 1024 + width - 1) / width)
+        return false;
+    size_t stripe = (size_t) 1 << (renderer->engine.align_order - 1);
+    if (width > SIZE_MAX - (stripe - 1))
+        return false;
+    size_t stripes = (width + stripe - 1) / stripe;
+    if (stripes < 2 || src_h > PTRDIFF_MAX / sizeof(*src) / (stripes * stripe) ||
+        dst_h > PTRDIFF_MAX / sizeof(*dst) / (stripes * stripe))
+        return false;
+    struct ass_event_pool *pool = renderer->event_pool;
+    if (pool && pool->job_kind != JOB_IDLE)
+        return false;
+    const char *value = getenv("LIBASS_RENDER_THREADS");
+    if (value && atoi(value) <= 1)
+        return false;
+    if (!pool) {
+        pool = event_pool_init(renderer);
+        if (!pool)
+            return false;
+        renderer->event_pool = pool;
+    }
+    pthread_mutex_lock(&pool->lock);
+    pool->vertical = (VerticalTask) {plain, param_filter, dst, src, coeff,
+        width, src_h, dst_h, stripe, (unsigned) FFMIN(stripes, (size_t) pool->count + 1)};
+    pool->job_kind = JOB_VERTICAL;
+    pool->pending = pool->count;
+    pool->generation++;
+    pthread_cond_broadcast(&pool->work);
+    pthread_mutex_unlock(&pool->lock);
+    vertical_batch(&pool->vertical, 0);
+    pthread_mutex_lock(&pool->lock);
+    while (pool->pending)
+        pthread_cond_wait(&pool->done, &pool->lock);
+    pool->job_kind = JOB_IDLE;
+    memset(&pool->vertical, 0, sizeof(pool->vertical));
+    pthread_mutex_unlock(&pool->lock);
+    return true;
 }
 
 static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
                                    long long now, int *rendered)
 {
     if (priv->custom_font_provider) {
-        if (priv->event_pool) {
+        if (priv->event_pool && priv->event_pool->event_ready) {
             priv->cache.glyph_max = priv->event_pool->glyph_budget;
             priv->cache.bitmap_max_size = priv->event_pool->bitmap_budget;
             priv->cache.composite_max_size = priv->event_pool->composite_budget;
@@ -3539,15 +3642,20 @@ static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
         }
     }
     bool queued = pool && active <= pool->capacity;
-    if (!pool) {
+    if (!pool || !pool->event_ready) {
         // A few large animated effects can cost more than many small events.
         bool expensive = priv->experimental_edges && active >= 2 &&
             priv->last_event_render_ns > 4000000;
-        if (active < 32 && !expensive && !getenv("LIBASS_RENDER_THREADS"))
+        const char *value = getenv("LIBASS_RENDER_THREADS");
+        if ((active < 32 && !expensive && !value) || (value && atoi(value) <= 1))
             return false;
-        priv->event_pool = event_pool_init(priv);
-        if (!priv->event_pool) return false;
-        pool = priv->event_pool;
+        if (!pool) {
+            priv->event_pool = event_pool_init(priv);
+            if (!priv->event_pool) return false;
+            pool = priv->event_pool;
+        }
+        if (!event_pool_prepare_events(pool))
+            return false;
     }
     set_pool_cache_limits(pool, pool->glyph_budget, pool->bitmap_budget, pool->composite_budget);
     if (active > pool->capacity) {
@@ -3584,6 +3692,7 @@ static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
 #endif
     }
     pthread_mutex_lock(&pool->lock);
+    pool->job_kind = JOB_EVENTS;
     pool->pending = pool->count;
     pool->generation++;
     pthread_cond_broadcast(&pool->work);
@@ -3592,6 +3701,7 @@ static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
     pthread_mutex_lock(&pool->lock);
     while (pool->pending)
         pthread_cond_wait(&pool->done, &pool->lock);
+    pool->job_kind = JOB_IDLE;
     pthread_mutex_unlock(&pool->lock);
 #ifdef ASS_FLE_PROFILE
     ass_msg(priv->library, MSGL_INFO, "FLE_WORKERS,%lld,%" PRIu64 ",%" PRIu64
@@ -3610,6 +3720,23 @@ static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
             priv->eimg[cnt++] = priv->eimg[i];
     *rendered = cnt;
     return true;
+}
+#else
+bool ass_run_vertical_filter(ASS_Renderer *renderer, FilterFunc *plain,
+                             ParamFilterFunc *param_filter, int16_t *dst,
+                             const int16_t *src, size_t width, size_t src_h,
+                             size_t dst_h, const int16_t *coeff)
+{
+    (void) renderer;
+    (void) plain;
+    (void) param_filter;
+    (void) dst;
+    (void) src;
+    (void) width;
+    (void) src_h;
+    (void) dst_h;
+    (void) coeff;
+    return false;
 }
 #endif
 

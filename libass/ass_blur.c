@@ -194,6 +194,45 @@ void ass_gaussian_blur_bounds(double r2, int *padding, int *alignment)
     *alignment = 1 << blur.level;
 }
 
+static bool blur_buffer_fits(uint64_t w, uint64_t h, int stripe_width,
+                             uint64_t capacity)
+{
+    uint64_t stride = (w + stripe_width - 1) & ~(uint64_t) (stripe_width - 1);
+    return stride && h <= capacity / sizeof(int16_t) / stride;
+}
+
+static bool can_reuse_blur_output(const BlurMethod *blur_x, const BlurMethod *blur_y,
+                                  uint32_t w, uint32_t h, uint32_t end_w, uint32_t end_h,
+                                  int stripe_width, uint64_t capacity)
+{
+    const BlurMethod *blur[2] = {blur_x, blur_y};
+    uint64_t dim[2] = {w, h};
+    int index = 0;
+
+    // Check every odd pass, including rounded tail lanes, before allocating output.
+    for (int axis = 1; axis >= 0; axis--)
+        for (int i = 0; i < blur[axis]->level; i++) {
+            dim[axis] = (dim[axis] + 5) >> 1;
+            index ^= 1;
+            if (index && !blur_buffer_fits(dim[0], dim[1], stripe_width, capacity))
+                return false;
+        }
+    for (int axis = 0; axis < 2; axis++) {
+        dim[axis] += 2 * blur[axis]->radius;
+        index ^= 1;
+        if (index && !blur_buffer_fits(dim[0], dim[1], stripe_width, capacity))
+            return false;
+    }
+    for (int axis = 0; axis < 2; axis++)
+        for (int i = 0; i < blur[axis]->level; i++) {
+            dim[axis] = 2 * dim[axis] + 4;
+            index ^= 1;
+            if (index && !blur_buffer_fits(dim[0], dim[1], stripe_width, capacity))
+                return false;
+        }
+    return !index && dim[0] == end_w && dim[1] == end_h;
+}
+
 bool ass_gaussian_blur(ASS_Renderer *renderer, Bitmap *bm, const Bitmap *src,
                        double r2x, double r2y)
 {
@@ -216,7 +255,14 @@ bool ass_gaussian_blur(ASS_Renderer *renderer, Bitmap *bm, const Bitmap *src,
     if (size > INT_MAX / 4)
         return false;
 
-    size_t bytes = 4 * size;
+    const int alignment = 2 * stripe_width;
+    uint64_t output_stride = ((uint64_t) end_w + alignment - 1) & ~(uint64_t) (alignment - 1);
+    // ass_alloc_bitmap reserves an extra alignment unit after the last row.
+    uint64_t output_capacity = output_stride * end_h + alignment;
+    bool reuse_output = (blur_x.level || blur_y.level) &&
+        can_reuse_blur_output(&blur_x, &blur_y, w, h, end_w, end_h,
+                              stripe_width, output_capacity);
+    size_t bytes = (reuse_output ? 2 : 4) * size;
     // Each event worker owns its renderer and scratch; never share this buffer.
     size_t scratch_limit = (renderer->experimental_edges ? 32 : 8) * 1024 * 1024;
     bool borrowed = bytes <= scratch_limit;
@@ -237,11 +283,18 @@ bool ass_gaussian_blur(ASS_Renderer *renderer, Bitmap *bm, const Bitmap *src,
         return false;
 
     engine->stripe_unpack(tmp, src->buffer, src->stride, w, h);
-    int16_t *buf[2] = {tmp, tmp + size};
+    // Unpack first: bm may alias src, whose allocation is freed by reallocation.
+    if (reuse_output && !ass_realloc_bitmap(engine, bm, end_w, end_h)) {
+        if (!borrowed) ass_aligned_free(tmp);
+        return false;
+    }
+    int16_t *buf[2] = {tmp, reuse_output ? (int16_t *) bm->buffer : tmp + size};
     int index = 0;
 
     for (int i = 0; i < blur_y.level; i++) {
-        engine->shrink_vert(buf[index ^ 1], buf[index], w, h);
+        if (!ass_run_vertical_filter(renderer, engine->shrink_vert, NULL,
+                buf[index ^ 1], buf[index], w, h, (h + 5) >> 1, NULL))
+            engine->shrink_vert(buf[index ^ 1], buf[index], w, h);
         h = (h + 5) >> 1;
         index ^= 1;
     }
@@ -255,7 +308,9 @@ bool ass_gaussian_blur(ASS_Renderer *renderer, Bitmap *bm, const Bitmap *src,
     w += 2 * blur_x.radius;
     index ^= 1;
     assert(blur_y.radius >= 4 && blur_y.radius <= 8);
-    engine->blur_vert[blur_y.radius - 4](buf[index ^ 1], buf[index], w, h, blur_y.coeff);
+    if (!ass_run_vertical_filter(renderer, NULL, engine->blur_vert[blur_y.radius - 4],
+            buf[index ^ 1], buf[index], w, h, h + 2 * blur_y.radius, blur_y.coeff))
+        engine->blur_vert[blur_y.radius - 4](buf[index ^ 1], buf[index], w, h, blur_y.coeff);
     h += 2 * blur_y.radius;
     index ^= 1;
     for (int i = 0; i < blur_x.level; i++) {
@@ -264,13 +319,17 @@ bool ass_gaussian_blur(ASS_Renderer *renderer, Bitmap *bm, const Bitmap *src,
         index ^= 1;
     }
     for (int i = 0; i < blur_y.level; i++) {
-        engine->expand_vert(buf[index ^ 1], buf[index], w, h);
+        if (!ass_run_vertical_filter(renderer, engine->expand_vert, NULL,
+                buf[index ^ 1], buf[index], w, h, 2 * h + 4, NULL))
+            engine->expand_vert(buf[index ^ 1], buf[index], w, h);
         h = 2 * h + 4;
         index ^= 1;
     }
     assert(w == end_w && h == end_h);
+    // There are 2 + 2 * (level_x + level_y) passes; pack never aliases its source.
+    assert(index == 0);
 
-    if (!ass_realloc_bitmap(engine, bm, w, h)) {
+    if (!reuse_output && !ass_realloc_bitmap(engine, bm, w, h)) {
         if (!borrowed) ass_aligned_free(tmp);
         return false;
     }

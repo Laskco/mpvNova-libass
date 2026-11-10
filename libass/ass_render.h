@@ -347,6 +347,7 @@ struct ass_renderer {
     unsigned font_generation;
     int font_provider;
     bool custom_font_provider;
+    bool is_event_worker;
 #endif
     uint8_t *raster_scratch;
     size_t raster_scratch_size;
@@ -373,6 +374,12 @@ void ass_reset_render_context(RenderContext *state, ASS_Style *style);
 void ass_frame_ref(ASS_Image *img);
 void ass_frame_unref(ASS_Image *img);
 ASS_Vector ass_layout_res(ASS_Renderer *render_priv);
+// Returns true after completing the stage; false leaves dst untouched for serial fallback.
+// Exactly one kernel must be provided. Buffers must satisfy its usual preconditions.
+bool ass_run_vertical_filter(ASS_Renderer *renderer, FilterFunc *plain,
+                             ParamFilterFunc *param_filter, int16_t *dst,
+                             const int16_t *src, size_t width, size_t src_h,
+                             size_t dst_h, const int16_t *coeff);
 #ifdef ASS_EVENT_THREADS
 bool ass_clone_render_settings(ASS_Renderer *dst, const ASS_Renderer *src,
                                 unsigned *font_generation, int *render_id);

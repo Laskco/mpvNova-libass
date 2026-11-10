@@ -386,8 +386,7 @@ endfunc
  *                const int16_t *param);
  */
 
-.macro blur_horz n
-function blur\n\()_horz16_neon, export=1
+.macro blur_horz_loop n, uniform
     ld1 {v0.8h}, [x4]
     lsl x4, x2, 1
     add x4, x4, 15
@@ -408,6 +407,21 @@ function blur\n\()_horz16_neon, export=1
     load_line v2, x1, x8, x4, x5, x9
     load_line v3, x1, x6, x4, x5, x9
 
+.if \uniform
+    // Equal source lanes make every convolution difference exactly zero.
+    dup v7.8h, v2.h[0]
+    eor v4.16b, v2.16b, v7.16b
+    eor v5.16b, v3.16b, v7.16b
+    orr v4.16b, v4.16b, v5.16b
+.if \n > 4
+    eor v5.16b, v1.16b, v7.16b
+    orr v4.16b, v4.16b, v5.16b
+.endif
+    umaxv h4, v4.8h
+    umov w9, v4.h[0]
+    cbz w9, 3f
+.endif
+
 .if \n < 8
     ext v7.16b, v2.16b, v3.16b, 16 - 2 * \n
     calc_blur x0, v1, v2, v3, \n, v7, v0, v4, v5, v6
@@ -415,12 +429,76 @@ function blur\n\()_horz16_neon, export=1
     calc_blur x0, v1, v2, v3, \n, v2, v0, v4, v5, v6
 .endif
 
+2:
     subs x7, x7, 1
     add x6, x6, 16
     b.ne 1b
     subs x2, x2, 8
     b.hi 0b
     ret
+.if \uniform
+3:
+    st1 {v7.8h}, [x0], 16
+    b 2b
+.endif
+.endm
+
+.macro blur_horz n
+function blur\n\()_horz16_neon, export=1
+    cmp x2, 128
+    b.lo 5f
+    cmp x3, 32
+    b.lo 5f
+    // width * height >= 16384, without multiplying possibly large sizes.
+    mov x5, 16383
+    udiv x5, x5, x3
+    cmp x2, x5
+    b.ls 5f
+
+    lsr x5, x2, 3
+    tst x2, 7
+    cinc x5, x5, ne
+    lsr x6, x5, 2
+    lsr x7, x5, 3
+    lsr x8, x3, 2
+    lsr x9, x3, 3
+    lsl x10, x3, 4
+    madd x11, x7, x10, x1
+    add x11, x11, x9, lsl 4
+    mul x12, x6, x10
+    lsl x13, x8, 4
+    mov w14, 4
+    mov w16, 0
+6:
+    mov x7, x11
+    mov w15, 4
+7:
+    ld1 {v0.8h}, [x7]
+    sub x17, x7, x10
+    ld1 {v1.8h}, [x17]
+    sub x17, x17, x10
+    ld1 {v2.8h}, [x17]
+    dup v3.8h, v0.h[0]
+    eor v4.16b, v0.16b, v3.16b
+    eor v5.16b, v1.16b, v3.16b
+    eor v6.16b, v2.16b, v3.16b
+    orr v4.16b, v4.16b, v5.16b
+    orr v4.16b, v4.16b, v6.16b
+    umaxv h4, v4.8h
+    umov w17, v4.h[0]
+    cmp w17, 0
+    cinc w16, w16, eq
+    add x7, x7, x13
+    subs w15, w15, 1
+    b.ne 7b
+    add x11, x11, x12
+    subs w14, w14, 1
+    b.ne 6b
+    cmp w16, 12
+    b.lo 5f
+    blur_horz_loop \n, 1
+5:
+    blur_horz_loop \n, 0
 endfunc
 .endm
 
@@ -436,28 +514,26 @@ blur_horz 8
  *                const int16_t *param);
  */
 
-.macro blur_vert n
-function blur\n\()_vert16_neon, export=1
-    ld1 {v0.8h}, [x4]
-    lsl x3, x3, 4
-    movrel x4, words_zero
-    sub x4, x4, x1
-0:
-    add x5, x3, 32 * \n
-    mov x6, -16 * \n
-1:
-    load_line v1, x1, x6, x3, x4, x7
+.macro calc_blur_vert n, direct
     movi v2.4s, 0x80, lsl 8
     movi v3.4s, 0x80, lsl 8
 .set pos, 0
 .rept \n
+.if \direct
+    ldur q4, [x9, -16 * (pos + 1)]
+.else
     sub x8, x6, 16 * (pos + 1)
     load_line v4, x1, x8, x3, x4, x7
+.endif
     sub v4.8h, v4.8h, v1.8h
     smlal v2.4s, v4.4h, v0.h[pos]
     smlal2 v3.4s, v4.8h, v0.h[pos]
+.if \direct
+    ldr q4, [x9, 16 * (pos + 1)]
+.else
     add x8, x6, 16 * (pos + 1)
     load_line v4, x1, x8, x3, x4, x7
+.endif
     sub v4.8h, v4.8h, v1.8h
     smlal v2.4s, v4.4h, v0.h[pos]
     smlal2 v3.4s, v4.8h, v0.h[pos]
@@ -466,7 +542,27 @@ function blur\n\()_vert16_neon, export=1
     uzp2 v2.8h, v2.8h, v3.8h
     add v2.8h, v2.8h, v1.8h
     st1 {v2.8h}, [x0], 16
+.endm
 
+.macro blur_vert n
+function blur\n\()_vert16_neon, export=1
+    ld1 {v0.8h}, [x4]
+    lsl x3, x3, 4
+    movrel x4, words_zero
+    sub x4, x4, x1
+    // The unsigned interior interval is empty for heights <= 2 * n.
+    subs x10, x3, 32 * \n
+    csel x10, x10, xzr, hs
+0:
+    add x5, x3, 32 * \n
+    mov x6, -16 * \n
+1:
+    sub x9, x6, 16 * \n
+    cmp x9, x10
+    b.lo 3f
+    load_line v1, x1, x6, x3, x4, x7
+    calc_blur_vert \n, 0
+2:
     subs x5, x5, 16
     add x6, x6, 16
     b.ne 1b
@@ -475,6 +571,11 @@ function blur\n\()_vert16_neon, export=1
     sub x4, x4, x3
     b.hi 0b
     ret
+3:
+    add x9, x1, x6
+    ldr q1, [x9]
+    calc_blur_vert \n, 1
+    b 2b
 endfunc
 .endm
 
