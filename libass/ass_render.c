@@ -2581,7 +2581,7 @@ static void set_composite_viewport(RenderContext *state, CombinedBitmapInfo *inf
                                     CompositeHashKey *key)
 {
     ASS_Renderer *renderer = state->renderer;
-    if (!renderer->experimental_edges || state->detect_collisions ||
+    if (state->detect_collisions ||
         !(state->evt_type & EVENT_POSITIONED) ||
         (info->filter.flags & FILTER_BORDER_STYLE_3) ||
         info->filter.be < 0 || info->filter.be > 16 ||
@@ -2600,6 +2600,15 @@ static void set_composite_viewport(RenderContext *state, CombinedBitmapInfo *inf
     int64_t y0 = -(int64_t)info->y - pad_y;
     int64_t x1 = (int64_t)renderer->settings.frame_width - info->x + pad_x;
     int64_t y1 = (int64_t)renderer->settings.frame_height - info->y + pad_y;
+    bool conservative = !renderer->experimental_edges;
+    if (conservative) {
+        // Quantize outward to retain cache reuse while preserving the blur halo.
+        const int64_t viewport_mask = -INT64_C(512);
+        x0 &= viewport_mask;
+        y0 &= viewport_mask;
+        x1 = (x1 + 511) & viewport_mask;
+        y1 = (y1 + 511) & viewport_mask;
+    }
     if (x0 < INT32_MIN || y0 < INT32_MIN || x1 > INT32_MAX || y1 > INT32_MAX)
         return;
     int64_t bx0 = INT64_MAX, by0 = INT64_MAX;
@@ -2620,13 +2629,17 @@ static void set_composite_viewport(RenderContext *state, CombinedBitmapInfo *inf
     }
     if (bx1 <= bx0 || by1 <= by0)
         return;
+    int viewport_align = FFMAX(1 << renderer->engine.align_order, FFMAX(ax, ay));
+    int64_t crop_guard = conservative ? viewport_align - 1 + info->filter.be : 0;
     double area = (double)(bx1 - bx0) * (by1 - by0);
-    double visible = (double)FFMAX(0, FFMIN(bx1, x1) - FFMAX(bx0, x0)) *
-        FFMAX(0, FFMIN(by1, y1) - FFMAX(by0, y0));
+    double visible = (double)FFMAX(0, FFMIN(bx1, x1 + crop_guard) - FFMAX(bx0, x0 - crop_guard)) *
+        FFMAX(0, FFMIN(by1, y1 + crop_guard) - FFMAX(by0, y0 - crop_guard));
     // Preserve position-independent cache reuse for small or mostly visible runs.
-    if (area >= 1024 * 1024 && area - visible >= FFMAX(256 * 1024, area / 4)) {
+    bool worthwhile = conservative ? visible <= area / 2 :
+        area - visible >= FFMAX(256 * 1024, area / 4);
+    if (area >= 1024 * 1024 && worthwhile) {
         key->viewport = (ASS_Rect){x0, y0, x1, y1};
-        key->viewport_align = FFMAX(1 << renderer->engine.align_order, FFMAX(ax, ay));
+        key->viewport_align = viewport_align;
     }
 }
 
