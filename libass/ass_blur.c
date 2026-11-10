@@ -146,6 +146,16 @@ typedef struct {
     int16_t coeff[8];
 } BlurMethod;
 
+// Select the cascade geometry for r2 >= 0.5 without computing coefficients.
+static double find_method_geometry(BlurMethod *blur, double r2)
+{
+    double frac = frexp(sqrt(0.11569 * r2 + 0.20591047), &blur->level);
+    double mul = pow(0.25, blur->level);
+    blur->radius = 8 - (int) ((10.1525 + 0.8335 * mul) * (1 - frac));
+    blur->radius = FFMAX(blur->radius, 4);
+    return mul;
+}
+
 static void find_best_method(BlurMethod *blur, double r2)
 {
     double mu[8];
@@ -156,10 +166,7 @@ static void find_best_method(BlurMethod *blur, double r2)
         mu[0] = 0.5 * r2 - 4 * mu[1];
         mu[2] = mu[3] = 0;
     } else {
-        double frac = frexp(sqrt(0.11569 * r2 + 0.20591047), &blur->level);
-        double mul = pow(0.25, blur->level);
-        blur->radius = 8 - (int) ((10.1525 + 0.8335 * mul) * (1 - frac));
-        blur->radius = FFMAX(blur->radius, 4);
+        double mul = find_method_geometry(blur, r2);
         calc_coeff(mu, blur->radius, r2, mul);
     }
     for (int i = 0; i < blur->radius; i++)
@@ -174,7 +181,12 @@ static void find_best_method(BlurMethod *blur, double r2)
 void ass_gaussian_blur_bounds(double r2, int *padding, int *alignment)
 {
     BlurMethod blur;
-    find_best_method(&blur, r2);
+    if (r2 < 0.5) {
+        blur.level = 0;
+        blur.radius = 4;
+    } else {
+        find_method_geometry(&blur, r2);
+    }
     // The shrink/expand cascade contributes at most 5 * (2^level - 1)
     // source pixels per side, in addition to the scaled convolution radius.
     // Keep a two-pixel guard at the integer bitmap/clip boundaries.
@@ -206,7 +218,8 @@ bool ass_gaussian_blur(ASS_Renderer *renderer, Bitmap *bm, const Bitmap *src,
 
     size_t bytes = 4 * size;
     // Each event worker owns its renderer and scratch; never share this buffer.
-    bool borrowed = renderer->experimental_edges && bytes <= 32 * 1024 * 1024;
+    size_t scratch_limit = (renderer->experimental_edges ? 32 : 8) * 1024 * 1024;
+    bool borrowed = bytes <= scratch_limit;
     if (borrowed && bytes > renderer->blur_scratch_size) {
         size_t capacity = ass_align(1024 * 1024, bytes);
         void *buffer = ass_aligned_alloc(2 * stripe_width, capacity, false);
