@@ -408,13 +408,13 @@ static bool simplify_contour(RasterizerData *rst, size_t first, int tolerance)
         return true;
 
 #if UINTPTR_MAX == UINT32_MAX || defined(__aarch64__)
-    // 2 * 32700^2 + 16 * 32700 fits INT32_MAX. Keep the original
+    // 2 * 32700^2 + 64 * 32700 fits INT32_MAX. Keep the original
     // wide arithmetic for larger contours or tolerances.
-    bool narrow = tolerance >= 0 && tolerance <= 16 &&
+    bool narrow = tolerance >= 0 && tolerance <= 64 &&
         (int64_t) bounds.x_max - bounds.x_min <= 32700 &&
         (int64_t) bounds.y_max - bounds.y_min <= 32700;
 #if defined(__ARM_NEON)
-    bool bounded = tolerance >= 0 && tolerance <= 16 &&
+    bool bounded = tolerance >= 0 && tolerance <= 64 &&
         (int64_t) bounds.x_max - bounds.x_min <= (1 << 29) &&
         (int64_t) bounds.y_max - bounds.y_min <= (1 << 29);
 #endif
