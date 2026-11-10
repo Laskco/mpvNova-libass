@@ -213,7 +213,10 @@ static bool scan_fonts(FcConfig *config, ASS_FontProvider *provider)
             meta.postscript_name = NULL;
 
         FcPatternReference(pat);
-        ass_font_provider_add_font(provider, &meta, path, index, (void *)pat);
+        if (!ass_font_provider_add_font(provider, &meta, path, index, (void *)pat)) {
+            FcFontSetDestroy(fonts);
+            return false;
+        }
     }
 
     FcFontSetDestroy(fonts);
@@ -394,10 +397,47 @@ ass_fontconfig_add_provider(ASS_Library *lib, ASS_FontSelector *selector,
 
     // create font provider
     provider = ass_font_provider_new(selector, &fontconfig_callbacks, fc);
+    if (!provider) { destroy(fc); return NULL; }
 
     // build database from system fonts
     if (!scan_fonts(fc->config, provider))
         ass_msg(lib, MSGL_ERR, "Failed to load fontconfig fonts!");
 
+    return provider;
+}
+
+static void *reference_pattern(void *data)
+{
+    FcPatternReference(data);
+    return data;
+}
+
+bool ass_fontconfig_can_clone_concurrently(const void *source_data)
+{
+#if defined(ASS_FONTCONFIG_ATOMIC_REFS) && ASS_FONTCONFIG_ATOMIC_REFS
+    const ProviderPrivate *parent = source_data;
+    return parent && parent->config && FcGetVersion() >= 21200;
+#else
+    // Fontconfig's public ABI cannot report its atomic-refcount build mode.
+    return false;
+#endif
+}
+
+ASS_FontProvider *ass_fontconfig_clone_provider(ASS_FontSelector *selector,
+        ASS_FontProvider *source, void *source_data)
+{
+    const ProviderPrivate *parent = source_data;
+    if (!ass_fontconfig_can_clone_concurrently(parent)) return NULL;
+    ProviderPrivate *fc = calloc(1, sizeof(*fc));
+    if (!fc) return NULL;
+    // The owner publishes a built, private config and never mutates it afterwards.
+    fc->config = FcConfigReference(parent->config);
+    if (!fc->config) { free(fc); return NULL; }
+    ASS_FontProvider *provider = ass_font_provider_new(selector, &fontconfig_callbacks, fc);
+    if (!provider) { destroy(fc); return NULL; }
+    if (!ass_font_provider_copy_fonts(source, provider, reference_pattern)) {
+        ass_font_provider_free(provider);
+        return NULL;
+    }
     return provider;
 }

@@ -27,6 +27,9 @@
 ASS_FontProvider *
 ass_fontconfig_add_provider(ASS_Library *lib, ASS_FontSelector *selector,
                             const char *config, FT_Library ftlib);
+ASS_FontProvider *ass_fontconfig_clone_provider(ASS_FontSelector *selector,
+        ASS_FontProvider *source, void *source_data);
+bool ass_fontconfig_can_clone_concurrently(const void *source_data);
 
 #endif
 

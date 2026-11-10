@@ -145,9 +145,9 @@ void ass_set_line_position(ASS_Renderer *priv, double line_position)
     }
 }
 
-void ass_set_fonts(ASS_Renderer *priv, const char *default_font,
+static void set_fonts_from(ASS_Renderer *priv, const char *default_font,
                    const char *default_family, int dfp,
-                   const char *config, int update)
+                   const char *config, int update, const ASS_FontSelector *source)
 {
 #ifdef ASS_EVENT_THREADS
     free(priv->font_config);
@@ -169,8 +169,15 @@ void ass_set_fonts(ASS_Renderer *priv, const char *default_font,
 
     if (priv->fontselect)
         ass_fontselect_free(priv->fontselect);
-    priv->fontselect = ass_fontselect_init(priv->library, priv->ftlibrary,
-            &priv->num_emfonts, default_family, default_font, config, dfp);
+    priv->fontselect = ass_fontselect_init_clone(priv->library, priv->ftlibrary,
+            &priv->num_emfonts, default_family, default_font, config, dfp, source);
+}
+
+void ass_set_fonts(ASS_Renderer *priv, const char *default_font,
+                   const char *default_family, int dfp,
+                   const char *config, int update)
+{
+    set_fonts_from(priv, default_font, default_family, dfp, config, update, NULL);
 }
 
 void ass_set_selective_style_override_enabled(ASS_Renderer *priv, int bits)
@@ -232,8 +239,8 @@ bool ass_clone_render_settings(ASS_Renderer *dst, const ASS_Renderer *src,
                                 unsigned *font_generation, int *render_id)
 {
     if (*font_generation != src->font_generation) {
-        ass_set_fonts(dst, src->settings.default_font, src->settings.default_family,
-                      src->font_provider, src->font_config, 1);
+        set_fonts_from(dst, src->settings.default_font, src->settings.default_family,
+                      src->font_provider, src->font_config, 1, src->fontselect);
         if (!dst->fontselect ||
             (src->settings.default_font && !dst->settings.default_font) ||
             (src->settings.default_family && !dst->settings.default_family) ||

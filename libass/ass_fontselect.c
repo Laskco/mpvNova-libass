@@ -101,6 +101,8 @@ struct font_selector {
 
     ASS_FontProvider *default_provider;
     ASS_FontProvider *embedded_provider;
+    ASS_DefaultFontProvider default_provider_id;
+    size_t provider_count;
 };
 
 struct font_provider {
@@ -222,6 +224,7 @@ ass_font_provider_new(ASS_FontSelector *selector, ASS_FontProviderFuncs *funcs,
     provider->parent   = selector;
     provider->funcs    = *funcs;
     provider->priv     = data;
+    selector->provider_count++;
 
     return provider;
 }
@@ -465,9 +468,13 @@ ass_font_provider_add_font(ASS_FontProvider *provider,
 
     // check size
     if (selector->n_font >= selector->alloc_font) {
-        selector->alloc_font = FFMAX(1, 2 * selector->alloc_font);
-        selector->font_infos = realloc(selector->font_infos,
-                selector->alloc_font * sizeof(ASS_FontInfo));
+        if (selector->alloc_font > INT_MAX / 2) goto error;
+        int capacity = FFMAX(1, 2 * selector->alloc_font);
+        ASS_FontInfo *fonts = ass_realloc_array(selector->font_infos,
+                capacity, sizeof(*fonts));
+        if (!fonts) goto error;
+        selector->font_infos = fonts;
+        selector->alloc_font = capacity;
     }
 
     // copy over metadata
@@ -545,6 +552,29 @@ error:
     return false;
 }
 
+bool ass_font_provider_copy_fonts(ASS_FontProvider *source,
+        ASS_FontProvider *target, void *(*reference_data)(void *))
+{
+    const ASS_FontSelector *selector = source->parent;
+    for (int i = 0; i < selector->n_font; i++) {
+        const ASS_FontInfo *info = selector->font_infos + i;
+        if (info->provider != source) continue;
+        ASS_FontProviderMetaData meta = {
+            .families = info->families, .fullnames = info->fullnames,
+            .postscript_name = info->postscript_name,
+            .extended_family = info->extended_family,
+            .n_family = info->n_family, .n_fullname = info->n_fullname,
+            .style_flags = info->style_flags, .weight = info->weight,
+            .is_postscript = info->is_postscript,
+        };
+        void *data = reference_data(info->priv);
+        if (!data) return false;
+        if (!ass_font_provider_add_font(target, &meta, info->path, info->index, data))
+            return false;
+    }
+    return true;
+}
+
 /**
  * \brief Clean up font database. Deletes all fonts that have an invalid
  * font provider (NULL).
@@ -595,6 +625,7 @@ void ass_font_provider_free(ASS_FontProvider *provider)
     if (provider->funcs.destroy_provider)
         provider->funcs.destroy_provider(provider->priv);
 
+    selector->provider_count--;
     free(provider);
 }
 
@@ -1017,7 +1048,7 @@ static void process_fontdata(ASS_FontProvider *priv, int idx)
         if (!ass_font_provider_add_font(priv, &info, NULL, face_index, ft)) {
             ass_msg(library, MSGL_WARN, "Failed to add embedded font '%s'",
                     name);
-            free(ft);
+            // add_font owns and destroys ft on failure too.
         }
 
         free_font_info(&info);
@@ -1031,7 +1062,8 @@ static void process_fontdata(ASS_FontProvider *priv, int idx)
  * \return font provider
  */
 static ASS_FontProvider *
-ass_embedded_fonts_add_provider(ASS_FontSelector *selector, size_t *num_emfonts)
+ass_embedded_fonts_add_provider(ASS_FontSelector *selector, size_t *num_emfonts,
+                                bool skip_directory)
 {
     ASS_FontProvider *priv = ass_font_provider_new(selector, &ft_funcs, NULL);
     if (priv == NULL)
@@ -1039,10 +1071,9 @@ ass_embedded_fonts_add_provider(ASS_FontSelector *selector, size_t *num_emfonts)
 
     ASS_Library *lib = selector->library;
 
-    if (lib->fonts_dir && lib->fonts_dir[0]) {
+    if (!skip_directory && lib->fonts_dir && lib->fonts_dir[0]) {
         load_fonts_from_dir(lib, lib->fonts_dir);
     }
-
     for (size_t i = 0; i < lib->num_fontdata; i++)
         process_fontdata(priv, i);
     *num_emfonts = lib->num_fontdata;
@@ -1089,6 +1120,21 @@ ass_fontselect_init(ASS_Library *library, FT_Library ftlibrary, size_t *num_emfo
                     const char *family, const char *path, const char *config,
                     ASS_DefaultFontProvider dfp)
 {
+    return ass_fontselect_init_clone(library, ftlibrary, num_emfonts, family,
+            path, config, dfp, NULL);
+}
+
+ASS_FontSelector *
+ass_fontselect_init_clone(ASS_Library *library, FT_Library ftlibrary,
+        size_t *num_emfonts, const char *family, const char *path,
+        const char *config, ASS_DefaultFontProvider dfp, const ASS_FontSelector *source)
+{
+    if (source && source->library != library) return NULL;
+#ifdef CONFIG_FONTCONFIG
+    if (source && dfp == ASS_FONTPROVIDER_AUTODETECT &&
+        source->default_provider_id == ASS_FONTPROVIDER_FONTCONFIG)
+        dfp = ASS_FONTPROVIDER_FONTCONFIG;
+#endif
     ASS_FontSelector *priv = calloc(1, sizeof(ASS_FontSelector));
     if (priv == NULL)
         return NULL;
@@ -1099,13 +1145,15 @@ ass_fontselect_init(ASS_Library *library, FT_Library ftlibrary, size_t *num_emfo
     priv->family_default = family ? strdup(family) : NULL;
     priv->path_default = path ? strdup(path) : NULL;
     priv->index_default = 0;
+    priv->default_provider_id = dfp == ASS_FONTPROVIDER_NONE ?
+        ASS_FONTPROVIDER_NONE : ASS_FONTPROVIDER_AUTODETECT;
 
     if (family && !priv->family_default)
         goto fail;
     if (path && !priv->path_default)
         goto fail;
 
-    priv->embedded_provider = ass_embedded_fonts_add_provider(priv, num_emfonts);
+    priv->embedded_provider = ass_embedded_fonts_add_provider(priv, num_emfonts, source != NULL);
 
     if (priv->embedded_provider == NULL) {
         ass_msg(library, MSGL_WARN, "failed to create embedded font provider");
@@ -1116,10 +1164,22 @@ ass_fontselect_init(ASS_Library *library, FT_Library ftlibrary, size_t *num_emfo
         for (int i = 0; font_constructors[i].constructor; i++ )
             if (dfp == font_constructors[i].id ||
                 dfp == ASS_FONTPROVIDER_AUTODETECT) {
-                priv->default_provider =
-                    font_constructors[i].constructor(library, priv,
-                                                     config, ftlibrary);
+                bool cloned = false;
+#ifdef CONFIG_FONTCONFIG
+                if (source && source->default_provider &&
+                    source->default_provider_id == ASS_FONTPROVIDER_FONTCONFIG &&
+                    font_constructors[i].id == ASS_FONTPROVIDER_FONTCONFIG &&
+                    ass_fontconfig_can_clone_concurrently(source->default_provider->priv)) {
+                    cloned = true;
+                    priv->default_provider = ass_fontconfig_clone_provider(priv,
+                            source->default_provider, source->default_provider->priv);
+                } else
+#endif
+                    priv->default_provider = font_constructors[i].constructor(
+                            library, priv, config, ftlibrary);
+                if (cloned && !priv->default_provider) goto fail;
                 if (priv->default_provider) {
+                    priv->default_provider_id = font_constructors[i].id;
                     ass_msg(library, MSGL_INFO, "Using font provider %s",
                             font_constructors[i].name);
                     break;
@@ -1145,6 +1205,20 @@ fail:
     free(priv);
 
     return NULL;
+}
+
+bool ass_fontselect_can_clone_concurrently(const ASS_FontSelector *selector)
+{
+    if (!selector || !selector->embedded_provider ||
+        selector->provider_count != 1 + !!selector->default_provider)
+        return false;
+    if (!selector->default_provider)
+        return selector->default_provider_id == ASS_FONTPROVIDER_NONE;
+#ifdef CONFIG_FONTCONFIG
+    if (selector->default_provider_id == ASS_FONTPROVIDER_FONTCONFIG)
+        return ass_fontconfig_can_clone_concurrently(selector->default_provider->priv);
+#endif
+    return false;
 }
 
 void ass_get_available_font_providers(ASS_Library *priv,

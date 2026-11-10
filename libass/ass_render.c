@@ -3399,6 +3399,7 @@ typedef struct {
     unsigned font_generation;
     int render_id, id;
     uint64_t batch_ns;
+    bool prepared;
 } EventWorker;
 
 struct ass_event_pool {
@@ -3409,7 +3410,7 @@ struct ass_event_pool {
     uint64_t generation;
     int count, pending;
     bool stop, event_ready, legacy_events, cache_split;
-    enum { JOB_IDLE, JOB_EVENTS, JOB_VERTICAL } job_kind;
+    enum { JOB_IDLE, JOB_EVENTS, JOB_VERTICAL, JOB_PREPARE } job_kind;
     VerticalTask vertical;
     EventTask *events;
     int first[4];
@@ -3524,6 +3525,9 @@ static void *event_worker(void *arg)
         pthread_mutex_unlock(&pool->lock);
         if (pool->job_kind == JOB_VERTICAL)
             vertical_batch(&pool->vertical, worker->id);
+        else if (pool->job_kind == JOB_PREPARE)
+            worker->prepared = ass_clone_render_settings(worker->renderer,
+                    pool->owner, &worker->font_generation, &worker->render_id);
         else
             worker->batch_ns = event_batch(pool, worker->renderer, worker->id);
         pthread_mutex_lock(&pool->lock);
@@ -3794,10 +3798,28 @@ static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
                 queue_event(pool, i, index++, tail);
         }
     }
+    bool prepare_parallel = ass_fontselect_can_clone_concurrently(priv->fontselect);
+    bool prepare_fonts = false;
+    for (int i = 0; i < pool->count; i++)
+        prepare_fonts |= pool->workers[i].font_generation != priv->font_generation;
+    prepare_parallel = prepare_parallel && prepare_fonts;
+    if (prepare_parallel) {
+        // Owner font import is complete; cloned selectors have private FT faces.
+        pthread_mutex_lock(&pool->lock);
+        pool->job_kind = JOB_PREPARE;
+        pool->pending = pool->count;
+        pool->generation++;
+        pthread_cond_broadcast(&pool->work);
+        while (pool->pending)
+            pthread_cond_wait(&pool->done, &pool->lock);
+        pool->job_kind = JOB_IDLE;
+        pthread_mutex_unlock(&pool->lock);
+    }
     for (int i = 0; i < pool->count; i++) {
         EventWorker *worker = pool->workers + i;
-        if (!ass_clone_render_settings(worker->renderer, priv,
-                &worker->font_generation, &worker->render_id) ||
+        if (!(prepare_parallel ? worker->prepared :
+                ass_clone_render_settings(worker->renderer, priv,
+                    &worker->font_generation, &worker->render_id)) ||
             !ass_start_frame(worker->renderer, track, now))
             goto serial;
 #ifdef ASS_FLE_PROFILE

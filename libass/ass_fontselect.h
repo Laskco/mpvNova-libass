@@ -252,6 +252,13 @@ ASS_FontSelector *
 ass_fontselect_init(ASS_Library *library, FT_Library ftlibrary, size_t *num_emfonts,
                     const char *family, const char *path, const char *config,
                     ASS_DefaultFontProvider dfp);
+ASS_FontSelector *ass_fontselect_init_clone(ASS_Library *library,
+        FT_Library ftlibrary, size_t *num_emfonts, const char *family,
+        const char *path, const char *config, ASS_DefaultFontProvider dfp,
+        const ASS_FontSelector *source);
+bool ass_fontselect_can_clone_concurrently(const ASS_FontSelector *selector);
+bool ass_font_provider_copy_fonts(ASS_FontProvider *source,
+        ASS_FontProvider *target, void *(*reference_data)(void *));
 char *ass_font_select(ASS_FontSelector *priv,
                       const ASS_Font *font, int *index, char **postscript_name,
                       int *uid, ASS_FontStream *data, uint32_t code);
