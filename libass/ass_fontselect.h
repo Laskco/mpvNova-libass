@@ -223,6 +223,10 @@ struct ass_font_stream {
     void *priv;
 };
 
+bool ass_font_stream_embedded_source(const ASS_FontStream *stream,
+                                     const ASS_Library *library,
+                                     const char **data, size_t *size);
+
 
 typedef struct ass_font_mapping ASS_FontMapping;
 

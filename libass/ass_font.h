@@ -47,10 +47,14 @@ struct ass_font {
     FT_Face faces[ASS_FONT_MAX_FACES];
     struct hb_font_t *hb_fonts[ASS_FONT_MAX_FACES];
     int n_faces;
+    // Immutable embedded backing data; NULL for unverified providers.
+    const char *primary_data;
+    size_t primary_size;
 };
 
 void ass_charmap_magic(ASS_Library *library, FT_Face face);
 ASS_Font *ass_font_new(ASS_Renderer *render_priv, ASS_FontDesc *desc);
+bool ass_font_primary_equal(const ASS_Font *a, const ASS_Font *b);
 void ass_face_set_size(FT_Face face, double size);
 int ass_face_get_weight(FT_Face face);
 FT_Long ass_face_get_style_flags(FT_Face face);

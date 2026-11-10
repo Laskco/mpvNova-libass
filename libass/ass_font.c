@@ -543,6 +543,9 @@ static int add_face(ASS_FontSelector *fontsel, ASS_Font *font, uint32_t ch)
         goto fail;
     }
 
+    if (!font->n_faces)
+        ass_font_stream_embedded_source(&stream, font->library,
+                &font->primary_data, &font->primary_size);
     ret = font->n_faces++;
 
 fail:
@@ -555,11 +558,28 @@ fail:
 ASS_Font *ass_font_new(ASS_Renderer *render_priv, ASS_FontDesc *desc)
 {
     ASS_Font *font = ass_cache_get(render_priv->cache.font_cache, desc, render_priv);
+#ifdef ASS_EVENT_THREADS
+    if (render_priv->primary_preflight && !ass_font_primary_equal(font, font))
+        render_priv->primary_preflight_failed = true;
+#endif
     if (!font)
         return NULL;
     if (font->library)
         return font;
     return NULL;
+}
+
+bool ass_font_primary_equal(const ASS_Font *a, const ASS_Font *b)
+{
+    if (!a || !b || !a->library || a->library != b->library ||
+        !a->n_faces || !b->n_faces || !a->primary_data || !a->primary_size ||
+        a->primary_data != b->primary_data || a->primary_size != b->primary_size)
+        return false;
+    FT_Face af = a->faces[0], bf = b->faces[0];
+    if (!af || !bf || af->face_index != bf->face_index || !af->charmap || !bf->charmap)
+        return false;
+    int charmap = FT_Get_Charmap_Index(af->charmap);
+    return charmap >= 0 && charmap == FT_Get_Charmap_Index(bf->charmap);
 }
 
 size_t ass_font_construct(void *key, void *value, void *priv)
@@ -571,6 +591,8 @@ size_t ass_font_construct(void *key, void *value, void *priv)
     font->library = render_priv->library;
     font->ftlibrary = render_priv->ftlibrary;
     font->n_faces = 0;
+    font->primary_data = NULL;
+    font->primary_size = 0;
     font->desc.family = desc->family;
     font->desc.bold = desc->bold;
     font->desc.italic = desc->italic;

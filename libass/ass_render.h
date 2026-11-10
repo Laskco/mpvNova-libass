@@ -348,6 +348,8 @@ struct ass_renderer {
     int font_provider;
     bool custom_font_provider;
     bool is_event_worker;
+    bool primary_preflight, primary_preflight_failed;
+    unsigned primary_retry_frames;
 #endif
     uint8_t *raster_scratch;
     size_t raster_scratch_size;

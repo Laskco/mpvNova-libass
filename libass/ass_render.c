@@ -39,6 +39,12 @@ static uint64_t fle_clock(void)
         return 0;
     return (uint64_t) ts.tv_sec * 1000000000 + ts.tv_nsec;
 }
+#ifdef ASS_EVENT_THREADS
+static uint64_t event_elapsed_ns(uint64_t start, uint64_t end)
+{
+    return !start || !end || end < start ? UINT64_MAX : end - start;
+}
+#endif
 #endif
 #ifdef ASS_FLE_PROFILE
 #define FLE_START uint64_t fle_last = fle_clock()
@@ -3389,7 +3395,7 @@ struct ass_event_pool {
     pthread_cond_t work, done;
     uint64_t generation;
     int count, pending;
-    bool stop, event_ready;
+    bool stop, event_ready, legacy_events, cache_split;
     enum { JOB_IDLE, JOB_EVENTS, JOB_VERTICAL } job_kind;
     VerticalTask vertical;
     EventTask *events;
@@ -3404,6 +3410,7 @@ static void set_pool_cache_limits(struct ass_event_pool *pool, size_t glyphs,
     pool->glyph_budget = glyphs;
     pool->bitmap_budget = bitmaps;
     pool->composite_budget = composites;
+    pool->cache_split = true;
     for (int i = -1; i < pool->count; i++) {
         ASS_Renderer *renderer = i < 0 ? pool->owner : pool->workers[i].renderer;
         renderer->cache.glyph_max = glyphs / (pool->count + 1);
@@ -3414,9 +3421,35 @@ static void set_pool_cache_limits(struct ass_event_pool *pool, size_t glyphs,
 
 void ass_event_pool_cache_limits(ASS_Renderer *renderer)
 {
-    if (renderer->event_pool && renderer->event_pool->event_ready)
-        set_pool_cache_limits(renderer->event_pool, renderer->cache.glyph_max,
+    struct ass_event_pool *pool = renderer->event_pool;
+    if (!pool || !pool->event_ready)
+        return;
+    if (pool->cache_split) {
+        set_pool_cache_limits(pool, renderer->cache.glyph_max,
                 renderer->cache.bitmap_max_size, renderer->cache.composite_max_size);
+    } else {
+        pool->glyph_budget = renderer->cache.glyph_max;
+        pool->bitmap_budget = renderer->cache.bitmap_max_size;
+        pool->composite_budget = renderer->cache.composite_max_size;
+    }
+}
+
+static void restore_serial_cache_limits(struct ass_event_pool *pool)
+{
+    if (!pool || !pool->cache_split)
+        return;
+    pool->cache_split = false;
+    pool->owner->cache.glyph_max = pool->glyph_budget;
+    pool->owner->cache.bitmap_max_size = pool->bitmap_budget;
+    pool->owner->cache.composite_max_size = pool->composite_budget;
+    for (int i = 0; i < pool->count; i++) {
+        ASS_Renderer *worker = pool->workers[i].renderer;
+        worker->cache.glyph_max = 0;
+        worker->cache.bitmap_max_size = 0;
+        worker->cache.composite_max_size = 0;
+        // Frame references remain valid, but idle workers retain no cache queue refs.
+        check_cache_limits(worker, &worker->cache);
+    }
 }
 
 static void queue_event(struct ass_event_pool *pool, int event_index,
@@ -3431,20 +3464,16 @@ static void queue_event(struct ass_event_pool *pool, int event_index,
 
 static uint64_t event_batch(struct ass_event_pool *pool, ASS_Renderer *renderer, int id)
 {
-#ifdef ASS_FLE_PROFILE
+    if (pool->first[id] < 0)
+        return 0;
     uint64_t start = fle_clock();
-#endif
     for (int i = pool->first[id]; i >= 0; i = pool->events[i].next) {
         ASS_Event *event = pool->owner->track->events + pool->events[i].event_index;
         EventImages *out = pool->owner->eimg + i;
         if (!ass_render_event(&renderer->state, event, out))
             out->event = NULL;
     }
-#ifdef ASS_FLE_PROFILE
-    return fle_clock() - start;
-#else
-    return 0;
-#endif
+    return event_elapsed_ns(start, fle_clock());
 }
 
 static void vertical_batch(const VerticalTask *task, unsigned id)
@@ -3556,14 +3585,77 @@ static bool event_pool_prepare_events(struct ass_event_pool *pool)
             return false;
         }
         renderer->is_event_worker = true;
+        renderer->cache.glyph_max = 0;
+        renderer->cache.bitmap_max_size = 0;
+        renderer->cache.composite_max_size = 0;
         pool->workers[i].renderer = renderer;
     }
     pool->event_ready = true;
     ASS_Renderer *owner = pool->owner;
-    // Stage-only pools do not own renderer caches or split caller budgets.
-    set_pool_cache_limits(pool, owner->cache.glyph_max,
-            owner->cache.bitmap_max_size, owner->cache.composite_max_size);
+    pool->glyph_budget = owner->cache.glyph_max;
+    pool->bitmap_budget = owner->cache.bitmap_max_size;
+    pool->composite_budget = owner->cache.composite_max_size;
     return true;
+}
+
+static bool certify_primary_events(ASS_Renderer *priv, ASS_Track *track,
+                                    long long now, struct ass_event_pool *pool)
+{
+    RenderContext *state = &priv->state;
+    priv->primary_preflight = true;
+    priv->primary_preflight_failed = false;
+    for (int i = 0; i < track->n_events; i++) {
+        ASS_Event *event = track->events + i;
+        if (!(event->Start <= now && now < event->Start + event->Duration))
+            continue;
+        if (event->Style < 0 || event->Style >= track->n_styles || !event->Text)
+            goto reject;
+        free_render_context(state);
+        priv->primary_preflight_failed = false;
+        init_render_context(state, event);
+        if (!parse_events(state, event))
+            goto reject;
+        unsigned id = pool ? (unsigned) event->ReadOrder % (pool->count + 1) : 0;
+        ASS_Renderer *worker = id ? pool->workers[id - 1].renderer : priv;
+        if (worker->experimental_edges != priv->experimental_edges)
+            goto reject;
+        for (int j = 0; j < state->text_info.length; j++) {
+            GlyphInfo *info = state->text_info.glyphs + j;
+            if (info->drawing_text.str)
+                continue;
+            if (priv->primary_preflight_failed)
+                goto reject;
+            ASS_Font *font = info->font;
+            if (!ass_font_primary_equal(font, font))
+                goto reject;
+            // Do not resolve fallback here, even on a rejected frame.
+            FT_UInt glyph = 0;
+            if (info->symbol >= 0x20) {
+                uint32_t code = ass_font_index_magic(font->faces[0], info->symbol);
+                if (!code || !(glyph = FT_Get_Char_Index(font->faces[0], code)))
+                    goto reject;
+            }
+            if (worker == priv)
+                continue;
+            ASS_FontDesc desc = font->desc;
+            ASS_Font *match = ass_font_new(worker, &desc);
+            if (!ass_font_primary_equal(font, match))
+                goto reject;
+            if (glyph) {
+                uint32_t code = ass_font_index_magic(match->faces[0], info->symbol);
+                if (!code || FT_Get_Char_Index(match->faces[0], code) != glyph)
+                    goto reject;
+            }
+        }
+        free_render_context(state);
+    }
+    priv->primary_preflight = priv->primary_preflight_failed = false;
+    return true;
+
+reject:
+    free_render_context(state);
+    priv->primary_preflight = priv->primary_preflight_failed = false;
+    return false;
 }
 
 bool ass_run_vertical_filter(ASS_Renderer *renderer, FilterFunc *plain,
@@ -3617,15 +3709,10 @@ bool ass_run_vertical_filter(ASS_Renderer *renderer, FilterFunc *plain,
 static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
                                    long long now, int *rendered)
 {
-    if (priv->custom_font_provider) {
-        if (priv->event_pool && priv->event_pool->event_ready) {
-            priv->cache.glyph_max = priv->event_pool->glyph_budget;
-            priv->cache.bitmap_max_size = priv->event_pool->bitmap_budget;
-            priv->cache.composite_max_size = priv->event_pool->composite_budget;
-        }
-        return false;
-    }
     struct ass_event_pool *pool = priv->event_pool;
+    bool preflight_attempted = false;
+    if (priv->custom_font_provider)
+        goto serial;
     int *tail[4];
     if (pool)
         for (int i = 0; i <= pool->count; i++) {
@@ -3642,29 +3729,42 @@ static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
         }
     }
     bool queued = pool && active <= pool->capacity;
+    bool expensive = active >= 2 && priv->last_event_render_ns > 4000000;
+    const char *value = getenv("LIBASS_RENDER_THREADS");
+    bool legacy = pool && pool->legacy_events;
+    if (!legacy && value && atoi(value) <= 1)
+        goto serial;
+    legacy |= active >= 32 || (priv->experimental_edges && expensive) || value;
+    bool restricted = !legacy;
+    if (restricted) {
+        if (priv->primary_retry_frames) {
+            priv->primary_retry_frames--;
+            goto serial;
+        }
+        if (priv->experimental_edges || !expensive)
+            goto serial;
+        preflight_attempted = true;
+        if (!certify_primary_events(priv, track, now, NULL))
+            goto serial;
+    }
     if (!pool || !pool->event_ready) {
-        // A few large animated effects can cost more than many small events.
-        bool expensive = priv->experimental_edges && active >= 2 &&
-            priv->last_event_render_ns > 4000000;
-        const char *value = getenv("LIBASS_RENDER_THREADS");
-        if ((active < 32 && !expensive && !value) || (value && atoi(value) <= 1))
-            return false;
         if (!pool) {
             priv->event_pool = event_pool_init(priv);
-            if (!priv->event_pool) return false;
+            if (!priv->event_pool) goto serial;
             pool = priv->event_pool;
         }
         if (!event_pool_prepare_events(pool))
-            return false;
+            goto serial;
     }
-    set_pool_cache_limits(pool, pool->glyph_budget, pool->bitmap_budget, pool->composite_budget);
+    if (legacy)
+        pool->legacy_events = true;
     if (active > pool->capacity) {
-        if (!ASS_REALLOC_ARRAY(pool->events, active)) return false;
+        if (!ASS_REALLOC_ARRAY(pool->events, active)) goto serial;
         pool->capacity = active;
     }
     if (active > priv->eimg_size) {
         EventImages *images = ass_realloc_array(priv->eimg, active, sizeof(*images));
-        if (!images) return false;
+        if (!images) goto serial;
         priv->eimg = images;
         priv->eimg_size = active;
     }
@@ -3686,11 +3786,15 @@ static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
         if (!ass_clone_render_settings(worker->renderer, priv,
                 &worker->font_generation, &worker->render_id) ||
             !ass_start_frame(worker->renderer, track, now))
-            return false;
+            goto serial;
 #ifdef ASS_FLE_PROFILE
         memset(worker->renderer->fle_phase_ns, 0, sizeof(priv->fle_phase_ns));
 #endif
     }
+    // Resource readiness is not admission: certify every restricted frame.
+    if (restricted && !certify_primary_events(priv, track, now, pool))
+        goto serial;
+    set_pool_cache_limits(pool, pool->glyph_budget, pool->bitmap_budget, pool->composite_budget);
     pthread_mutex_lock(&pool->lock);
     pool->job_kind = JOB_EVENTS;
     pool->pending = pool->count;
@@ -3703,6 +3807,21 @@ static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
         pthread_cond_wait(&pool->done, &pool->lock);
     pool->job_kind = JOB_IDLE;
     pthread_mutex_unlock(&pool->lock);
+    if (restricted) {
+        uint64_t work_ns = main_ns;
+        bool valid = main_ns != UINT64_MAX;
+        for (int i = 0; i < pool->count; i++) {
+            uint64_t batch_ns = pool->workers[i].batch_ns;
+            if (batch_ns == UINT64_MAX) {
+                valid = false;
+                break;
+            }
+            work_ns = batch_ns > UINT64_MAX - work_ns ? UINT64_MAX : work_ns + batch_ns;
+        }
+        // Sum lane work, not parallel latency, to keep the admission estimate current.
+        if (valid)
+            priv->last_event_render_ns = work_ns;
+    }
 #ifdef ASS_FLE_PROFILE
     ass_msg(priv->library, MSGL_INFO, "FLE_WORKERS,%lld,%" PRIu64 ",%" PRIu64
             ",%" PRIu64 ",%" PRIu64, now, main_ns, pool->workers[0].batch_ns,
@@ -3711,8 +3830,6 @@ static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
     for (int i = 0; i < pool->count; i++)
         for (int p = 0; p < 10; p++)
             priv->fle_phase_ns[p] += pool->workers[i].renderer->fle_phase_ns[p];
-#else
-    (void) main_ns;
 #endif
     int cnt = 0;
     for (int i = 0; i < active; i++)
@@ -3720,6 +3837,13 @@ static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
             priv->eimg[cnt++] = priv->eimg[i];
     *rendered = cnt;
     return true;
+
+serial:
+    // Bound repeated parse-only work on expensive, uncertifiable frames.
+    if (preflight_attempted)
+        priv->primary_retry_frames = 8;
+    restore_serial_cache_limits(pool);
+    return false;
 }
 #else
 bool ass_run_vertical_filter(ASS_Renderer *renderer, FilterFunc *plain,
@@ -4028,7 +4152,7 @@ ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
     bool parallel = false;
 #ifdef ASS_EVENT_THREADS
     parallel = render_events_parallel(priv, track, now, &cnt);
-    uint64_t event_start = !parallel && priv->experimental_edges ? fle_clock() : 0;
+    uint64_t event_start = !parallel ? fle_clock() : 0;
 #endif
     if (!parallel)
     for (int i = 0; i < track->n_events; i++) {
@@ -4047,8 +4171,11 @@ ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
     }
 
 #ifdef ASS_EVENT_THREADS
-    if (event_start)
-        priv->last_event_render_ns = fle_clock() - event_start;
+    if (!parallel) {
+        uint64_t elapsed = event_elapsed_ns(event_start, fle_clock());
+        if (elapsed != UINT64_MAX)
+            priv->last_event_render_ns = elapsed;
+    }
 #endif
 
     // sort by layer

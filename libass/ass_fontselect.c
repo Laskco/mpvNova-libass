@@ -154,6 +154,23 @@ get_data_embedded(void *data, unsigned char *buf, size_t offset, size_t len)
     return len;
 }
 
+bool ass_font_stream_embedded_source(const ASS_FontStream *stream,
+                                     const ASS_Library *library,
+                                     const char **data, size_t *size)
+{
+    if (stream->func != get_data_embedded || !stream->priv)
+        return false;
+    const FontDataFT *font = stream->priv;
+    if (font->lib != library || font->idx < 0 || font->idx >= library->num_fontdata)
+        return false;
+    const ASS_Fontdata *source = library->fontdata + font->idx;
+    if (!source->data || source->size <= 0)
+        return false;
+    *data = source->data;
+    *size = source->size;
+    return true;
+}
+
 static ASS_FontProviderFuncs ft_funcs = {
     .get_data          = get_data_embedded,
     .check_glyph       = check_glyph_ft,
