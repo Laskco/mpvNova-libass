@@ -155,10 +155,32 @@ static inline bool segment_subdivide(const OutlineSegment *seg,
         (pcr < 0 ? -pcr : pcr) > seg->er;
 }
 
+// Normalize raw halfplane coefficients without changing their direction.
+static void normalize_line(struct segment *line)
+{
+    int32_t abs_a = line->a < 0 ? -line->a : line->a;
+    int32_t abs_b = line->b < 0 ? -line->b : line->b;
+    uint32_t max_ab = (abs_a > abs_b ? abs_a : abs_b);
+    int shift = 30 - ilog2(max_ab);
+    max_ab <<= shift + 1;
+    line->a *= 1 << shift;
+    line->b *= 1 << shift;
+    line->c *= 1 << shift;
+    line->scale = (uint64_t) 0x53333333 * (uint32_t) (max_ab * (uint64_t) max_ab >> 32) >> 32;
+    line->scale += 0x8810624D - (0xBBC6A7EF * (uint64_t) max_ab >> 32);
+}
+
+static void normalize_lines(RasterizerData *rst, size_t first)
+{
+    for (size_t i = first; i < rst->size[0]; i++)
+        normalize_line(rst->linebuf[0] + i);
+}
+
 /**
  * \brief Add new segment to polyline
  */
-static bool add_line(RasterizerData *rst, ASS_Vector pt0, ASS_Vector pt1)
+static bool add_line(RasterizerData *rst, ASS_Vector pt0, ASS_Vector pt1,
+                     bool normalize)
 {
     int32_t x = pt1.x - pt0.x;
     int32_t y = pt1.y - pt0.y;
@@ -186,18 +208,9 @@ static bool add_line(RasterizerData *rst, ASS_Vector pt0, ASS_Vector pt1)
     line->b = -x;
     line->c = y * (int64_t) pt0.x - x * (int64_t) pt0.y;
 
-    // halfplane normalization
-    int32_t abs_x = x < 0 ? -x : x;
-    int32_t abs_y = y < 0 ? -y : y;
-    uint32_t max_ab = (abs_x > abs_y ? abs_x : abs_y);
-    int shift = 30 - ilog2(max_ab);
-    max_ab <<= shift + 1;
-    line->a *= 1 << shift;
-    line->b *= 1 << shift;
-    line->c *= 1 << shift;
-    line->scale = (uint64_t) 0x53333333 * (uint32_t) (max_ab * (uint64_t) max_ab >> 32) >> 32;
-    line->scale += 0x8810624D - (0xBBC6A7EF * (uint64_t) max_ab >> 32);
-    //line->scale = ((uint64_t) 1 << 61) / max_ab;
+    line->scale = 0;
+    if (normalize)
+        normalize_line(line);
     return true;
 }
 
@@ -205,12 +218,12 @@ static bool add_line(RasterizerData *rst, ASS_Vector pt0, ASS_Vector pt1)
  * \brief Add quadratic spline to polyline
  * Performs recursive subdivision if necessary.
  */
-static bool add_quadratic(RasterizerData *rst, const ASS_Vector *pt)
+static bool add_quadratic(RasterizerData *rst, const ASS_Vector *pt, bool normalize)
 {
     OutlineSegment seg;
     segment_init(&seg, pt[0], pt[2], rst->outline_error);
     if (!segment_subdivide(&seg, pt[0], pt[1]))
-        return add_line(rst, pt[0], pt[2]);
+        return add_line(rst, pt[0], pt[2], normalize);
 
     ASS_Vector next[5];
     next[1].x = pt[0].x + pt[1].x;
@@ -225,19 +238,19 @@ static bool add_quadratic(RasterizerData *rst, const ASS_Vector *pt)
     next[3].y >>= 1;
     next[0] = pt[0];
     next[4] = pt[2];
-    return add_quadratic(rst, next) && add_quadratic(rst, next + 2);
+    return add_quadratic(rst, next, normalize) && add_quadratic(rst, next + 2, normalize);
 }
 
 /**
  * \brief Add cubic spline to polyline
  * Performs recursive subdivision if necessary.
  */
-static bool add_cubic(RasterizerData *rst, const ASS_Vector *pt)
+static bool add_cubic(RasterizerData *rst, const ASS_Vector *pt, bool normalize)
 {
     OutlineSegment seg;
     segment_init(&seg, pt[0], pt[3], rst->outline_error);
     if (!segment_subdivide(&seg, pt[0], pt[1]) && !segment_subdivide(&seg, pt[0], pt[2]))
-        return add_line(rst, pt[0], pt[3]);
+        return add_line(rst, pt[0], pt[3], normalize);
 
     ASS_Vector next[7], center;
     next[1].x = pt[0].x + pt[1].x;
@@ -262,7 +275,7 @@ static bool add_cubic(RasterizerData *rst, const ASS_Vector *pt)
     next[5].y >>= 1;
     next[0] = pt[0];
     next[6] = pt[3];
-    return add_cubic(rst, next) && add_cubic(rst, next + 3);
+    return add_cubic(rst, next, normalize) && add_cubic(rst, next + 3, normalize);
 }
 
 
@@ -361,13 +374,18 @@ static bool contour_fits32(const ASS_Vector *points, size_t begin, size_t end)
 #endif
 #endif
 
+// Input is raw; every return leaves all surviving contour lines normalized.
 static bool simplify_contour(RasterizerData *rst, size_t first, int tolerance)
 {
     size_t count = rst->size[0] - first;
-    if (count < 64 || count > 65536)
+    if (count < 64 || count > 65536) {
+        normalize_lines(rst, first);
         return true;
-    if (!check_capacity(rst, 1, count + 1))
+    }
+    if (!check_capacity(rst, 1, count + 1)) {
+        normalize_lines(rst, first);
         return false;
+    }
 
     // The second segment buffer is scratch until raster subdivision starts.
     // Its storage is large and aligned enough for points, an interval stack,
@@ -404,8 +422,10 @@ static bool simplify_contour(RasterizerData *rst, size_t first, int tolerance)
         }
     }
     if (points[count].x != points[0].x || points[count].y != points[0].y ||
-        !corner || corner == count)
+        !corner || corner == count) {
+        normalize_lines(rst, first);
         return true;
+    }
 
 #if UINTPTR_MAX == UINT32_MAX || defined(__aarch64__)
     // 2 * 32700^2 + 64 * 32700 fits INT32_MAX. Keep the original
@@ -471,7 +491,7 @@ static bool simplify_contour(RasterizerData *rst, size_t first, int tolerance)
     ASS_Vector previous = points[0];
     for (size_t i = 1; i <= count; i++) {
         if (!keep[i]) continue;
-        if (!add_line(rst, previous, points[i])) return false;
+        if (!add_line(rst, previous, points[i], true)) return false;
         previous = points[i];
     }
     return true;
@@ -494,6 +514,8 @@ bool ass_rasterizer_set_outline(RasterizerData *rst,
 
     ASS_Vector *start = path->points, *cur = start;
     size_t contour_start = rst->size[0];
+    // RDP needs only coefficient signs and endpoint bounds, not normalization.
+    bool normalize = !simplify;
     for (size_t i = 0; i < path->n_segments; i++) {
         int n = path->segments[i] & OUTLINE_COUNT_MASK;
         cur += n;
@@ -506,16 +528,16 @@ bool ass_rasterizer_set_outline(RasterizerData *rst,
 
         switch (n) {
         case OUTLINE_LINE_SEGMENT:
-            if (!add_line(rst, cur[-1], *end))
-                return false;
+            if (!add_line(rst, cur[-1], *end, normalize))
+                goto fail;
             break;
 
         case OUTLINE_QUADRATIC_SPLINE:
             p[0] = cur[-2];
             p[1] = cur[-1];
             p[2] = *end;
-            if (!add_quadratic(rst, p))
-                return false;
+            if (!add_quadratic(rst, p, normalize))
+                goto fail;
             break;
 
         case OUTLINE_CUBIC_SPLINE:
@@ -523,12 +545,12 @@ bool ass_rasterizer_set_outline(RasterizerData *rst,
             p[1] = cur[-2];
             p[2] = cur[-1];
             p[3] = *end;
-            if (!add_cubic(rst, p))
-                return false;
+            if (!add_cubic(rst, p, normalize))
+                goto fail;
             break;
 
         default:
-            return false;
+            goto fail;
         }
         if (path->segments[i] & OUTLINE_CONTOUR_END) {
             if (simplify && !simplify_contour(rst, contour_start, simplify))
@@ -554,6 +576,8 @@ bool ass_rasterizer_set_outline(RasterizerData *rst,
         if (path->segments[i] & OUTLINE_CONTOUR_END)
             contour_start = rst->size[0];
     }
+    if (simplify)
+        normalize_lines(rst, contour_start);
     assert(start == cur && (!cur || cur == path->points + path->n_points));
 
     for (size_t k = rst->n_first; !clip && k < rst->size[0]; k++) {
@@ -565,6 +589,12 @@ bool ass_rasterizer_set_outline(RasterizerData *rst,
     if (!extra)
         rst->n_first = rst->size[0];
     return true;
+
+fail:
+    // Earlier contours are finalized; never expose a raw trailing contour.
+    if (simplify)
+        normalize_lines(rst, contour_start);
+    return false;
 }
 
 
