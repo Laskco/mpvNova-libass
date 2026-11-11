@@ -376,6 +376,11 @@ void ass_reset_render_context(RenderContext *state, ASS_Style *style);
 void ass_frame_ref(ASS_Image *img);
 void ass_frame_unref(ASS_Image *img);
 ASS_Vector ass_layout_res(ASS_Renderer *render_priv);
+// Main vertical NEON blur only. Caller must gate on a large full-stage workload.
+// Returns false without writing dst if the kernel or buffer geometry is unsupported.
+bool ass_trim_blur_vertical(ParamFilterFunc *filter, int16_t *dst,
+                             const int16_t *src, size_t width, size_t src_h,
+                             size_t dst_h, const int16_t *coeff);
 // Returns true after completing the stage; false leaves dst untouched for serial fallback.
 // Exactly one kernel must be provided. Buffers must satisfy its usual preconditions.
 bool ass_run_vertical_filter(ASS_Renderer *renderer, FilterFunc *plain,

@@ -233,6 +233,68 @@ static bool can_reuse_blur_output(const BlurMethod *blur_x, const BlurMethod *bl
     return !index && dim[0] == end_w && dim[1] == end_h;
 }
 
+#if CONFIG_ASM && ARCH_AARCH64
+ParamFilterFunc ass_blur4_vert16_neon, ass_blur5_vert16_neon,
+    ass_blur6_vert16_neon, ass_blur7_vert16_neon, ass_blur8_vert16_neon;
+
+static bool blur_row_zero(const int16_t *row)
+{
+    uint64_t bits[2];
+    memcpy(bits, row, sizeof(bits));
+    return !(bits[0] | bits[1]);
+}
+#endif
+
+bool ass_trim_blur_vertical(ParamFilterFunc *filter, int16_t *dst,
+                             const int16_t *src, size_t width, size_t src_h,
+                             size_t dst_h, const int16_t *coeff)
+{
+#if CONFIG_ASM && ARCH_AARCH64
+    ParamFilterFunc *const kernels[] = {ass_blur4_vert16_neon, ass_blur5_vert16_neon,
+        ass_blur6_vert16_neon, ass_blur7_vert16_neon, ass_blur8_vert16_neon};
+    int radius = 0;
+    for (int i = 0; i < 5; i++)
+        if (filter == kernels[i]) radius = i + 4;
+    if (!radius || !dst || !src || !coeff || !width || !src_h ||
+        dst_h < src_h || dst_h - src_h != 2 * (size_t) radius ||
+        (((uintptr_t) dst | (uintptr_t) src) & 15) || width > SIZE_MAX - 7)
+        return false;
+    size_t rounded_width = (width + 7) & ~(size_t) 7;
+    if (src_h > PTRDIFF_MAX / sizeof(*src) / rounded_width ||
+        dst_h > PTRDIFF_MAX / sizeof(*dst) / rounded_width)
+        return false;
+    size_t src_bytes = rounded_width * src_h * sizeof(*src);
+    size_t dst_bytes = rounded_width * dst_h * sizeof(*dst);
+    uintptr_t s = (uintptr_t) src, d = (uintptr_t) dst;
+    if (d <= s ? s - d < dst_bytes : d - s < src_bytes)
+        return false;
+
+    for (size_t x = 0; x < rounded_width; x += 8) {
+        const int16_t *input = src + x * src_h;
+        int16_t *output = dst + x * dst_h;
+        size_t first = 0, end = src_h;
+        while (first < end && blur_row_zero(input + 8 * first)) first++;
+        if (first == end) {
+            memset(output, 0, dst_h * 16);
+            continue;
+        }
+        while (end > first + 1 && blur_row_zero(input + 8 * (end - 1))) end--;
+        if (first) memset(output, 0, first * 16);
+        // The kernel maps output y to input [y - 2r, y]; offset both origins.
+        filter(output + 8 * first, input + 8 * first, 8, end - first, coeff);
+        if (end < src_h) {
+            size_t tail = src_h - end;
+            memset(output + 8 * (dst_h - tail), 0, tail * 16);
+        }
+    }
+    return true;
+#else
+    (void) filter; (void) dst; (void) src; (void) width;
+    (void) src_h; (void) dst_h; (void) coeff;
+    return false;
+#endif
+}
+
 bool ass_gaussian_blur(ASS_Renderer *renderer, Bitmap *bm, const Bitmap *src,
                        double r2x, double r2y)
 {
@@ -308,8 +370,13 @@ bool ass_gaussian_blur(ASS_Renderer *renderer, Bitmap *bm, const Bitmap *src,
     w += 2 * blur_x.radius;
     index ^= 1;
     assert(blur_y.radius >= 4 && blur_y.radius <= 8);
+    bool large_vertical = w &&
+        (w >= 128 * 1024 || h >= (128 * 1024 + w - 1) / w);
     if (!ass_run_vertical_filter(renderer, NULL, engine->blur_vert[blur_y.radius - 4],
-            buf[index ^ 1], buf[index], w, h, h + 2 * blur_y.radius, blur_y.coeff))
+            buf[index ^ 1], buf[index], w, h, h + 2 * blur_y.radius, blur_y.coeff) &&
+        !(large_vertical && engine->align_order == 4 &&
+          ass_trim_blur_vertical(engine->blur_vert[blur_y.radius - 4],
+              buf[index ^ 1], buf[index], w, h, h + 2 * blur_y.radius, blur_y.coeff)))
         engine->blur_vert[blur_y.radius - 4](buf[index ^ 1], buf[index], w, h, blur_y.coeff);
     h += 2 * blur_y.radius;
     index ^= 1;

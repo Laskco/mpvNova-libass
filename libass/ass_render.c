@@ -3505,9 +3505,12 @@ static void vertical_batch(const VerticalTask *task, unsigned id)
     size_t width = end == stripes ? task->width - x : (end - begin) * task->stripe;
     const int16_t *src = task->src + x * task->src_h;
     int16_t *dst = task->dst + x * task->dst_h;
-    if (task->param_filter)
-        task->param_filter(dst, src, width, task->src_h, task->coeff);
-    else
+    if (task->param_filter) {
+        // The full stage already passed the pool's large-work threshold.
+        if (task->stripe != 8 || !ass_trim_blur_vertical(task->param_filter,
+                dst, src, width, task->src_h, task->dst_h, task->coeff))
+            task->param_filter(dst, src, width, task->src_h, task->coeff);
+    } else
         task->plain(dst, src, width, task->src_h);
 }
 
