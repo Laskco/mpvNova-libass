@@ -37,6 +37,17 @@ jobs:
             cc: gcc
           - os: ubuntu-24.04-arm
             cc: clang
+          # Production event threading with Ubuntu's atomic-refcount Fontconfig.
+          - os: ubuntu-latest
+            cc: gcc
+            jobname_suffix: production-threading
+            extra_cflags: '-DASS_EVENT_THREADS -DASS_FONTCONFIG_ATOMIC_REFS=1'
+            render_threads: '4'
+          - os: ubuntu-24.04-arm
+            cc: gcc
+            jobname_suffix: production-threading
+            extra_cflags: '-DASS_EVENT_THREADS -DASS_FONTCONFIG_ATOMIC_REFS=1'
+            render_threads: '4'
           # Add docker-build with minimum version of dependencies
           - os: ubuntu-latest
             cc: gcc
@@ -262,9 +273,20 @@ jobs:
 
       - name: run tests
         if: matrix.skip_tests != 'yes'
+        env:
+          LIBASS_RENDER_THREADS: ${{ matrix.render_threads }}
+          LIBASS_EXPERIMENTAL_EDGES: '0'
         run: |
           ART_REG_SKIP="${{ matrix.art_reg_skip }}" make -j 1 check \
           || (cat test-suite.log; exit 1;)
+
+      - name: check experimental edges with production threading
+        if: matrix.render_threads
+        env:
+          LIBASS_RENDER_THREADS: ${{ matrix.render_threads }}
+          LIBASS_EXPERIMENTAL_EDGES: '1'
+        # Experimental output is not expected to match ordinary visual baselines.
+        run: make -j 1 check-art-fuzz
 
 
       - name: Coverity scan

@@ -175,6 +175,60 @@ static void check_param_filter(ParamFilterFunc func, const char *name, int n, in
     report(name, n, align);
 }
 
+static void check_param_filter_large(ParamFilterFunc func, const char *name, int n, int align)
+{
+    enum { MAX_WIDTH = 544, MAX_HEIGHT = 136, PADDING = 16 * MAX_WIDTH };
+    const int sizes[][2] = {
+        { 64, 2 * n - 1 }, { 64, 2 * n }, { 64, 2 * n + 1 },
+        { 127, 136 }, { 128, 127 }, { 128, 128 }, { 129, 128 },
+        { 544, 31 }, { 511, 32 }, { 512, 32 }, { 513, 32 },
+    };
+    ALIGN(int16_t src[MAX_WIDTH * MAX_HEIGHT], 32);
+    ALIGN(int16_t dst_ref[MAX_WIDTH * MAX_HEIGHT + PADDING], 32);
+    ALIGN(int16_t dst_new[MAX_WIDTH * MAX_HEIGHT + PADDING], 32);
+    int16_t param[8];
+    declare_func(void,
+                 int16_t *dst, const int16_t *src,
+                 size_t src_width, size_t src_height,
+                 const int16_t *param);
+
+    if (check_func(func, name, n, align)) {
+        // Straddle the NEON horizontal size gates and vertical interior boundary.
+        for (int s = 0; s < sizeof(sizes) / sizeof(*sizes); s++) {
+            for (int pattern = 0; pattern < 4; pattern++) {
+                for (int i = 0; i < sizeof(src) / 2; i++)
+                    src[i] = pattern == 0 ? rnd() % 0x4001 :
+                             pattern == 1 ? 0 : pattern == 2 ? 0x4000 : 0x2000;
+
+                // Mostly flat input passes sampling but still needs convolution
+                // near these unsampled, nonuniform lanes and the image edges.
+                if (pattern == 3) {
+                    src[0] = 0;
+                    src[align / 2 + 1] = 0x4000;
+                }
+                for (int i = 0; i < sizeof(dst_ref) / 2; i++)
+                    dst_ref[i] = dst_new[i] = rnd();
+
+                int left = 0x8000;
+                for (int i = 0; i < n; i++) {
+                    param[i] = rnd() % FFMIN(left + 1, 0x8000);
+                    left -= param[i];
+                }
+
+                call_ref(dst_ref, src, sizes[s][0], sizes[s][1], param);
+                call_new(dst_new, src, sizes[s][0], sizes[s][1], param);
+                if (memcmp(dst_ref, dst_new, sizeof(dst_ref))) {
+                    fail();
+                    goto done;
+                }
+            }
+        }
+    }
+
+done:
+    report(name, n, align);
+}
+
 void checkasm_check_blur(unsigned cpu_flag)
 {
     BitmapEngine engine[2] = {
@@ -192,6 +246,8 @@ void checkasm_check_blur(unsigned cpu_flag)
         for (int n = 4; n <= 8; n++) {
             check_param_filter(engine[i].blur_horz[n - 4], "blur%d_horz%d", n, align);
             check_param_filter(engine[i].blur_vert[n - 4], "blur%d_vert%d", n, align);
+            check_param_filter_large(engine[i].blur_horz[n - 4], "blur%d_horz%d_large", n, align);
+            check_param_filter_large(engine[i].blur_vert[n - 4], "blur%d_vert%d_large", n, align);
         }
     }
 }

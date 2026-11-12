@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        source: [baseline, candidate]
+        source: [baseline, candidate, production]
     steps:
       - uses: actions/checkout@v6
         with:
@@ -27,19 +27,25 @@ jobs:
           sudo apt-get install -y meson ninja-build nasm build-essential pkgconf \
             libfreetype-dev libfontconfig-dev libharfbuzz-dev libfribidi-dev libpng-dev libunibreak-dev
       - name: Configure reference or candidate
+        id: build
         run: |
           flags=''
           if [ '${{ matrix.source }}' = baseline ]; then
+            # Frozen upstream compatibility reference, not a current-fork control.
             git checkout f61db567e6593df3470e91594bcd4ad2d0473aff
           else
             flags=-DASS_EVENT_THREADS
+            if [ '${{ matrix.source }}' = production ]; then
+              flags="$flags -DASS_FONTCONFIG_ATOMIC_REFS=1"
+            fi
           fi
           meson setup build --buildtype=debugoptimized -Dc_args="$flags" \
             -Db_sanitize=address,undefined -Dtest=enabled -Dcompare=enabled \
             -Dfuzz=enabled -Dcheckasm=enabled -Dart-samples="$PWD/art"
           meson compile -C build
       - name: Check experimental outline clipping under sanitizers
-        if: matrix.source == 'candidate'
+        # This strict check uses fork-only APIs absent from the upstream snapshot.
+        if: matrix.source != 'baseline'
         run: |
           cc -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
             -ffunction-sections -fdata-sections -Ibuild -Ilibass \
@@ -48,7 +54,7 @@ jobs:
             -Wl,--gc-sections -lm -o build/edge-check
           ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 build/edge-check
       - name: Exercise experimental mode with malformed subtitle inputs
-        if: matrix.source == 'candidate'
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && matrix.source != 'baseline' }}
         env:
           LIBASS_EXPERIMENTAL_EDGES: '1'
           LIBASS_RENDER_THREADS: '4'
@@ -56,7 +62,10 @@ jobs:
           UBSAN_OPTIONS: halt_on_error=1
         run: meson test -C build checkasm art-fuzz --timeout-multiplier 4 --print-errorlogs
       - name: Run upstream regression and malformed-input tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         env:
+          # Existing edges-on visual differences are not ordinary baseline tests.
+          LIBASS_EXPERIMENTAL_EDGES: '0'
           LIBASS_RENDER_THREADS: '4'
           ASAN_OPTIONS: detect_leaks=1
           UBSAN_OPTIONS: halt_on_error=1
@@ -74,7 +83,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           repository: Laskco/mpvNova
-          ref: a083f74b3658dfd3e858a28065e5e9cf4bb9dad0
+          ref: 23c532f3369a3fcbfee682e382adb89003416143
           path: player
           sparse-checkout: buildscripts
       - name: Install build tools
@@ -88,7 +97,7 @@ jobs:
             player/buildscripts/prefix
             player/buildscripts/deps
             player/buildscripts/sdk
-          key: fle-deps-arm64-ndk30-v1
+          key: fle-deps-arm64-ndk30-23c532f3-v2
       - name: Prepare pinned dependencies
         run: |
           set -euo pipefail
@@ -138,13 +147,15 @@ jobs:
             ./buildall.sh --arch arm64 fribidi
             ./buildall.sh --arch arm64 unibreak
           fi
-          ./buildall.sh --arch arm64 -n libass
-          # buildall deliberately clears compiler flags. Rebuild only libass with
-          # timing enabled after configuration; dependencies remain unchanged.
+          MPVNOVA_LIBASS_REF="$GITHUB_SHA" ./buildall.sh --arch arm64 -n libass
+          # Append timing instrumentation without replacing the production
+          # CPPFLAGS, including the build script's Fontconfig atomic-ref check.
           export PATH="$PWD/sdk/android-ndk-r30/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
           cd deps/libass/_build_arm64
           make clean
-          make -j2 CPPFLAGS='-DASS_FLE_PROFILE -DASS_EVENT_THREADS'
+          make -j2 -f Makefile -f - <<'MAKE'
+          CPPFLAGS += -DASS_FLE_PROFILE
+          MAKE
           make DESTDIR="$GITHUB_WORKSPACE/player/buildscripts/prefix/arm64" install
       - name: Link standalone benchmark
         run: |
