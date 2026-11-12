@@ -114,10 +114,88 @@ void *ass_try_realloc_array(void *ptr, size_t nmemb, size_t size)
     }
 }
 
+#ifdef ASS_EVENT_THREADS
+#ifdef _MSC_VER
+static __declspec(thread) ASS_MsgBuffer *worker_msg_buffer;
+#else
+static __thread ASS_MsgBuffer *worker_msg_buffer;
+#endif
+
+void ass_msg_buffer_begin(ASS_MsgBuffer *buffer, ASS_Library *library)
+{
+    assert(!buffer->count && !buffer->used && !buffer->dropped &&
+           !buffer->truncated && buffer != worker_msg_buffer);
+    buffer->library = library;
+    buffer->previous = worker_msg_buffer;
+    worker_msg_buffer = buffer;
+}
+
+void ass_msg_buffer_end(ASS_MsgBuffer *buffer)
+{
+    assert(worker_msg_buffer == buffer);
+    worker_msg_buffer = buffer->previous;
+    buffer->previous = NULL;
+}
+
+static void buffer_message(ASS_MsgBuffer *buffer, int level,
+                           const char *fmt, va_list va)
+{
+    size_t available = sizeof(buffer->text) - buffer->used;
+    if (buffer->count == sizeof(buffer->messages) / sizeof(buffer->messages[0]) ||
+        available < 2)
+        goto dropped;
+    available = FFMIN(available, 1024);
+    char *text = buffer->text + buffer->used;
+    int length = vsnprintf(text, available, fmt, va);
+    if (length < 0)
+        goto dropped;
+    if ((size_t) length >= available) {
+        static const char suffix[] = " [truncated]";
+        if (available >= sizeof(suffix))
+            memcpy(text + available - sizeof(suffix), suffix, sizeof(suffix));
+        length = available - 1;
+        if ((!buffer->dropped && !buffer->truncated) || level < buffer->loss_level)
+            buffer->loss_level = level;
+        buffer->truncated += buffer->truncated < SIZE_MAX;
+    }
+    buffer->messages[buffer->count].level = level;
+    buffer->messages[buffer->count++].offset = buffer->used;
+    buffer->used += length + 1;
+    return;
+
+dropped:
+    if ((!buffer->dropped && !buffer->truncated) || level < buffer->loss_level)
+        buffer->loss_level = level;
+    buffer->dropped += buffer->dropped < SIZE_MAX;
+}
+
+void ass_msg_buffer_drain(ASS_MsgBuffer *buffer)
+{
+    assert(!buffer->previous && buffer != worker_msg_buffer);
+    for (size_t i = 0; i < buffer->count; i++)
+        ass_msg(buffer->library, buffer->messages[i].level, "%s",
+                buffer->text + buffer->messages[i].offset);
+    if (buffer->dropped || buffer->truncated)
+        ass_msg(buffer->library, buffer->loss_level,
+                "Worker logging: %zu message(s) dropped, %zu truncated",
+                buffer->dropped, buffer->truncated);
+    buffer->count = buffer->used = buffer->dropped = buffer->truncated = 0;
+    buffer->loss_level = 0;
+}
+#endif
+
 void ass_msg(ASS_Library *priv, int lvl, const char *fmt, ...)
 {
     va_list va;
     va_start(va, fmt);
+#ifdef ASS_EVENT_THREADS
+    ASS_MsgBuffer *buffer = worker_msg_buffer;
+    while (buffer && buffer->library != priv)
+        buffer = buffer->previous;
+    if (buffer)
+        buffer_message(buffer, lvl, fmt, va);
+    else
+#endif
     priv->msg_callback(lvl, fmt, va, priv->msg_callback_data);
     va_end(va);
 }

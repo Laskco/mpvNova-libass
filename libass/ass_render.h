@@ -357,6 +357,8 @@ struct ass_renderer {
     ASS_Outline raster_outline[2];
     void *blur_scratch;
     size_t blur_scratch_size;
+    BlurMethodCacheEntry blur_methods[8];
+    unsigned blur_method_next;
     uint64_t last_event_render_ns;
 };
 

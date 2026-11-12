@@ -1667,8 +1667,7 @@ size_t ass_bitmap_construct(void *key, void *value, void *priv)
 
     ASS_Rect clip = {k->clip_min.x, k->clip_min.y, k->clip_max.x, k->clip_max.y};
     ASS_Outline temporary[2] = {{0}};
-    bool reuse = state->renderer->experimental_edges &&
-        outline_size(&k->outline->outline[0]) <= 512 * 1024 &&
+    bool reuse = outline_size(&k->outline->outline[0]) <= 512 * 1024 &&
         outline_size(&k->outline->outline[1]) <= 512 * 1024;
     ASS_Outline *outline = reuse ? state->renderer->raster_outline : temporary;
     if (k->matrix_z.x || k->matrix_z.y) {
@@ -2840,36 +2839,57 @@ int ass_be_padding(int be)
 }
 
 
-static void crop_composite_bitmap(const BitmapEngine *engine, Bitmap *bm,
-                                  const CompositeHashKey *key)
+static bool alloc_composite_bitmap(const BitmapEngine *engine, Bitmap *bm,
+                                    ASS_Rect rect, int border,
+                                    const CompositeHashKey *key)
 {
-    if (!bm->buffer || !key->viewport_align)
-        return;
-    // Preserve the original blur cascade and ordered-dither sampling origin.
-    int64_t mask = -(int64_t)key->viewport_align;
-    int x0 = FFMINMAX(((int64_t)key->viewport.x_min - bm->left) & mask, 0, bm->w);
-    int y0 = FFMINMAX(((int64_t)key->viewport.y_min - bm->top) & mask, 0, bm->h);
-    int x1 = FFMINMAX(((int64_t)key->viewport.x_max - bm->left + key->viewport_align - 1) & mask, 0, bm->w);
-    int y1 = FFMINMAX(((int64_t)key->viewport.y_max - bm->top + key->viewport_align - 1) & mask, 0, bm->h);
-    if (x1 <= x0 || y1 <= y0) {
-        ass_free_bitmap(bm);
-        memset(bm, 0, sizeof(*bm));
-        return;
+    int64_t left = (int64_t) rect.x_min - border;
+    int64_t top = (int64_t) rect.y_min - border;
+    int64_t width = (int64_t) rect.x_max - rect.x_min + 2 * border;
+    int64_t height = (int64_t) rect.y_max - rect.y_min + 2 * border;
+    if (width <= 0 || height <= 0 || width > INT_MAX || height > INT_MAX ||
+        left < INT_MIN || top < INT_MIN)
+        return false;
+    if (key->viewport_align) {
+        // Keep the full bitmap's blur/dither origin and required filter halo.
+        int64_t mask = -(int64_t) key->viewport_align;
+        int64_t x0 = FFMINMAX(((int64_t) key->viewport.x_min - left) & mask, 0, width);
+        int64_t y0 = FFMINMAX(((int64_t) key->viewport.y_min - top) & mask, 0, height);
+        int64_t x1 = FFMINMAX(((int64_t) key->viewport.x_max - left +
+                               key->viewport_align - 1) & mask, 0, width);
+        int64_t y1 = FFMINMAX(((int64_t) key->viewport.y_max - top +
+                               key->viewport_align - 1) & mask, 0, height);
+        if (x1 <= x0 || y1 <= y0)
+            return false;
+        if (!key->filter.be || (x1 - x0 >= 2 && y1 - y0 >= 2)) {
+            left += x0;
+            top += y0;
+            width = x1 - x0;
+            height = y1 - y0;
+        }
     }
-    if (key->filter.be && (x1 - x0 < 2 || y1 - y0 < 2))
+    if (left > INT_MAX || top > INT_MAX ||
+        !ass_alloc_bitmap(engine, bm, width, height, true))
+        return false;
+    bm->left = left;
+    bm->top = top;
+    return true;
+}
+
+static void add_composite_bitmap(const BitmapEngine *engine, Bitmap *dst,
+                                  const Bitmap *src, ASS_Vector pos)
+{
+    if (!src)
         return;
-    if (!x0 && !y0 && x1 == bm->w && y1 == bm->h)
+    int64_t x = (int64_t) pos.x + src->left - dst->left;
+    int64_t y = (int64_t) pos.y + src->top - dst->top;
+    int x0 = FFMINMAX(-x, 0, src->w), x1 = FFMINMAX(dst->w - x, 0, src->w);
+    int y0 = FFMINMAX(-y, 0, src->h), y1 = FFMINMAX(dst->h - y, 0, src->h);
+    if (x1 <= x0 || y1 <= y0)
         return;
-    Bitmap cropped = {0};
-    if (!ass_alloc_bitmap(engine, &cropped, x1 - x0, y1 - y0, true))
-        return;
-    cropped.left = bm->left + x0;
-    cropped.top = bm->top + y0;
-    for (int y = 0; y < cropped.h; y++)
-        memcpy(cropped.buffer + y * cropped.stride,
-               bm->buffer + (y + y0) * bm->stride + x0, cropped.w);
-    ass_free_bitmap(bm);
-    *bm = cropped;
+    engine->add_bitmaps(dst->buffer + (y + y0) * dst->stride + (x + x0), dst->stride,
+                        src->buffer + (ptrdiff_t) y0 * src->stride + x0, src->stride,
+                        x1 - x0, y1 - y0);
 }
 
 size_t ass_composite_construct(void *key, void *value, void *priv)
@@ -2907,7 +2927,7 @@ size_t ass_composite_construct(void *key, void *value, void *priv)
     bool gaussian = r2x > 0.001 || r2y > 0.001;
     bool blur_fill = !(flags & FILTER_NONZERO_BORDER) || (flags & FILTER_BORDER_STYLE_3);
     bool fill_blurred = false, outline_blurred = false;
-    if (!bord && n_bm == 1) {
+    if (!bord && n_bm == 1 && !k->viewport_align) {
         // Gaussian blur unpacks the source before allocating its output. Read
         // immutable cached bitmaps directly when no pre-blur cropping is needed.
         if (gaussian && blur_fill && !k->viewport_align)
@@ -2916,58 +2936,23 @@ size_t ass_composite_construct(void *key, void *value, void *priv)
             ass_copy_bitmap(&render_priv->engine, &v->bm, last->bm);
         v->bm.left += last->pos.x;
         v->bm.top  += last->pos.y;
-    } else if (n_bm && ass_alloc_bitmap(&render_priv->engine, &v->bm,
-                                        rect.x_max - rect.x_min + 2 * bord,
-                                        rect.y_max - rect.y_min + 2 * bord,
-                                        true)) {
-        Bitmap *dst = &v->bm;
-        dst->left = rect.x_min - bord;
-        dst->top  = rect.y_min - bord;
-        for (int i = 0; i < k->bitmap_count; i++) {
-            Bitmap *src = k->bitmaps[i].bm;
-            if (!src)
-                continue;
-            int x = k->bitmaps[i].pos.x + src->left - dst->left;
-            int y = k->bitmaps[i].pos.y + src->top  - dst->top;
-            assert(x >= 0 && x + src->w <= dst->w);
-            assert(y >= 0 && y + src->h <= dst->h);
-            unsigned char *buf = dst->buffer + y * dst->stride + x;
-            render_priv->engine.add_bitmaps(buf, dst->stride,
-                                            src->buffer, src->stride,
-                                            src->w, src->h);
-        }
+    } else if (n_bm && alloc_composite_bitmap(&render_priv->engine, &v->bm, rect, bord, k)) {
+        for (int i = 0; i < k->bitmap_count; i++)
+            add_composite_bitmap(&render_priv->engine, &v->bm,
+                                  k->bitmaps[i].bm, k->bitmaps[i].pos);
     }
-    if (!bord && n_bm_o == 1) {
+    if (!bord && n_bm_o == 1 && !k->viewport_align) {
         if (gaussian && !k->viewport_align)
             outline_blurred = ass_gaussian_blur(render_priv, &v->bm_o, last_o->bm_o, r2x, r2y);
         if (!outline_blurred)
             ass_copy_bitmap(&render_priv->engine, &v->bm_o, last_o->bm_o);
         v->bm_o.left += last_o->pos_o.x;
         v->bm_o.top  += last_o->pos_o.y;
-    } else if (n_bm_o && ass_alloc_bitmap(&render_priv->engine, &v->bm_o,
-                                          rect_o.x_max - rect_o.x_min + 2 * bord,
-                                          rect_o.y_max - rect_o.y_min + 2 * bord,
-                                          true)) {
-        Bitmap *dst = &v->bm_o;
-        dst->left = rect_o.x_min - bord;
-        dst->top  = rect_o.y_min - bord;
-        for (int i = 0; i < k->bitmap_count; i++) {
-            Bitmap *src = k->bitmaps[i].bm_o;
-            if (!src)
-                continue;
-            int x = k->bitmaps[i].pos_o.x + src->left - dst->left;
-            int y = k->bitmaps[i].pos_o.y + src->top  - dst->top;
-            assert(x >= 0 && x + src->w <= dst->w);
-            assert(y >= 0 && y + src->h <= dst->h);
-            unsigned char *buf = dst->buffer + y * dst->stride + x;
-            render_priv->engine.add_bitmaps(buf, dst->stride,
-                                            src->buffer, src->stride,
-                                            src->w, src->h);
-        }
+    } else if (n_bm_o && alloc_composite_bitmap(&render_priv->engine, &v->bm_o, rect_o, bord, k)) {
+        for (int i = 0; i < k->bitmap_count; i++)
+            add_composite_bitmap(&render_priv->engine, &v->bm_o,
+                                  k->bitmaps[i].bm_o, k->bitmaps[i].pos_o);
     }
-
-    crop_composite_bitmap(&render_priv->engine, &v->bm, k);
-    crop_composite_bitmap(&render_priv->engine, &v->bm_o, k);
 
     if (blur_fill && !fill_blurred)
         ass_synth_blur(render_priv, &v->bm, k->filter.be, r2x, r2y);
@@ -3091,8 +3076,7 @@ ass_render_event(RenderContext *state, ASS_Event *event,
         return false;
 
     TextInfo *text_info = &state->text_info;
-    if (text_info->length == 0 || event_is_transparent(state)) {
-        // No visible output, and no collision layout to preserve.
+    if (text_info->length == 0) {
         free_render_context(state);
         return false;
     }
@@ -3105,6 +3089,11 @@ ass_render_event(RenderContext *state, ASS_Event *event,
             ass_resolve_base_direction(state->font_encoding));
     ass_shaper_find_runs(state->shaper, render_priv, text_info->glyphs,
             text_info->length);
+    // Font fallback has ordered, persistent side effects, even for invisible text.
+    if (event_is_transparent(state)) {
+        free_render_context(state);
+        return false;
+    }
     if (!ass_shaper_shape(state->shaper, text_info)) {
         ass_msg(render_priv->library, MSGL_ERR, "Failed to shape text");
         free_render_context(state);
@@ -3396,6 +3385,8 @@ typedef struct {
     struct ass_event_pool *pool;
     ASS_Renderer *renderer;
     pthread_t thread;
+    pthread_cond_t work;
+    ASS_MsgBuffer messages;
     unsigned font_generation;
     int render_id, id;
     uint64_t batch_ns;
@@ -3406,10 +3397,11 @@ struct ass_event_pool {
     ASS_Renderer *owner;
     EventWorker workers[3];
     pthread_mutex_t lock;
-    pthread_cond_t work, done;
+    pthread_cond_t done;
     uint64_t generation;
     int count, pending;
     bool stop, event_ready, legacy_events, cache_split;
+    unsigned job_mask;
     enum { JOB_IDLE, JOB_EVENTS, JOB_VERTICAL, JOB_PREPARE } job_kind;
     VerticalTask vertical;
     EventTask *events;
@@ -3521,11 +3513,13 @@ static void *event_worker(void *arg)
     uint64_t seen = 0;
     pthread_mutex_lock(&pool->lock);
     while (!pool->stop) {
-        while (!pool->stop && seen == pool->generation)
-            pthread_cond_wait(&pool->work, &pool->lock);
+        while (!pool->stop && (seen == pool->generation ||
+                !(pool->job_mask & (1U << worker->id))))
+            pthread_cond_wait(&worker->work, &pool->lock);
         if (pool->stop) break;
         seen = pool->generation;
         pthread_mutex_unlock(&pool->lock);
+        ass_msg_buffer_begin(&worker->messages, pool->owner->library);
         if (pool->job_kind == JOB_VERTICAL)
             vertical_batch(&pool->vertical, worker->id);
         else if (pool->job_kind == JOB_PREPARE)
@@ -3533,6 +3527,7 @@ static void *event_worker(void *arg)
                     pool->owner, &worker->font_generation, &worker->render_id);
         else
             worker->batch_ns = event_batch(pool, worker->renderer, worker->id);
+        ass_msg_buffer_end(&worker->messages);
         pthread_mutex_lock(&pool->lock);
         if (!--pool->pending)
             pthread_cond_signal(&pool->done);
@@ -3541,19 +3536,41 @@ static void *event_worker(void *arg)
     return NULL;
 }
 
+// Called with the pool locked. Idle lanes keep their caches without being woken.
+static void start_worker_job(struct ass_event_pool *pool, unsigned mask)
+{
+    pool->job_mask = mask;
+    pool->pending = 0;
+    pool->generation++;
+    for (int i = 0; i < pool->count; i++) {
+        if (mask & (1U << pool->workers[i].id)) {
+            pool->pending++;
+            pthread_cond_signal(&pool->workers[i].work);
+        }
+    }
+}
+
+static void drain_worker_messages(struct ass_event_pool *pool)
+{
+    for (int i = 0; i < pool->count; i++)
+        ass_msg_buffer_drain(&pool->workers[i].messages);
+}
+
 static void event_pool_done(struct ass_event_pool *pool)
 {
     if (!pool) return;
     pthread_mutex_lock(&pool->lock);
     pool->stop = true;
-    pthread_cond_broadcast(&pool->work);
+    for (int i = 0; i < pool->count; i++)
+        pthread_cond_signal(&pool->workers[i].work);
     pthread_mutex_unlock(&pool->lock);
     for (int i = 0; i < pool->count; i++) {
         pthread_join(pool->workers[i].thread, NULL);
+        ass_msg_buffer_drain(&pool->workers[i].messages);
+        pthread_cond_destroy(&pool->workers[i].work);
         ass_renderer_done(pool->workers[i].renderer);
     }
     pthread_cond_destroy(&pool->done);
-    pthread_cond_destroy(&pool->work);
     pthread_mutex_destroy(&pool->lock);
     free(pool->events);
     free(pool);
@@ -3570,11 +3587,7 @@ static struct ass_event_pool *event_pool_init(ASS_Renderer *owner)
     if (!pool) return NULL;
     pool->owner = owner;
     if (pthread_mutex_init(&pool->lock, NULL)) { free(pool); return NULL; }
-    if (pthread_cond_init(&pool->work, NULL)) {
-        pthread_mutex_destroy(&pool->lock); free(pool); return NULL;
-    }
     if (pthread_cond_init(&pool->done, NULL)) {
-        pthread_cond_destroy(&pool->work);
         pthread_mutex_destroy(&pool->lock); free(pool); return NULL;
     }
     for (int i = 0; i < threads - 1; i++) {
@@ -3582,7 +3595,12 @@ static struct ass_event_pool *event_pool_init(ASS_Renderer *owner)
         worker->pool = pool;
         worker->id = i + 1;
         worker->render_id = -1;
+        if (pthread_cond_init(&worker->work, NULL)) {
+            event_pool_done(pool);
+            return NULL;
+        }
         if (pthread_create(&worker->thread, NULL, event_worker, worker)) {
+            pthread_cond_destroy(&worker->work);
             event_pool_done(pool);
             return NULL;
         }
@@ -3712,9 +3730,7 @@ bool ass_run_vertical_filter(ASS_Renderer *renderer, FilterFunc *plain,
     pool->vertical = (VerticalTask) {plain, param_filter, dst, src, coeff,
         width, src_h, dst_h, stripe, (unsigned) FFMIN(stripes, (size_t) pool->count + 1)};
     pool->job_kind = JOB_VERTICAL;
-    pool->pending = pool->count;
-    pool->generation++;
-    pthread_cond_broadcast(&pool->work);
+    start_worker_job(pool, (1U << pool->vertical.lanes) - 1);
     pthread_mutex_unlock(&pool->lock);
     vertical_batch(&pool->vertical, 0);
     pthread_mutex_lock(&pool->lock);
@@ -3723,6 +3739,7 @@ bool ass_run_vertical_filter(ASS_Renderer *renderer, FilterFunc *plain,
     pool->job_kind = JOB_IDLE;
     memset(&pool->vertical, 0, sizeof(pool->vertical));
     pthread_mutex_unlock(&pool->lock);
+    drain_worker_messages(pool);
     return true;
 }
 
@@ -3749,11 +3766,13 @@ static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
         }
     }
     bool queued = pool && active <= pool->capacity;
+    if (active < 2)
+        goto serial;
     bool expensive = active >= 2 && priv->last_event_render_ns > 4000000;
     const char *value = getenv("LIBASS_RENDER_THREADS");
-    bool legacy = pool && pool->legacy_events;
-    if (!legacy && value && atoi(value) <= 1)
+    if (value && atoi(value) <= 1)
         goto serial;
+    bool legacy = pool && pool->legacy_events;
     legacy |= active >= 32 || (priv->experimental_edges && expensive) || value;
     bool restricted = !legacy;
     if (restricted) {
@@ -3801,33 +3820,46 @@ static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
                 queue_event(pool, i, index++, tail);
         }
     }
+    unsigned occupied = 0;
+    for (int i = 0; i <= pool->count; i++)
+        if (pool->first[i] >= 0)
+            occupied |= 1U << i;
+    // One occupied lane gains nothing from event dispatch. The serial renderer
+    // can instead use this pool for a large blur, regardless of previous scenes.
+    if (!(occupied & (occupied - 1))) {
+        preflight_attempted = false;
+        goto serial;
+    }
     bool prepare_parallel = ass_fontselect_can_clone_concurrently(priv->fontselect);
     bool prepare_fonts = false;
     for (int i = 0; i < pool->count; i++)
-        prepare_fonts |= pool->workers[i].font_generation != priv->font_generation;
+        prepare_fonts |= (occupied & (1U << pool->workers[i].id)) &&
+            pool->workers[i].font_generation != priv->font_generation;
     prepare_parallel = prepare_parallel && prepare_fonts;
     if (prepare_parallel) {
         // Owner font import is complete; cloned selectors have private FT faces.
         pthread_mutex_lock(&pool->lock);
         pool->job_kind = JOB_PREPARE;
-        pool->pending = pool->count;
-        pool->generation++;
-        pthread_cond_broadcast(&pool->work);
+        start_worker_job(pool, occupied);
         while (pool->pending)
             pthread_cond_wait(&pool->done, &pool->lock);
         pool->job_kind = JOB_IDLE;
         pthread_mutex_unlock(&pool->lock);
+        drain_worker_messages(pool);
     }
     for (int i = 0; i < pool->count; i++) {
         EventWorker *worker = pool->workers + i;
+        worker->batch_ns = 0;
+#ifdef ASS_FLE_PROFILE
+        memset(worker->renderer->fle_phase_ns, 0, sizeof(priv->fle_phase_ns));
+#endif
+        if (!(occupied & (1U << worker->id)))
+            continue;
         if (!(prepare_parallel ? worker->prepared :
                 ass_clone_render_settings(worker->renderer, priv,
                     &worker->font_generation, &worker->render_id)) ||
             !ass_start_frame(worker->renderer, track, now))
             goto serial;
-#ifdef ASS_FLE_PROFILE
-        memset(worker->renderer->fle_phase_ns, 0, sizeof(priv->fle_phase_ns));
-#endif
     }
     // Resource readiness is not admission: certify every restricted frame.
     if (restricted && !certify_primary_events(priv, track, now, pool))
@@ -3835,9 +3867,7 @@ static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
     set_pool_cache_limits(pool, pool->glyph_budget, pool->bitmap_budget, pool->composite_budget);
     pthread_mutex_lock(&pool->lock);
     pool->job_kind = JOB_EVENTS;
-    pool->pending = pool->count;
-    pool->generation++;
-    pthread_cond_broadcast(&pool->work);
+    start_worker_job(pool, occupied);
     pthread_mutex_unlock(&pool->lock);
     uint64_t main_ns = event_batch(pool, priv, 0);
     pthread_mutex_lock(&pool->lock);
@@ -3845,6 +3875,7 @@ static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
         pthread_cond_wait(&pool->done, &pool->lock);
     pool->job_kind = JOB_IDLE;
     pthread_mutex_unlock(&pool->lock);
+    drain_worker_messages(pool);
     if (restricted) {
         uint64_t work_ns = main_ns;
         bool valid = main_ns != UINT64_MAX;

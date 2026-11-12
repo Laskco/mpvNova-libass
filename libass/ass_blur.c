@@ -141,11 +141,6 @@ static void calc_coeff(double mu[], int n, double r2, double mul)
     }
 }
 
-typedef struct {
-    int level, radius;
-    int16_t coeff[8];
-} BlurMethod;
-
 // Select the cascade geometry for r2 >= 0.5 without computing coefficients.
 static double find_method_geometry(BlurMethod *blur, double r2)
 {
@@ -158,6 +153,7 @@ static double find_method_geometry(BlurMethod *blur, double r2)
 
 static void find_best_method(BlurMethod *blur, double r2)
 {
+    *blur = (BlurMethod) {0};
     double mu[8];
     if (r2 < 0.5) {
         blur->level = 0;
@@ -171,6 +167,28 @@ static void find_best_method(BlurMethod *blur, double r2)
     }
     for (int i = 0; i < blur->radius; i++)
         blur->coeff[i] = (int) (0x10000 * mu[i] + 0.5);
+}
+
+static void get_blur_method(ASS_Renderer *renderer, BlurMethod *blur, double r2)
+{
+    const unsigned count = sizeof(renderer->blur_methods) /
+        sizeof(renderer->blur_methods[0]);
+    for (unsigned i = 0; i < count; i++) {
+        const BlurMethodCacheEntry *entry = &renderer->blur_methods[i];
+        if (entry->valid && entry->r2 == r2) {
+            *blur = entry->method;
+            return;
+        }
+    }
+
+    find_best_method(blur, r2);
+    // Exact keys preserve the computed coefficients; evict in round-robin order.
+    renderer->blur_methods[renderer->blur_method_next] = (BlurMethodCacheEntry) {
+        .r2 = r2,
+        .method = *blur,
+        .valid = true,
+    };
+    renderer->blur_method_next = (renderer->blur_method_next + 1) % count;
 }
 
 /**
@@ -300,10 +318,10 @@ bool ass_gaussian_blur(ASS_Renderer *renderer, Bitmap *bm, const Bitmap *src,
 {
     const BitmapEngine *engine = &renderer->engine;
     BlurMethod blur_x, blur_y;
-    find_best_method(&blur_x, r2x);
+    get_blur_method(renderer, &blur_x, r2x);
     if (r2y == r2x)
         memcpy(&blur_y, &blur_x, sizeof(blur_y));
-    else find_best_method(&blur_y, r2y);
+    else get_blur_method(renderer, &blur_y, r2y);
 
     uint32_t w = src->w, h = src->h;
     int left = src->left, top = src->top;

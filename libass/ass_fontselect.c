@@ -1194,16 +1194,7 @@ ass_fontselect_init_clone(ASS_Library *library, FT_Library ftlibrary,
     return priv;
 
 fail:
-    if (priv->default_provider)
-        ass_font_provider_free(priv->default_provider);
-    if (priv->embedded_provider)
-        ass_font_provider_free(priv->embedded_provider);
-
-    free(priv->family_default);
-    free(priv->path_default);
-
-    free(priv);
-
+    ass_fontselect_free(priv);
     return NULL;
 }
 

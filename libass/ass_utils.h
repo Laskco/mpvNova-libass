@@ -127,6 +127,35 @@ void ass_utf16be_to_utf8(char *dst, size_t dst_size, uint8_t *src, size_t src_si
     __attribute__ ((format (printf, 3, 4)))
 #endif
 void ass_msg(ASS_Library *priv, int lvl, const char *fmt, ...);
+
+#ifdef ASS_EVENT_THREADS
+typedef struct ass_msg_buffer {
+    ASS_Library *library;
+    struct ass_msg_buffer *previous;
+    size_t count, used, dropped, truncated;
+    int loss_level;
+    struct {
+        int level;
+        size_t offset;
+    } messages[64];
+    char text[16 * 1024];
+} ASS_MsgBuffer;
+
+/*
+ * Zero-initialize one buffer per worker. Begin/end run on that worker around
+ * each job and defer only messages for library. Buffers may be nested, but must
+ * end in reverse order. No allocation or application callback occurs here.
+ * After end and a completion barrier, drain on the rendering caller thread,
+ * outside all pool locks, before reusing or destroying the buffer. The worker
+ * must remain idle until drain returns. Drain also reports dropped/truncated
+ * messages at their most severe level and preserves the application's va_list
+ * callback ABI.
+ */
+void ass_msg_buffer_begin(ASS_MsgBuffer *buffer, ASS_Library *library);
+void ass_msg_buffer_end(ASS_MsgBuffer *buffer);
+void ass_msg_buffer_drain(ASS_MsgBuffer *buffer);
+#endif
+
 int ass_lookup_style(ASS_Track *track, char *name);
 
 /* defined in ass_strtod.c */

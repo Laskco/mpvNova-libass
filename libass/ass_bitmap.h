@@ -34,6 +34,17 @@ typedef struct {
     uint8_t *buffer;      // h * stride buffer
 } Bitmap;
 
+typedef struct {
+    int level, radius;
+    int16_t coeff[8];
+} BlurMethod;
+
+typedef struct {
+    double r2;
+    BlurMethod method;
+    bool valid;
+} BlurMethodCacheEntry;
+
 bool ass_alloc_bitmap(const BitmapEngine *engine, Bitmap *bm, int32_t w, int32_t h, bool zero);
 bool ass_realloc_bitmap(const BitmapEngine *engine, Bitmap *bm, int32_t w, int32_t h);
 bool ass_copy_bitmap(const BitmapEngine *engine, Bitmap *dst, const Bitmap *src);
