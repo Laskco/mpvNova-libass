@@ -775,6 +775,86 @@ static Bitmap *get_vector_clip(RenderContext *state, ASS_Vector *pos)
     return ass_cache_get(render_priv->cache.bitmap_cache, &key, state);
 }
 
+static ASS_Image *ass_free_image(ASS_Image *img);
+
+// Rotated lettering can occupy a thin diagonal of a large transparent bitmap.
+// Keep at most eight horizontal strips, and only split when it saves enough
+// masking and upload work to pay for the extra draw calls.
+static ASS_Image *clip_sparse_strips(const BitmapEngine *engine, ASS_Image *cur,
+                                     int x, int y, int w, int h, int left, int top,
+                                     const uint8_t *mask, ptrdiff_t mask_stride)
+{
+    if (w < 192 || h < 96 || (int64_t) w * h < 65536)
+        return NULL;
+    ASS_Rect strips[8];
+    int n = 0;
+    int64_t area = 0;
+    int band = FFMAX(64, (h - 1) / 8 + 1);
+    const uint8_t *src = cur->bitmap + (ptrdiff_t) y * cur->stride + x;
+    for (int row = 0; row < h;) {
+        int end = row + FFMIN(band, h - row);
+        int lo = w, hi = 0;
+        for (int j = row; j < end && (lo || hi != w); j++) {
+            const uint8_t *p = src + (ptrdiff_t) j * cur->stride;
+            int a = 0, b = w;
+            uint64_t word;
+            while (a + 8 <= lo) {
+                memcpy(&word, p + a, 8);
+                if (word) break;
+                a += 8;
+            }
+            while (a < lo && !p[a]) a++;
+            if (a == w) continue;
+            while (b - 8 >= FFMAX(hi, a)) {
+                memcpy(&word, p + b - 8, 8);
+                if (word) break;
+                b -= 8;
+            }
+            while (b > hi && b > a && !p[b-1]) b--;
+            lo = FFMIN(lo, a);
+            hi = FFMAX(hi, b);
+        }
+        if (hi > lo) {
+            strips[n++] = (ASS_Rect) {lo, row, hi, end};
+            area += (int64_t) (hi - lo) * (end - row);
+        }
+        row = end;
+    }
+    if (!n || area > (int64_t) w * h / 2)
+        return NULL;
+
+    ASS_Image *first = NULL, *last = NULL;
+    unsigned align = 1U << engine->align_order;
+    for (int i = 0; i < n; i++) {
+        ASS_Rect r = strips[i];
+        int sw = r.x_max - r.x_min, sh = r.y_max - r.y_min;
+        unsigned stride = ass_align(align, sw);
+        uint8_t *buf = ass_aligned_alloc(align, (size_t) stride * sh + align, false);
+        ASS_Image *img = buf ? my_draw_bitmap(buf, sw, sh, stride, left + r.x_min,
+                                              top + r.y_min, cur->color, NULL) : NULL;
+        if (!img) {
+            while (first) first = ass_free_image(first);
+            return NULL;
+        }
+        img->type = cur->type;
+        img->next = NULL;
+        if (last) last->next = img;
+        else first = img;
+        last = img;
+        engine->mul_bitmaps(buf, stride, src + (ptrdiff_t) r.y_min * cur->stride + r.x_min,
+                            cur->stride, mask + (ptrdiff_t) r.y_min * mask_stride + r.x_min,
+                            mask_stride, sw, sh);
+    }
+    last->next = cur->next;
+    ASS_ImagePriv *priv = (ASS_ImagePriv *) cur, *replacement = (ASS_ImagePriv *) first;
+    ass_cache_dec_ref(priv->source);
+    ass_aligned_free(priv->buffer);
+    *priv = *replacement;
+    if (last == first) last = cur;
+    free(replacement);
+    return last;
+}
+
 static void blend_vector_clip(RenderContext *state, ASS_Image *head)
 {
     ASS_Vector pos;
@@ -844,6 +924,13 @@ static void blend_vector_clip(RenderContext *state, ASS_Image *head)
 
             // Allocate new buffer and add to free list
             unsigned ns = ass_align(align, w);
+            ASS_Image *last = clip_sparse_strips(&render_priv->engine, cur, aleft, atop,
+                                                 w, h, left, top,
+                                                 bbuffer + (ptrdiff_t) btop * bs + bleft, bs);
+            if (last) {
+                cur = last;
+                continue;
+            }
             nbuffer = ass_aligned_alloc(align, ns * h + align, false);
             if (!nbuffer)
                 break;
