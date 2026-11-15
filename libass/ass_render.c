@@ -820,7 +820,11 @@ static ASS_Image *clip_sparse_strips(const BitmapEngine *engine, ASS_Image *cur,
         }
         row = end;
     }
-    if (!n || area > (int64_t) w * h / 2)
+    if (!n) {
+        cur->w = cur->h = cur->stride = 0;
+        return cur;
+    }
+    if (area > (int64_t) w * h / 2)
         return NULL;
 
     ASS_Image *first = NULL, *last = NULL;
@@ -4072,9 +4076,13 @@ shift_event(ASS_Renderer *render_priv, EventImages *ei, int shift)
         cur->dst_y += shift;
         // clip top and bottom
         if (cur->dst_y < 0) {
-            int clip = -cur->dst_y;
-            cur->h -= clip;
-            cur->bitmap += clip * cur->stride;
+            if (cur->dst_y <= -cur->h) {
+                cur->h = 0;
+            } else {
+                int clip = -cur->dst_y;
+                cur->h -= clip;
+                cur->bitmap += (ptrdiff_t) clip * cur->stride;
+            }
             cur->dst_y = 0;
         }
         if (cur->dst_y + cur->h >= render_priv->height) {
