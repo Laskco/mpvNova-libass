@@ -12,30 +12,27 @@ A fork of [libass](https://github.com/libass/libass) with subtitle-rendering imp
 
 ## Before and After
 
-### NVIDIA Shield Pro 2019
+FLE openings played locally, with the original ASS tracks and fonts. The table
+compares the native libraries from mpvNova **2026-10-19** (stock libass 0.17.5)
+and **2026-11-15** (this fork) in the same test app. Both builds were speed
+compiled. Stats were on; frame drops were counted with recording off.
 
-FLE openings, comparing stock libass with this fork. Stats were visible during recording.
+| Device / mode | Opening | Stock drops | Current drops | Reduction | Video |
+| --- | --- | ---: | ---: | ---: | --- |
+| NVIDIA Shield TV Pro 2019 / G-Next Copy | Wistoria S01E02 (HEVC) | 573 | 0 | **100%** | [Watch](https://files.catbox.moe/o00uqm.mp4) |
+| NVIDIA Shield TV Pro 2019 / G-Next Copy | The Apothecary Diaries S02E02 | 585 | 18 | **96.9%** | [Watch](https://files.catbox.moe/egjdny.mp4) |
+| Onn 4K Pro / `gpu` Direct | Wistoria S01E02 (HEVC) | 1,005 | 161 | **84.0%** | [Watch](https://files.catbox.moe/2xkb3d.mp4) |
+| Onn 4K Pro / `gpu` Direct | The Apothecary Diaries S02E02 | 1,340 | 481 | **64.1%** | [Watch](https://files.catbox.moe/lx2rqs.mp4) |
 
-| Opening | Before: dropped frames | After: dropped frames | Reduction |
-| --- | ---: | ---: | ---: |
-| Wistoria - Wand and Sword, S01E02 | 576 | 0 | **100%** |
-| The Apothecary Diaries, S02E01 | 618 | 64 | **89.6%** |
+Videos were captured separately, so their counters can differ from the table.
+These are playback comparisons, not a libass-only benchmark. In a separate run
+of the current release on the Shield, G-Next Direct recorded **1** output drop
+on the Apothecary opening.
 
-**Wistoria S01E02**
+<details>
+<summary>Earlier Onn 4K Pro ARM32 comparison</summary>
 
-https://github.com/user-attachments/assets/97908d78-f012-4c14-a514-6bd4c5242430
-
-[Original video](https://files.catbox.moe/j2lhfx.mp4)
-
-**The Apothecary Diaries S02E01**
-
-https://github.com/user-attachments/assets/8000c564-a228-43df-8664-5a0261c73725
-
-[Original video](https://files.catbox.moe/9v5tds.mp4)
-
-### Onn 4K Pro
-
-The Apothecary Diaries S02E01 opening, comparing the latest ARM32 optimization with an earlier optimized build. Same clip and settings, with Stats visible.
+This test compared two optimized builds, not stock libass against the fork.
 
 | Renderer | Before: dropped frames | After: dropped frames | Reduction |
 | --- | ---: | ---: | ---: |
@@ -44,7 +41,7 @@ The Apothecary Diaries S02E01 opening, comparing the latest ARM32 optimization w
 
 Average subtitle render time also fell from **36.93 ms to 29.49 ms**: **20.2% less time**, or **25.3% higher render throughput**. That's subtitle rendering, not video FPS.
 
-These numbers are from the clips above. Results vary by file and device, and demanding subtitles can still cause dropped frames.
+</details>
 
 ## Using It in mpvNova
 
