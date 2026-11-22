@@ -846,11 +846,13 @@ static inline void rasterizer_fill_solid(const BitmapEngine *engine,
 
 static inline void rasterizer_fill_halfplane(const BitmapEngine *engine,
                                              uint8_t *buf, int width, int height, ptrdiff_t stride,
-                                             int32_t a, int32_t b, int64_t c, int32_t scale)
+                                             int32_t a, int32_t b, int64_t c, int32_t scale,
+                                             bool single_tile_guaranteed)
 {
     assert(!(width  & ((1 << engine->tile_order) - 1)));
     assert(!(height & ((1 << engine->tile_order) - 1)));
-    if (width == 1 << engine->tile_order && height == 1 << engine->tile_order) {
+    if (single_tile_guaranteed &&
+        width == 1 << engine->tile_order && height == 1 << engine->tile_order) {
         engine->fill_halfplane(buf, stride, a, b, c, scale);
         return;
     }
@@ -937,41 +939,68 @@ static bool rasterizer_fill_level(const BitmapEngine *engine, RasterizerData *rs
     int flags1 = get_fill_flags(line1, n_lines[1], winding[1]);
     int flags = (flags0 | flags1) ^ FLAG_COMPLEX;
     if (flags & (FLAG_SOLID | FLAG_COMPLEX)) {
-        rasterizer_fill_solid(engine, buf, width, height, stride, flags & FLAG_SOLID);
+        if (clip) {
+            int cx0 = FFMAX(x0, clip->x_min);
+            int cy0 = FFMAX(y0, clip->y_min);
+            int cx1 = FFMIN(x0 + width, clip->x_max);
+            int cy1 = FFMIN(y0 + height, clip->y_max);
+            uint8_t *dst = buf + (ptrdiff_t) (cy0 - clip->y_min) * stride + (cx0 - clip->x_min);
+            rasterizer_fill_solid(engine, dst, cx1 - cx0, cy1 - cy0, stride, flags & FLAG_SOLID);
+        } else {
+            rasterizer_fill_solid(engine, buf, width, height, stride, flags & FLAG_SOLID);
+        }
         rst->size[index] = offs;
         return true;
     }
     if (!(flags & FLAG_GENERIC) && ((flags0 ^ flags1) & FLAG_COMPLEX)) {
         if (flags1 & FLAG_COMPLEX)
             line = line1;
-        rasterizer_fill_halfplane(engine, buf, width, height, stride,
-                                  line->a, line->b, line->c,
-                                  flags & FLAG_REVERSE ? -line->scale : line->scale);
+        if (clip) {
+            int cx0 = FFMAX(x0, clip->x_min);
+            int cy0 = FFMAX(y0, clip->y_min);
+            int cx1 = FFMIN(x0 + width, clip->x_max);
+            int cy1 = FFMIN(y0 + height, clip->y_max);
+            int64_t cc = line->c - ((int64_t) line->a * (cx0 - x0) +
+                                    (int64_t) line->b * (cy0 - y0)) * 64;
+            uint8_t *dst = buf + (ptrdiff_t) (cy0 - clip->y_min) * stride + (cx0 - clip->x_min);
+            rasterizer_fill_halfplane(engine, dst, cx1 - cx0, cy1 - cy0, stride,
+                                      line->a, line->b, cc,
+                                      flags & FLAG_REVERSE ? -line->scale : line->scale,
+                                      width == 1 << engine->tile_order &&
+                                      height == 1 << engine->tile_order);
+        } else {
+            rasterizer_fill_halfplane(engine, buf, width, height, stride,
+                                      line->a, line->b, line->c,
+                                      flags & FLAG_REVERSE ? -line->scale : line->scale,
+                                      true);
+        }
         rst->size[index] = offs;
         return true;
     }
     if (width == 1 << engine->tile_order && height == 1 << engine->tile_order) {
+        uint8_t *dst = clip ?
+            buf + (ptrdiff_t) (y0 - clip->y_min) * stride + (x0 - clip->x_min) : buf;
         if (!(flags1 & FLAG_COMPLEX)) {
-            engine->fill_generic(buf, stride, line, n_lines[0], winding[0]);
+            engine->fill_generic(dst, stride, line, n_lines[0], winding[0]);
             rst->size[index] = offs;
             return true;
         }
         if (!(flags0 & FLAG_COMPLEX)) {
-            engine->fill_generic(buf, stride, line1, n_lines[1], winding[1]);
+            engine->fill_generic(dst, stride, line1, n_lines[1], winding[1]);
             rst->size[index] = offs;
             return true;
         }
         if (flags0 & FLAG_GENERIC)
-            engine->fill_generic(buf, stride, line, n_lines[0], winding[0]);
+            engine->fill_generic(dst, stride, line, n_lines[0], winding[0]);
         else
-            engine->fill_halfplane(buf, stride, line->a, line->b, line->c,
+            engine->fill_halfplane(dst, stride, line->a, line->b, line->c,
                                    flags0 & FLAG_REVERSE ? -line->scale : line->scale);
         if (flags1 & FLAG_GENERIC)
             engine->fill_generic(rst->tile, width, line1, n_lines[1], winding[1]);
         else
             engine->fill_halfplane(rst->tile, width, line1->a, line1->b, line1->c,
                                    flags1 & FLAG_REVERSE ? -line1->scale : line1->scale);
-        engine->merge(buf, stride, rst->tile);
+        engine->merge(dst, stride, rst->tile);
         rst->size[index] = offs;
         return true;
     }
@@ -992,7 +1021,8 @@ static bool rasterizer_fill_level(const BitmapEngine *engine, RasterizerData *rs
         width = 1 << ilog2(width - 1);
         width1 -= width;
         x1 += width;
-        buf1 += width;
+        if (!clip)
+            buf1 += width;
         // The second child would be rejected before reading its segments.
         if (clip && x1 >= clip->x_max)
             dst1 = NULL;
@@ -1003,7 +1033,8 @@ static bool rasterizer_fill_level(const BitmapEngine *engine, RasterizerData *rs
         height = 1 << ilog2(height - 1);
         height1 -= height;
         y1 += height;
-        buf1 += height * stride;
+        if (!clip)
+            buf1 += height * stride;
         if (clip && y1 >= clip->y_max)
             dst1 = NULL;
         polyline_split_vert(line, n_lines,

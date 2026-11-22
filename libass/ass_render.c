@@ -745,7 +745,8 @@ static inline size_t bitmap_size(const Bitmap *bm)
  * applicable. The blended bitmaps are added to a free list which is freed
  * at the start of a new frame.
  */
-static Bitmap *get_vector_clip(RenderContext *state, ASS_Vector *pos)
+static Bitmap *get_vector_clip(RenderContext *state, ASS_Vector *pos,
+                               const ASS_Rect *target_box)
 {
     if (!state->clip_drawing_text.str)
         return NULL;
@@ -771,6 +772,34 @@ static Bitmap *get_vector_clip(RenderContext *state, ASS_Vector *pos)
     if (!key.outline || !key.outline->valid ||
             !quantize_transform(m, pos, NULL, true, &key))
         return NULL;
+
+    // Bound vector-clip rasterization to the screen (and quantized target
+    // image box when provided). Pixels outside this box are never read.
+    if (render_priv->width > 0 && render_priv->height > 0) {
+        int32_t cx0 = 0, cy0 = 0;
+        int32_t cx1 = render_priv->width, cy1 = render_priv->height;
+        if (target_box) {
+            int32_t qx0 = target_box->x_min & ~63;
+            int32_t qy0 = target_box->y_min & ~63;
+            int32_t qx1 = (target_box->x_max + 63) & ~63;
+            int32_t qy1 = (target_box->y_max + 63) & ~63;
+            cx0 = FFMAX(cx0, qx0);
+            cy0 = FFMAX(cy0, qy0);
+            cx1 = FFMIN(cx1, qx1);
+            cy1 = FFMIN(cy1, qy1);
+        }
+        int64_t x0 = (int64_t) cx0 - pos->x;
+        int64_t y0 = (int64_t) cy0 - pos->y;
+        int64_t x1 = (int64_t) cx1 - pos->x;
+        int64_t y1 = (int64_t) cy1 - pos->y;
+        if (x1 > x0 && y1 > y0 &&
+            x0 >= INT32_MIN && y0 >= INT32_MIN &&
+            x1 <= INT32_MAX && y1 <= INT32_MAX) {
+            key.clip_min = (ASS_Vector) {x0, y0};
+            key.clip_max = (ASS_Vector) {x1, y1};
+            key.clip_align = 1 << render_priv->engine.align_order;
+        }
+    }
 
     return ass_cache_get(render_priv->cache.bitmap_cache, &key, state);
 }
@@ -861,10 +890,27 @@ static ASS_Image *clip_sparse_strips(const BitmapEngine *engine, ASS_Image *cur,
 
 static void blend_vector_clip(RenderContext *state, ASS_Image *head)
 {
+    ASS_Rect head_box;
+    rectangle_reset(&head_box);
+    for (ASS_Image *cur = head; cur; cur = cur->next) {
+        if (cur->w > 0 && cur->h > 0)
+            rectangle_update(&head_box, cur->dst_x, cur->dst_y,
+                             cur->dst_x + cur->w, cur->dst_y + cur->h);
+    }
+    if (head_box.x_min >= head_box.x_max || head_box.y_min >= head_box.y_max)
+        return;
+
     ASS_Vector pos;
-    Bitmap *clip_bm = get_vector_clip(state, &pos);
+    Bitmap *clip_bm = get_vector_clip(state, &pos, &head_box);
     if (!clip_bm)
         return;
+    if (!clip_bm->buffer || !clip_bm->w || !clip_bm->h) {
+        if (!state->clip_drawing_mode) {
+            for (ASS_Image *cur = head; cur; cur = cur->next)
+                cur->w = cur->h = cur->stride = 0;
+        }
+        return;
+    }
     ASS_Renderer *render_priv = state->renderer;
 
     // Iterate through bitmaps and blend/clip them
@@ -1548,9 +1594,25 @@ static void set_bitmap_clip(RenderContext *state, GlyphInfo *info,
         (state->text_info.length != 1 || state->text_info.glyphs[0].next))
         return;
 
-    ASS_Vector clip_pos;
-    Bitmap *clip = get_vector_clip(state, &clip_pos);
-    if (!clip || !clip->buffer)
+    OutlineHashKey ol_key;
+    ol_key.type = OUTLINE_DRAWING;
+    ol_key.u.drawing.text = state->clip_drawing_text;
+    OutlineHashValue *ol = ass_cache_get(state->renderer->cache.outline_cache, &ol_key, state->renderer);
+    if (!ol || !ol->valid)
+        return;
+    int32_t scale_base = lshiftwrapi(1, state->clip_drawing_scale - 1);
+    double w = scale_base > 0 ? (1.0 / scale_base) : 0;
+    double sx = state->screen_scale_x * w / 64.0;
+    double sy = state->screen_scale_y * w / 64.0;
+    if (!(sx > 0 && sy > 0 && isfinite(sx) && isfinite(sy)))
+        return;
+    double cmin_x = ol->cbox.x_min * sx + state->renderer->settings.left_margin;
+    double cmin_y = ol->cbox.y_min * sy + state->renderer->settings.top_margin;
+    double cmax_x = ol->cbox.x_max * sx + state->renderer->settings.left_margin;
+    double cmax_y = ol->cbox.y_max * sy + state->renderer->settings.top_margin;
+    if (!isfinite(cmin_x) || !isfinite(cmin_y) || !isfinite(cmax_x) || !isfinite(cmax_y) ||
+        cmin_x < INT32_MIN / 2 || cmin_y < INT32_MIN / 2 ||
+        cmax_x > INT32_MAX / 2 || cmax_y > INT32_MAX / 2)
         return;
 
     int pad_x = 0, pad_y = 0, align_x = 1, align_y = 1;
@@ -1560,12 +1622,12 @@ static void set_bitmap_clip(RenderContext *state, GlyphInfo *info,
         ass_gaussian_blur_bounds(r2x, &pad_x, &align_x);
         ass_gaussian_blur_bounds(r2y, &pad_y, &align_y);
     }
-    pad_x += info->be + 4;
-    pad_y += info->be + 4;
-    int64_t x0 = (int64_t) clip_pos.x + clip->left - pos.x - pad_x;
-    int64_t y0 = (int64_t) clip_pos.y + clip->top - pos.y - pad_y;
-    int64_t x1 = (int64_t) clip_pos.x + clip->left + clip->w - pos.x + pad_x;
-    int64_t y1 = (int64_t) clip_pos.y + clip->top + clip->h - pos.y + pad_y;
+    pad_x += info->be + 6;
+    pad_y += info->be + 6;
+    int64_t x0 = (int64_t) floor(cmin_x) - pos.x - pad_x;
+    int64_t y0 = (int64_t) floor(cmin_y) - pos.y - pad_y;
+    int64_t x1 = (int64_t) ceil(cmax_x) - pos.x + pad_x;
+    int64_t y1 = (int64_t) ceil(cmax_y) - pos.y + pad_y;
     if (x0 < INT32_MIN || y0 < INT32_MIN || x1 > INT32_MAX || y1 > INT32_MAX)
         return;
     key->clip_min = (ASS_Vector) {x0, y0};
@@ -3499,6 +3561,8 @@ struct ass_event_pool {
     int first[4];
     size_t capacity;
     size_t glyph_budget, bitmap_budget, composite_budget;
+    size_t worker_glyph_limit, worker_bitmap_limit, worker_composite_limit;
+    int serial_frames;
 };
 
 static void set_pool_cache_limits(struct ass_event_pool *pool, size_t glyphs,
@@ -3508,11 +3572,16 @@ static void set_pool_cache_limits(struct ass_event_pool *pool, size_t glyphs,
     pool->bitmap_budget = bitmaps;
     pool->composite_budget = composites;
     pool->cache_split = true;
+    pool->serial_frames = 0;
+    size_t lanes = (size_t) pool->count + 1;
+    pool->worker_glyph_limit = glyphs / lanes;
+    pool->worker_bitmap_limit = bitmaps / lanes;
+    pool->worker_composite_limit = composites / lanes;
     for (int i = -1; i < pool->count; i++) {
         ASS_Renderer *renderer = i < 0 ? pool->owner : pool->workers[i].renderer;
-        renderer->cache.glyph_max = glyphs / (pool->count + 1);
-        renderer->cache.bitmap_max_size = bitmaps / (pool->count + 1);
-        renderer->cache.composite_max_size = composites / (pool->count + 1);
+        renderer->cache.glyph_max = pool->worker_glyph_limit;
+        renderer->cache.bitmap_max_size = pool->worker_bitmap_limit;
+        renderer->cache.composite_max_size = pool->worker_composite_limit;
     }
 }
 
@@ -3524,6 +3593,9 @@ void ass_event_pool_cache_limits(ASS_Renderer *renderer)
     if (pool->cache_split) {
         set_pool_cache_limits(pool, renderer->cache.glyph_max,
                 renderer->cache.bitmap_max_size, renderer->cache.composite_max_size);
+        for (int i = 0; i < pool->count; i++)
+            check_cache_limits(pool->workers[i].renderer,
+                               &pool->workers[i].renderer->cache);
     } else {
         pool->glyph_budget = renderer->cache.glyph_max;
         pool->bitmap_budget = renderer->cache.bitmap_max_size;
@@ -3531,22 +3603,48 @@ void ass_event_pool_cache_limits(ASS_Renderer *renderer)
     }
 }
 
+static size_t shrink_worker_limit(size_t current, size_t initial, int steps_left)
+{
+    if (!current || steps_left <= 1)
+        return 0;
+    size_t step = (initial + 7) / 8;
+    return current > step ? current - step : 0;
+}
+
 static void restore_serial_cache_limits(struct ass_event_pool *pool)
 {
     if (!pool || !pool->cache_split)
         return;
-    pool->cache_split = false;
-    pool->owner->cache.glyph_max = pool->glyph_budget;
-    pool->owner->cache.bitmap_max_size = pool->bitmap_budget;
-    pool->owner->cache.composite_max_size = pool->composite_budget;
+    // Keep worker caches warm across brief gaps and spread eviction across
+    // multiple serial frames to avoid a single-frame teardown stall while
+    // keeping total budget strictly within pool->*_budget.
+    if (++pool->serial_frames <= 8)
+        return;
+    int steps_left = 17 - pool->serial_frames;
+    size_t lanes = (size_t) pool->count + 1;
+    pool->worker_glyph_limit = shrink_worker_limit(
+        pool->worker_glyph_limit, pool->glyph_budget / lanes, steps_left);
+    pool->worker_bitmap_limit = shrink_worker_limit(
+        pool->worker_bitmap_limit, pool->bitmap_budget / lanes, steps_left);
+    pool->worker_composite_limit = shrink_worker_limit(
+        pool->worker_composite_limit, pool->composite_budget / lanes, steps_left);
+
     for (int i = 0; i < pool->count; i++) {
         ASS_Renderer *worker = pool->workers[i].renderer;
-        worker->cache.glyph_max = 0;
-        worker->cache.bitmap_max_size = 0;
-        worker->cache.composite_max_size = 0;
-        // Frame references remain valid, but idle workers retain no cache queue refs.
+        worker->cache.glyph_max = pool->worker_glyph_limit;
+        worker->cache.bitmap_max_size = pool->worker_bitmap_limit;
+        worker->cache.composite_max_size = pool->worker_composite_limit;
         check_cache_limits(worker, &worker->cache);
     }
+    pool->owner->cache.glyph_max =
+        pool->glyph_budget - pool->worker_glyph_limit * (size_t) pool->count;
+    pool->owner->cache.bitmap_max_size =
+        pool->bitmap_budget - pool->worker_bitmap_limit * (size_t) pool->count;
+    pool->owner->cache.composite_max_size =
+        pool->composite_budget - pool->worker_composite_limit * (size_t) pool->count;
+    if (!pool->worker_glyph_limit && !pool->worker_bitmap_limit &&
+        !pool->worker_composite_limit)
+        pool->cache_split = false;
 }
 
 static void queue_event(struct ass_event_pool *pool, int event_index,

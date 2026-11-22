@@ -189,77 +189,41 @@ bool ass_outline_to_bitmap(RenderContext *state, Bitmap *bm,
 
     int32_t tile_w = (w + mask) & ~mask;
     int32_t tile_h = (h + mask) & ~mask;
-    ASS_Rect window = {0, 0, tile_w, tile_h};
+    unsigned align_step = 1U << render_priv->engine.align_order;
+    int32_t full_w = ass_align(align_step, tile_w);
+    ASS_Rect window = {0, 0, full_w, tile_h};
     if (clip) {
-        int align = FFMAX(1 << render_priv->engine.align_order, clip_align);
+        int align = FFMAX((int) align_step,
+                          FFMAX(1 << render_priv->engine.tile_order, clip_align));
         int64_t dx0 = (int64_t) clip->x_min - x_min;
         int64_t dy0 = (int64_t) clip->y_min - y_min;
         int64_t dx1 = (int64_t) clip->x_max - x_min;
         int64_t dy1 = (int64_t) clip->y_max - y_min;
-        int32_t left = FFMINMAX(dx0 & -(int64_t) align, 0, tile_w);
+        int32_t left = FFMINMAX(dx0 & -(int64_t) align, 0, full_w);
         int32_t top = FFMINMAX(dy0 & -(int64_t) align, 0, tile_h);
-        int32_t right = FFMINMAX((dx1 + align - 1) & -(int64_t) align, 0, tile_w);
+        int32_t right = FFMINMAX((dx1 + align - 1) & -(int64_t) align, 0, full_w);
         int32_t bottom = FFMINMAX((dy1 + align - 1) & -(int64_t) align, 0, tile_h);
         if (right <= left || bottom <= top)
             return false;
         window = (ASS_Rect) {left, top, right, bottom};
     }
     bool crop = clip && (window.x_min || window.y_min ||
-                          window.x_max != tile_w || window.y_max != tile_h);
-    bool borrowed = false;
-    unsigned align = 1 << render_priv->engine.align_order;
-    size_t stride = ass_align(align, tile_w);
-    const size_t scratch_limit = 1024 * 1024;
-    if (crop && stride <= (scratch_limit - align) / tile_h) {
-        size_t needed = stride * tile_h + align;
-        if (needed > render_priv->raster_scratch_size) {
-            size_t capacity = ass_align(65536, needed);
-            uint8_t *buffer = ass_aligned_alloc(align, capacity, false);
-            if (buffer) {
-                ass_aligned_free(render_priv->raster_scratch);
-                render_priv->raster_scratch = buffer;
-                render_priv->raster_scratch_size = capacity;
-            }
-        }
-        if (needed <= render_priv->raster_scratch_size) {
-            *bm = (Bitmap) { .w = tile_w, .h = tile_h, .stride = stride,
-                            .buffer = render_priv->raster_scratch };
-            borrowed = true;
-        }
-    }
-    if (!borrowed && !ass_alloc_bitmap(&render_priv->engine, bm, tile_w, tile_h, false))
+                          window.x_max != full_w || window.y_max != tile_h);
+    // Keep the original raster grid and subdivision tree while writing only
+    // the cropped window directly into the final bitmap buffer.
+    int32_t out_w = crop ? window.x_max - window.x_min : tile_w;
+    int32_t out_h = crop ? window.y_max - window.y_min : tile_h;
+    if (!ass_alloc_bitmap(&render_priv->engine, bm, out_w, out_h, false))
         return false;
-    bm->left = x_min;
-    bm->top  = y_min;
+    bm->left = x_min + (crop ? window.x_min : 0);
+    bm->top  = y_min + (crop ? window.y_min : 0);
 
-    ASS_Rect raster_window = window;
-    raster_window.x_max = ass_align(1 << render_priv->engine.align_order, window.x_max);
     if (!ass_rasterizer_fill(&render_priv->engine, rst, bm->buffer,
-                             x_min, y_min, bm->stride, tile_h, bm->stride,
-                             clip ? &raster_window : NULL)) {
+                             x_min, y_min, full_w, tile_h, bm->stride,
+                             crop ? &window : NULL)) {
         ass_msg(render_priv->library, MSGL_WARN, "Failed to rasterize glyph!\n");
-        if (!borrowed) ass_free_bitmap(bm);
+        ass_free_bitmap(bm);
         return false;
-    }
-
-    // Keep the original raster grid and subdivision tree. Moving the raster
-    // origin can change edge coverage; discard unused pixels only afterwards.
-    if (crop) {
-        Bitmap cropped = {0};
-        if (!ass_alloc_bitmap(&render_priv->engine, &cropped,
-                               window.x_max - window.x_min,
-                               window.y_max - window.y_min, false)) {
-            if (!borrowed) ass_free_bitmap(bm);
-            return false;
-        }
-        cropped.left = bm->left + window.x_min;
-        cropped.top = bm->top + window.y_min;
-        for (int y = 0; y < cropped.h; y++)
-            memcpy(cropped.buffer + y * cropped.stride,
-                   bm->buffer + (y + window.y_min) * bm->stride + window.x_min,
-                   cropped.stride);
-        if (!borrowed) ass_free_bitmap(bm);
-        *bm = cropped;
     }
 
     return true;
