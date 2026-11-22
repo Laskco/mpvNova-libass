@@ -351,6 +351,7 @@ struct ass_renderer {
     bool is_event_worker;
     bool primary_preflight, primary_preflight_failed;
     unsigned primary_retry_frames;
+    int last_active_events;
 #endif
     uint8_t *raster_scratch;
     size_t raster_scratch_size;

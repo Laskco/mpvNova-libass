@@ -3539,8 +3539,14 @@ ass_start_frame(ASS_Renderer *render_priv, ASS_Track *track,
 
 #ifdef ASS_EVENT_THREADS
 typedef struct {
-    int event_index, next;
+    int event_index;
+    unsigned lane;
 } EventTask;
+
+typedef struct {
+    uint64_t range; // low 32 bits = head, high 32 bits = tail
+    char pad[56];
+} LaneDeque;
 
 typedef struct {
     FilterFunc *plain;
@@ -3575,7 +3581,8 @@ struct ass_event_pool {
     enum { JOB_IDLE, JOB_EVENTS, JOB_VERTICAL, JOB_PREPARE } job_kind;
     VerticalTask vertical;
     EventTask *events;
-    int first[4];
+    int *lane_slots;
+    LaneDeque lanes[4];
     size_t capacity;
     size_t glyph_budget, bitmap_budget, composite_budget;
     size_t worker_glyph_limit, worker_bitmap_limit, worker_composite_limit;
@@ -3671,24 +3678,74 @@ static inline unsigned event_worker_lane(const struct ass_event_pool *pool,
     return ((unsigned) event->ReadOrder >> pool->lane_shift) % (pool->count + 1);
 }
 
-static void queue_event(struct ass_event_pool *pool, int event_index,
-                        int index, int **tail)
+static inline int lane_pop_head(LaneDeque *d)
 {
-    ASS_Event *event = pool->owner->track->events + event_index;
-    unsigned id = event_worker_lane(pool, event);
-    pool->events[index] = (EventTask) {event_index, -1};
-    *tail[id] = index;
-    tail[id] = &pool->events[index].next;
+    uint64_t cur = __atomic_load_n(&d->range, __ATOMIC_RELAXED);
+    for (;;) {
+        uint32_t head = (uint32_t) cur;
+        uint32_t tail = (uint32_t) (cur >> 32);
+        if (head >= tail)
+            return -1;
+        uint64_t next = ((uint64_t) tail << 32) | (head + 1);
+        if (__atomic_compare_exchange_n(&d->range, &cur, next, true,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            return (int) head;
+    }
+}
+
+static inline int lane_steal_tail(LaneDeque *d)
+{
+    uint64_t cur = __atomic_load_n(&d->range, __ATOMIC_RELAXED);
+    for (;;) {
+        uint32_t head = (uint32_t) cur;
+        uint32_t tail = (uint32_t) (cur >> 32);
+        if (head >= tail)
+            return -1;
+        uint64_t next = ((uint64_t) (tail - 1) << 32) | head;
+        if (__atomic_compare_exchange_n(&d->range, &cur, next, true,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            return (int) (tail - 1);
+    }
+}
+
+static int steal_task(struct ass_event_pool *pool, int self_id)
+{
+    int n_lanes = pool->count + 1;
+    for (;;) {
+        int best = -1;
+        uint32_t best_rem = 0;
+        for (int i = 0; i < n_lanes; i++) {
+            if (i == self_id)
+                continue;
+            uint64_t r = __atomic_load_n(&pool->lanes[i].range, __ATOMIC_RELAXED);
+            uint32_t head = (uint32_t) r;
+            uint32_t tail = (uint32_t) (r >> 32);
+            if (tail > head && tail - head > best_rem) {
+                best_rem = tail - head;
+                best = i;
+            }
+        }
+        if (best < 0)
+            return -1;
+        int pos = lane_steal_tail(&pool->lanes[best]);
+        if (pos >= 0)
+            return pos;
+    }
 }
 
 static uint64_t event_batch(struct ass_event_pool *pool, ASS_Renderer *renderer, int id)
 {
-    if (pool->first[id] < 0)
-        return 0;
     uint64_t start = fle_clock();
-    for (int i = pool->first[id]; i >= 0; i = pool->events[i].next) {
-        ASS_Event *event = pool->owner->track->events + pool->events[i].event_index;
-        EventImages *out = pool->owner->eimg + i;
+    for (;;) {
+        int pos = lane_pop_head(&pool->lanes[id]);
+        if (pos < 0) {
+            pos = steal_task(pool, id);
+            if (pos < 0)
+                break;
+        }
+        int slot = pool->lane_slots[pos];
+        ASS_Event *event = pool->owner->track->events + pool->events[slot].event_index;
+        EventImages *out = pool->owner->eimg + slot;
         if (!ass_render_event(&renderer->state, event, out))
             out->event = NULL;
     }
@@ -3785,6 +3842,7 @@ static void event_pool_done(struct ass_event_pool *pool)
     }
     pthread_cond_destroy(&pool->done);
     pthread_mutex_destroy(&pool->lock);
+    free(pool->lane_slots);
     free(pool->events);
     free(pool);
 }
@@ -3850,11 +3908,20 @@ static bool event_pool_prepare_events(struct ass_event_pool *pool)
 }
 
 static bool certify_primary_events(ASS_Renderer *priv, ASS_Track *track,
-                                    long long now, struct ass_event_pool *pool)
+                                    long long now, struct ass_event_pool *pool,
+                                    unsigned occupied)
 {
     RenderContext *state = &priv->state;
     priv->primary_preflight = true;
     priv->primary_preflight_failed = false;
+    if (pool) {
+        for (int w = 0; w < pool->count; w++) {
+            if (!(occupied & (1U << pool->workers[w].id)))
+                continue;
+            if (pool->workers[w].renderer->experimental_edges != priv->experimental_edges)
+                goto reject;
+        }
+    }
     for (int i = 0; i < track->n_events; i++) {
         ASS_Event *event = track->events + i;
         if (!(event->Start <= now && now < event->Start + event->Duration))
@@ -3866,10 +3933,8 @@ static bool certify_primary_events(ASS_Renderer *priv, ASS_Track *track,
         init_render_context(state, event);
         if (!parse_events(state, event))
             goto reject;
-        unsigned id = pool ? event_worker_lane(pool, event) : 0;
-        ASS_Renderer *worker = id ? pool->workers[id - 1].renderer : priv;
-        if (worker->experimental_edges != priv->experimental_edges)
-            goto reject;
+        ASS_Font *last_font = NULL;
+        ASS_Font *last_matches[3] = {NULL, NULL, NULL};
         for (int j = 0; j < state->text_info.length; j++) {
             GlyphInfo *info = state->text_info.glyphs + j;
             if (info->drawing_text.str)
@@ -3886,16 +3951,31 @@ static bool certify_primary_events(ASS_Renderer *priv, ASS_Track *track,
                 if (!code || !(glyph = FT_Get_Char_Index(font->faces[0], code)))
                     goto reject;
             }
-            if (worker == priv)
+            if (!pool)
                 continue;
-            ASS_FontDesc desc = font->desc;
-            ASS_Font *match = ass_font_new(worker, &desc);
-            if (!ass_font_primary_equal(font, match))
-                goto reject;
+            if (font != last_font) {
+                ASS_FontDesc desc = font->desc;
+                for (int w = 0; w < pool->count; w++) {
+                    if (!(occupied & (1U << pool->workers[w].id))) {
+                        last_matches[w] = NULL;
+                        continue;
+                    }
+                    ASS_Font *match = ass_font_new(pool->workers[w].renderer, &desc);
+                    if (!ass_font_primary_equal(font, match))
+                        goto reject;
+                    last_matches[w] = match;
+                }
+                last_font = font;
+            }
             if (glyph) {
-                uint32_t code = ass_font_index_magic(match->faces[0], info->symbol);
-                if (!code || FT_Get_Char_Index(match->faces[0], code) != glyph)
-                    goto reject;
+                for (int w = 0; w < pool->count; w++) {
+                    ASS_Font *match = last_matches[w];
+                    if (!match)
+                        continue;
+                    uint32_t code = ass_font_index_magic(match->faces[0], info->symbol);
+                    if (!code || FT_Get_Char_Index(match->faces[0], code) != glyph)
+                        goto reject;
+                }
             }
         }
         free_render_context(state);
@@ -3961,27 +4041,24 @@ static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
 {
     struct ass_event_pool *pool = priv->event_pool;
     bool preflight_attempted = false;
+    int prev_active = priv->last_active_events;
+    int active = 0;
     if (priv->custom_font_provider)
         goto serial;
-    int *tail[4];
-    if (pool)
-        for (int i = 0; i <= pool->count; i++) {
-            pool->first[i] = -1;
-            tail[i] = &pool->first[i];
-        }
-    int active = 0;
     for (int i = 0; i < track->n_events; i++) {
         ASS_Event *event = track->events + i;
         if (event->Start <= now && now < event->Start + event->Duration) {
             if (pool && active < pool->capacity)
-                queue_event(pool, i, active, tail);
+                pool->events[active] = (EventTask) {i, 0};
             active++;
         }
     }
-    bool queued = pool && active <= pool->capacity;
+    priv->last_active_events = active;
+    bool collected = pool && active <= pool->capacity;
     if (active < 2)
         goto serial;
-    bool expensive = active >= 2 && priv->last_event_render_ns > 4000000;
+    bool spike = active >= 12 || (active >= 6 && active > prev_active + 4);
+    bool expensive = active >= 2 && (priv->last_event_render_ns > 4000000 || spike);
     const char *value = getenv("LIBASS_RENDER_THREADS");
     if (value && atoi(value) <= 1)
         goto serial;
@@ -3996,7 +4073,7 @@ static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
         if (priv->experimental_edges || !expensive)
             goto serial;
         preflight_attempted = true;
-        if (!certify_primary_events(priv, track, now, NULL))
+        if (!certify_primary_events(priv, track, now, NULL, 0))
             goto serial;
     }
     if (!pool || !pool->event_ready) {
@@ -4015,13 +4092,12 @@ static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
         desired_shift = 3;
     else if (active < 320)
         desired_shift = 0;
-    if (desired_shift != pool->lane_shift) {
-        pool->lane_shift = desired_shift;
-        queued = false;
-    }
+    pool->lane_shift = desired_shift;
     if (active > pool->capacity) {
         if (!ASS_REALLOC_ARRAY(pool->events, active)) goto serial;
+        if (!ASS_REALLOC_ARRAY(pool->lane_slots, active)) goto serial;
         pool->capacity = active;
+        collected = false;
     }
     if (active > priv->eimg_size) {
         EventImages *images = ass_realloc_array(priv->eimg, active, sizeof(*images));
@@ -4029,23 +4105,47 @@ static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
         priv->eimg = images;
         priv->eimg_size = active;
     }
-    if (!queued) {
-        // Rebuild only after pool creation or growth, which can move tail pointers.
-        for (int i = 0; i <= pool->count; i++) {
-            pool->first[i] = -1;
-            tail[i] = &pool->first[i];
-        }
+    if (!collected) {
         int index = 0;
         for (int i = 0; i < track->n_events; i++) {
             ASS_Event *event = track->events + i;
             if (event->Start <= now && now < event->Start + event->Duration)
-                queue_event(pool, i, index++, tail);
+                pool->events[index++] = (EventTask) {i, 0};
         }
     }
+    int n_lanes = pool->count + 1;
+    int lane_counts[4] = {0, 0, 0, 0};
+    for (int i = 0; i < active; i++) {
+        unsigned lane = event_worker_lane(pool, track->events + pool->events[i].event_index);
+        pool->events[i].lane = lane;
+        lane_counts[lane]++;
+    }
+    int lane_pos[4];
+    int offset = 0;
+    for (int l = 0; l < n_lanes; l++) {
+        lane_pos[l] = offset;
+        int end = offset + lane_counts[l];
+        pool->lanes[l].range = ((uint64_t) (uint32_t) end << 32) | (uint32_t) offset;
+        offset = end;
+    }
+    for (int i = 0; i < active; i++)
+        pool->lane_slots[lane_pos[pool->events[i].lane]++] = i;
+
     unsigned occupied = 0;
-    for (int i = 0; i <= pool->count; i++)
-        if (pool->first[i] >= 0)
+    int active_lanes = 0;
+    for (int i = 0; i < n_lanes; i++) {
+        if (lane_counts[i] > 0) {
             occupied |= 1U << i;
+            active_lanes++;
+        }
+    }
+    int target_lanes = FFMIN(active, n_lanes);
+    for (int i = 0; i < n_lanes && active_lanes < target_lanes; i++) {
+        if (!(occupied & (1U << i))) {
+            occupied |= 1U << i;
+            active_lanes++;
+        }
+    }
     // One occupied lane gains nothing from event dispatch. The serial renderer
     // can instead use this pool for a large blur, regardless of previous scenes.
     if (!(occupied & (occupied - 1))) {
@@ -4084,7 +4184,7 @@ static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
             goto serial;
     }
     // Resource readiness is not admission: certify every restricted frame.
-    if (restricted && !certify_primary_events(priv, track, now, pool))
+    if (restricted && !certify_primary_events(priv, track, now, pool, occupied))
         goto serial;
     set_pool_cache_limits(pool, pool->glyph_budget, pool->bitmap_budget, pool->composite_budget);
     pthread_mutex_lock(&pool->lock);
