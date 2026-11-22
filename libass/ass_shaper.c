@@ -45,6 +45,32 @@ enum {
     WHOLE_TEXT_LAYOUT_EXPLICIT,
 };
 
+#define SHAPER_FONT_CACHE_SIZE 8
+#define SINGLE_GLYPH_CACHE_SIZE 256
+
+typedef struct {
+    hb_font_t *hb_font;
+    FaceSizeMetricsHashKey key;
+    hb_shape_plan_t *plan;
+    hb_segment_properties_t props;
+    hb_feature_t features[NUM_FEATURES];
+} ShaperFontSlot;
+
+typedef struct {
+    uint64_t font_uid;
+    uint64_t font_size_bits;
+    uint32_t symbol;
+    hb_script_t script;
+    hb_language_t language;
+    int face_index;
+    uint8_t flags;
+    hb_codepoint_t glyph_index;
+    hb_position_t x_offset;
+    hb_position_t y_offset;
+    hb_position_t x_advance;
+    hb_position_t y_advance;
+} SingleGlyphShapeEntry;
+
 struct ass_shaper {
     ASS_ShapingLevel shaping_level;
 
@@ -68,11 +94,9 @@ struct ass_shaper {
 
     hb_font_funcs_t *font_funcs;
     hb_buffer_t *buf;
-    hb_shape_plan_t *last_plan;
-    hb_segment_properties_t last_props;
-    hb_feature_t last_features[NUM_FEATURES];
-    hb_font_t *last_font;
-    FaceSizeMetricsHashKey last_font_key;
+    ShaperFontSlot font_cache[SHAPER_FONT_CACHE_SIZE];
+    unsigned font_cache_next;
+    SingleGlyphShapeEntry single_glyph_cache[SINGLE_GLYPH_CACHE_SIZE];
 
 #ifdef USE_FRIBIDI_EX_API
     FriBidiBracketType *btypes;
@@ -136,9 +160,11 @@ static bool check_par_allocations(ASS_Shaper *shaper, size_t n_pars)
  */
 void ass_shaper_free(ASS_Shaper *shaper)
 {
-    hb_shape_plan_destroy(shaper->last_plan);
-    hb_font_destroy(shaper->last_font);
-    ass_cache_dec_ref(shaper->last_font_key.font);
+    for (int i = 0; i < SHAPER_FONT_CACHE_SIZE; i++) {
+        hb_shape_plan_destroy(shaper->font_cache[i].plan);
+        hb_font_destroy(shaper->font_cache[i].hb_font);
+        ass_cache_dec_ref(shaper->font_cache[i].key.font);
+    }
     free(shaper->ctypes);
 #ifdef USE_FRIBIDI_EX_API
     free(shaper->btypes);
@@ -463,7 +489,7 @@ bool ass_create_hb_font(ASS_Font *font, int index)
  * \param info glyph cluster
  * \return HarfBuzz font
  */
-static hb_font_t *get_hb_font(ASS_Shaper *shaper, GlyphInfo *info)
+static ShaperFontSlot *get_hb_font_slot(ASS_Shaper *shaper, GlyphInfo *info)
 {
     ASS_Font *font = info->font;
 
@@ -472,10 +498,13 @@ static hb_font_t *get_hb_font(ASS_Shaper *shaper, GlyphInfo *info)
         .face_index = info->face_index,
         .size = info->font_size,
     };
-    if (shaper->last_font && shaper->last_font_key.font == key.font &&
-        shaper->last_font_key.size == key.size &&
-        shaper->last_font_key.face_index == key.face_index)
-        return hb_font_reference(shaper->last_font);
+    for (int i = 0; i < SHAPER_FONT_CACHE_SIZE; i++) {
+        ShaperFontSlot *slot = &shaper->font_cache[i];
+        if (slot->hb_font && slot->key.font == key.font &&
+            slot->key.size == key.size &&
+            slot->key.face_index == key.face_index)
+            return slot;
+    }
 
     FT_Size_Metrics *m = ass_cache_get(shaper->face_size_metrics_cache, &key, NULL);
     if (!m)
@@ -498,14 +527,16 @@ static hb_font_t *get_hb_font(ASS_Shaper *shaper, GlyphInfo *info)
 
     update_hb_size(hb_font, font->faces[info->face_index], m);
 
-    hb_shape_plan_destroy(shaper->last_plan);
-    shaper->last_plan = NULL;
-    hb_font_destroy(shaper->last_font);
-    ass_cache_dec_ref(shaper->last_font_key.font);
-    shaper->last_font = hb_font_reference(hb_font);
-    shaper->last_font_key = key;
+    ShaperFontSlot *slot = &shaper->font_cache[shaper->font_cache_next];
+    shaper->font_cache_next = (shaper->font_cache_next + 1) & (SHAPER_FONT_CACHE_SIZE - 1);
+    hb_shape_plan_destroy(slot->plan);
+    slot->plan = NULL;
+    hb_font_destroy(slot->hb_font);
+    ass_cache_dec_ref(slot->key.font);
+    slot->hb_font = hb_font;
+    slot->key = key;
     ass_cache_inc_ref(key.font);
-    return hb_font;
+    return slot;
 }
 
 /**
@@ -689,9 +720,6 @@ static bool shape_harfbuzz(ASS_Shaper *shaper, GlyphInfo *glyphs, size_t len)
         }
 
         int offset = i;
-        hb_font_t *font = get_hb_font(shaper, glyphs + offset);
-        if (!font)
-            return false;
         int run_id = glyphs[offset].shape_run_id;
         int level = shaper->emblevels[offset];
 
@@ -700,49 +728,115 @@ static bool shape_harfbuzz(ASS_Shaper *shaper, GlyphInfo *glyphs, size_t len)
                 level == shaper->emblevels[i + 1])
             i++;
 
-        hb_buffer_pre_allocate(buf, i - offset + 1);
-
         int lead_context = 0, trail_context = 0;
-        if (shaper->whole_text_layout) {
-            hb_buffer_add_utf32(buf, shaper->event_text, len,
-                    offset, i - offset + 1);
-        } else {
+        if (!shaper->whole_text_layout) {
             if (offset > 0 && !glyphs[offset].starts_new_run &&
                     is_shaping_control(glyphs[offset - 1].symbol))
                 lead_context = 1;
             if (i < (len - 1) && !glyphs[i + 1].starts_new_run &&
                     is_shaping_control(glyphs[i + 1].symbol))
                 trail_context = 1;
+        }
 
+        props.direction = FRIBIDI_LEVEL_IS_RTL(level) ?
+            HB_DIRECTION_RTL : HB_DIRECTION_LTR;
+        props.script = glyphs[offset].script;
+        props.language = hb_shaper_get_run_language(shaper, props.script);
+
+        SingleGlyphShapeEntry *sg_entry = NULL;
+        uint64_t sg_font_uid = 0;
+        uint64_t sg_size_bits = 0;
+        uint8_t sg_flags = 0;
+        if (i == offset && !lead_context && !trail_context &&
+            (!shaper->whole_text_layout || len == 1) &&
+            !glyphs[offset].font->desc.vertical &&
+            glyphs[offset].font->uid) {
+            GlyphInfo *info = glyphs + offset;
+            sg_font_uid = info->font->uid;
+            memcpy(&sg_size_bits, &info->font_size, sizeof(sg_size_bits));
+            sg_flags = (uint8_t) ((props.direction == HB_DIRECTION_RTL ? 1 : 0) |
+                                  (info->hspacing ? 0 : 2) |
+                                  (shaper->features[KERN].value ? 4 : 0));
+            uint64_t h = sg_font_uid * 0x9e3779b97f4a7c15ULL ^
+                         sg_size_bits * 0xbf58476d1ce4e5b9ULL ^
+                         ((uint64_t) info->symbol << 17) ^
+                         ((uint64_t) info->face_index << 9) ^
+                         ((uint64_t) sg_flags << 3) ^
+                         (uint32_t) props.script;
+            h ^= h >> 32;
+            sg_entry = &shaper->single_glyph_cache[h & (SINGLE_GLYPH_CACHE_SIZE - 1)];
+            if (sg_entry->font_uid == sg_font_uid &&
+                sg_entry->font_size_bits == sg_size_bits &&
+                sg_entry->symbol == info->symbol &&
+                sg_entry->face_index == info->face_index &&
+                sg_entry->script == props.script &&
+                sg_entry->language == props.language &&
+                sg_entry->flags == sg_flags) {
+                info->skip = false;
+                info->glyph_index = sg_entry->glyph_index;
+                info->offset.x    = ass_lrint(sg_entry->x_offset * info->scale_x);
+                info->offset.y    = ass_lrint(-sg_entry->y_offset * info->scale_y);
+                info->advance.x   = ass_lrint(sg_entry->x_advance * info->scale_x);
+                info->advance.y   = ass_lrint(-sg_entry->y_advance * info->scale_y);
+                info->cluster_advance.x += info->advance.x;
+                info->cluster_advance.y += info->advance.y;
+                continue;
+            }
+        }
+
+        ShaperFontSlot *slot = get_hb_font_slot(shaper, glyphs + offset);
+        if (!slot)
+            return false;
+        hb_font_t *font = slot->hb_font;
+
+        hb_buffer_pre_allocate(buf, i - offset + 1);
+
+        if (shaper->whole_text_layout) {
+            hb_buffer_add_utf32(buf, shaper->event_text, len,
+                    offset, i - offset + 1);
+        } else {
             hb_buffer_add_utf32(buf,
                     shaper->event_text + offset - lead_context,
                     i - offset + 1 + lead_context + trail_context,
                     lead_context, i - offset + 1);
         }
 
-        props.direction = FRIBIDI_LEVEL_IS_RTL(level) ?
-            HB_DIRECTION_RTL : HB_DIRECTION_LTR;
-        props.script = glyphs[offset].script;
-        props.language  = hb_shaper_get_run_language(shaper, props.script);
         hb_buffer_set_segment_properties(buf, &props);
 
         set_run_features(shaper, glyphs + offset);
-        if (!shaper->last_plan ||
-            !hb_segment_properties_equal(&props, &shaper->last_props) ||
-            memcmp(shaper->features, shaper->last_features, sizeof(shaper->last_features))) {
-            hb_shape_plan_destroy(shaper->last_plan);
-            shaper->last_plan = hb_shape_plan_create_cached(hb_font_get_face(font),
+        if (!slot->plan ||
+            !hb_segment_properties_equal(&props, &slot->props) ||
+            memcmp(shaper->features, slot->features, sizeof(slot->features))) {
+            hb_shape_plan_destroy(slot->plan);
+            slot->plan = hb_shape_plan_create_cached(hb_font_get_face(font),
                     &props, shaper->features, shaper->n_features, shapers);
-            shaper->last_props = props;
-            memcpy(shaper->last_features, shaper->features, sizeof(shaper->last_features));
+            slot->props = props;
+            memcpy(slot->features, shaper->features, sizeof(slot->features));
         }
-        hb_shape_plan_execute(shaper->last_plan, font, buf, shaper->features, shaper->n_features);
+        hb_shape_plan_execute(slot->plan, font, buf, shaper->features, shaper->n_features);
+
+        if (sg_entry && hb_buffer_get_length(buf) == 1) {
+            hb_glyph_info_t *gi = hb_buffer_get_glyph_infos(buf, NULL);
+            hb_glyph_position_t *pos = hb_buffer_get_glyph_positions(buf, NULL);
+            if (gi[0].cluster == 0) {
+                sg_entry->font_uid = sg_font_uid;
+                sg_entry->font_size_bits = sg_size_bits;
+                sg_entry->symbol = glyphs[offset].symbol;
+                sg_entry->script = props.script;
+                sg_entry->language = props.language;
+                sg_entry->face_index = glyphs[offset].face_index;
+                sg_entry->flags = sg_flags;
+                sg_entry->glyph_index = gi[0].codepoint;
+                sg_entry->x_offset = pos[0].x_offset;
+                sg_entry->y_offset = pos[0].y_offset;
+                sg_entry->x_advance = pos[0].x_advance;
+                sg_entry->y_advance = pos[0].y_advance;
+            }
+        }
 
         shape_harfbuzz_process_run(glyphs, buf,
                 shaper->whole_text_layout ? 0 : offset - lead_context);
         hb_buffer_reset(buf);
-
-        hb_font_destroy(font);
     }
 
     return true;
@@ -764,7 +858,13 @@ void ass_shaper_determine_script(ASS_Shaper *shaper, GlyphInfo *glyphs,
     // determine script (forward scan)
     for (i = 0; i < len; i++) {
         GlyphInfo *info = glyphs + i;
-        info->script = hb_unicode_script(ufuncs, info->symbol);
+        uint32_t sym = info->symbol;
+        if ((sym >= 'A' && sym <= 'Z') || (sym >= 'a' && sym <= 'z')) {
+            info->script = HB_SCRIPT_LATIN;
+            last_script = HB_SCRIPT_LATIN;
+            continue;
+        }
+        info->script = hb_unicode_script(ufuncs, sym);
 
         // common/inherit codepoints inherit script from context
         if (info->script == HB_SCRIPT_COMMON ||
@@ -882,6 +982,11 @@ void ass_shaper_find_runs(ASS_Shaper *shaper, ASS_Renderer *render_priv,
     int i;
     int shape_run = 0;
 
+    if (len == 1 && glyphs[0].drawing_text.str) {
+        glyphs[0].shape_run_id = 0;
+        return;
+    }
+
     ass_shaper_determine_script(shaper, glyphs, len);
     ass_shaper_skip_characters(glyphs, len);
 
@@ -974,6 +1079,23 @@ bool ass_shaper_shape(ASS_Shaper *shaper, TextInfo *text_info)
     FriBidiParType dir, *pdir;
     GlyphInfo *glyphs = text_info->glyphs;
     shaper->event_text = text_info->event_text;
+
+    if (text_info->length == 1) {
+        if (glyphs[0].drawing_text.str) {
+            glyphs[0].skip = false;
+            return true;
+        }
+        if (shaper->shaping_level == ASS_SHAPING_COMPLEX &&
+            (shaper->base_direction == FRIBIDI_PAR_LTR ||
+             shaper->base_direction == FRIBIDI_PAR_ON) &&
+            glyphs[0].symbol >= 0x20 && glyphs[0].symbol <= 0x7E) {
+            if (!check_codepoint_allocations(shaper, 1))
+                return false;
+            shaper->event_text[0] = glyphs[0].symbol;
+            shaper->emblevels[0] = 0;
+            return shape_harfbuzz(shaper, glyphs, 1);
+        }
+    }
 
     if (!check_codepoint_allocations(shaper, text_info->length))
         return false;
@@ -1111,6 +1233,13 @@ void ass_shaper_cleanup(ASS_Shaper *shaper, TextInfo *text_info)
 FriBidiStrIndex *ass_shaper_reorder(ASS_Shaper *shaper, TextInfo *text_info)
 {
     int i, ret;
+
+    if (text_info->length <= 1) {
+        if (!check_codepoint_allocations(shaper, 1))
+            return NULL;
+        shaper->cmap[0] = 0;
+        return shaper->cmap;
+    }
 
     // Initialize reorder map
     for (i = 0; i < text_info->length; i++)

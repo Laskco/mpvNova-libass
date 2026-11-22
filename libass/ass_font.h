@@ -50,6 +50,7 @@ struct ass_font {
     // Immutable embedded backing data; NULL for unverified providers.
     const char *primary_data;
     size_t primary_size;
+    uint64_t uid;
 };
 
 void ass_charmap_magic(ASS_Library *library, FT_Face face);

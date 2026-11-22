@@ -78,13 +78,14 @@ enum {
     FILTER_FILL_IN_BORDER = 0x10,
 };
 
-// ass_cache_get() takes ownership of the bitmaps array and either frees it
-// or persists it in the item key; individual bitmaps in the array behave
-// as documented in ass_cache_template.h
+// ass_cache_get() takes ownership of the bitmaps array when non-NULL and either
+// frees it or persists it in the item key. For single-bitmap runs, bitmaps may
+// be NULL with the sole entry stored inline in single_bitmap.
 typedef struct {
     FilterDesc filter;
     size_t bitmap_count;
     BitmapRef *bitmaps;
+    BitmapRef single_bitmap;
     ASS_Rect viewport;
     int viewport_align;
 } CompositeHashKey;

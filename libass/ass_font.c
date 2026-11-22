@@ -582,6 +582,16 @@ bool ass_font_primary_equal(const ASS_Font *a, const ASS_Font *b)
     return charmap >= 0 && charmap == FT_Get_Charmap_Index(bf->charmap);
 }
 
+static uint64_t next_ass_font_uid(void)
+{
+    static uint64_t counter = 0;
+#if defined(__GNUC__) || defined(__clang__)
+    return __atomic_add_fetch(&counter, 1, __ATOMIC_RELAXED);
+#else
+    return ++counter;
+#endif
+}
+
 size_t ass_font_construct(void *key, void *value, void *priv)
 {
     ASS_Renderer *render_priv = priv;
@@ -593,6 +603,7 @@ size_t ass_font_construct(void *key, void *value, void *priv)
     font->n_faces = 0;
     font->primary_data = NULL;
     font->primary_size = 0;
+    font->uid = next_ass_font_uid();
     font->desc.family = desc->family;
     font->desc.bold = desc->bold;
     font->desc.italic = desc->italic;

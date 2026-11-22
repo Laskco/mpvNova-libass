@@ -111,14 +111,20 @@ const CacheDesc bitmap_cache_desc = {
 
 
 // composite cache
+static inline const BitmapRef *composite_bitmaps(const CompositeHashKey *k)
+{
+    return k->bitmaps ? k->bitmaps : &k->single_bitmap;
+}
+
 static ass_hashcode composite_hash(void *key, ass_hashcode hval)
 {
     CompositeHashKey *k = key;
+    const BitmapRef *bitmaps = composite_bitmaps(k);
     hval = filter_hash(&k->filter, hval);
     hval = ass_hash_buf(&k->viewport, sizeof(k->viewport), hval);
     hval = ass_hash_buf(&k->viewport_align, sizeof(k->viewport_align), hval);
     for (size_t i = 0; i < k->bitmap_count; i++)
-        hval = bitmap_ref_hash(&k->bitmaps[i], hval);
+        hval = bitmap_ref_hash((void *) &bitmaps[i], hval);
     return hval;
 }
 
@@ -133,8 +139,10 @@ static bool composite_compare(void *a, void *b)
     if (ak->viewport_align != bk->viewport_align ||
         memcmp(&ak->viewport, &bk->viewport, sizeof(ak->viewport)))
         return false;
+    const BitmapRef *ab = composite_bitmaps(ak);
+    const BitmapRef *bb = composite_bitmaps(bk);
     for (size_t i = 0; i < ak->bitmap_count; i++)
-        if (!bitmap_ref_compare(&ak->bitmaps[i], &bk->bitmaps[i]))
+        if (!bitmap_ref_compare((void *) &ab[i], (void *) &bb[i]))
             return false;
     return true;
 }
@@ -144,9 +152,10 @@ static bool composite_key_move(void *dst, void *src)
     CompositeHashKey *d = dst, *s = src;
     if (d) {
         *d = *s;
+        const BitmapRef *bitmaps = composite_bitmaps(d);
         for (size_t i = 0; i < d->bitmap_count; i++) {
-            ass_cache_inc_ref(d->bitmaps[i].bm);
-            ass_cache_inc_ref(d->bitmaps[i].bm_o);
+            ass_cache_inc_ref(bitmaps[i].bm);
+            ass_cache_inc_ref(bitmaps[i].bm_o);
         }
         return true;
     }
@@ -162,9 +171,10 @@ static void composite_destruct(void *key, void *value)
     ass_free_bitmap(&v->bm);
     ass_free_bitmap(&v->bm_o);
     ass_free_bitmap(&v->bm_s);
+    const BitmapRef *bitmaps = composite_bitmaps(k);
     for (size_t i = 0; i < k->bitmap_count; i++) {
-        ass_cache_dec_ref(k->bitmaps[i].bm);
-        ass_cache_dec_ref(k->bitmaps[i].bm_o);
+        ass_cache_dec_ref(bitmaps[i].bm);
+        ass_cache_dec_ref(bitmaps[i].bm_o);
     }
     free(k->bitmaps);
 }

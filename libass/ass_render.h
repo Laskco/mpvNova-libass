@@ -111,6 +111,7 @@ typedef struct {
 
     size_t bitmap_count, max_bitmap_count;
     BitmapRef *bitmaps;
+    BitmapRef inline_bitmap;
 
     int x, y;
     Bitmap *bm, *bm_o, *bm_s;   // glyphs, outline, shadow bitmaps

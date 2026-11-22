@@ -2765,8 +2765,9 @@ static void set_composite_viewport(RenderContext *state, CombinedBitmapInfo *inf
         return;
     int64_t bx0 = INT64_MAX, by0 = INT64_MAX;
     int64_t bx1 = INT64_MIN, by1 = INT64_MIN;
+    const BitmapRef *bitmaps = info->bitmaps ? info->bitmaps : &info->inline_bitmap;
     for (int i = 0; i < info->bitmap_count; i++) {
-        BitmapRef *ref = info->bitmaps + i;
+        const BitmapRef *ref = bitmaps + i;
         Bitmap *bm[2] = {ref->bm, ref->bm_o};
         ASS_Vector pos[2] = {ref->pos, ref->pos_o};
         for (int j = 0; j < 2; j++) {
@@ -2878,12 +2879,9 @@ static void render_and_combine_glyphs(RenderContext *state,
                 current_info->bm = current_info->bm_o = current_info->bm_s = NULL;
                 current_info->image = NULL;
 
-                current_info->bitmap_count = current_info->max_bitmap_count = 0;
-                current_info->bitmaps = malloc(MAX_SUB_BITMAPS_INITIAL * sizeof(BitmapRef));
-                if (!current_info->bitmaps)
-                    continue;
-
-                current_info->max_bitmap_count = MAX_SUB_BITMAPS_INITIAL;
+                current_info->bitmap_count = 0;
+                current_info->bitmaps = NULL;
+                current_info->max_bitmap_count = 1;
 
                 nb_bitmaps++;
                 new_run = false;
@@ -2900,16 +2898,28 @@ static void render_and_combine_glyphs(RenderContext *state,
                 continue;
 
             if (current_info->bitmap_count >= current_info->max_bitmap_count) {
-                size_t new_size = 2 * current_info->max_bitmap_count;
-                if (!ASS_REALLOC_ARRAY(current_info->bitmaps, new_size))
-                    continue;
+                if (!current_info->bitmaps) {
+                    BitmapRef *allocated = malloc(MAX_SUB_BITMAPS_INITIAL * sizeof(BitmapRef));
+                    if (!allocated)
+                        continue;
+                    allocated[0] = current_info->inline_bitmap;
+                    current_info->bitmaps = allocated;
+                    current_info->max_bitmap_count = MAX_SUB_BITMAPS_INITIAL;
+                } else {
+                    size_t new_size = 2 * current_info->max_bitmap_count;
+                    if (!ASS_REALLOC_ARRAY(current_info->bitmaps, new_size))
+                        continue;
 
-                current_info->max_bitmap_count = new_size;
+                    current_info->max_bitmap_count = new_size;
+                }
             }
-            current_info->bitmaps[current_info->bitmap_count].bm   = info->bm;
-            current_info->bitmaps[current_info->bitmap_count].bm_o = info->bm_o;
-            current_info->bitmaps[current_info->bitmap_count].pos   = pos;
-            current_info->bitmaps[current_info->bitmap_count].pos_o = pos_o;
+            BitmapRef *dst_ref = current_info->bitmaps ?
+                &current_info->bitmaps[current_info->bitmap_count] :
+                &current_info->inline_bitmap;
+            dst_ref->bm    = info->bm;
+            dst_ref->bm_o  = info->bm_o;
+            dst_ref->pos   = pos;
+            dst_ref->pos_o = pos_o;
             current_info->bitmap_count++;
 
             current_info->x = FFMIN(current_info->x, pos.x);
@@ -2928,17 +2938,23 @@ static void render_and_combine_glyphs(RenderContext *state,
             info->effect_timing = lround(d6_to_double(info->leftmost_x) +
                 d6_to_double(info->effect_timing) * render_priv->par_scale_x);
 
+        BitmapRef *bitmaps = info->bitmaps ? info->bitmaps : &info->inline_bitmap;
         for (int j = 0; j < info->bitmap_count; j++) {
-            info->bitmaps[j].pos.x -= info->x;
-            info->bitmaps[j].pos.y -= info->y;
-            info->bitmaps[j].pos_o.x -= info->x;
-            info->bitmaps[j].pos_o.y -= info->y;
+            bitmaps[j].pos.x -= info->x;
+            bitmaps[j].pos.y -= info->y;
+            bitmaps[j].pos_o.x -= info->x;
+            bitmaps[j].pos_o.y -= info->y;
         }
 
         CompositeHashKey key = {0};
         key.filter = info->filter;
         key.bitmap_count = info->bitmap_count;
-        key.bitmaps = info->bitmaps;
+        if (!info->bitmaps) {
+            key.bitmaps = NULL;
+            key.single_bitmap = info->inline_bitmap;
+        } else {
+            key.bitmaps = info->bitmaps;
+        }
         set_composite_viewport(state, info, &key);
         CompositeHashValue *val = ass_cache_get(render_priv->cache.composite_cache, &key, render_priv);
         if (!val)
@@ -3058,9 +3074,10 @@ size_t ass_composite_construct(void *key, void *value, void *priv)
     rectangle_reset(&rect_o);
 
     size_t n_bm = 0, n_bm_o = 0;
-    BitmapRef *last = NULL, *last_o = NULL;
+    const BitmapRef *bitmaps = k->bitmaps ? k->bitmaps : &k->single_bitmap;
+    const BitmapRef *last = NULL, *last_o = NULL;
     for (int i = 0; i < k->bitmap_count; i++) {
-        BitmapRef *ref = &k->bitmaps[i];
+        const BitmapRef *ref = &bitmaps[i];
         if (ref->bm) {
             rectangle_combine(&rect, ref->bm, ref->pos);
             last = ref;
@@ -3092,7 +3109,7 @@ size_t ass_composite_construct(void *key, void *value, void *priv)
     } else if (n_bm && alloc_composite_bitmap(&render_priv->engine, &v->bm, rect, bord, k)) {
         for (int i = 0; i < k->bitmap_count; i++)
             add_composite_bitmap(&render_priv->engine, &v->bm,
-                                  k->bitmaps[i].bm, k->bitmaps[i].pos);
+                                  bitmaps[i].bm, bitmaps[i].pos);
     }
     if (!bord && n_bm_o == 1 && !k->viewport_align) {
         if (gaussian && !k->viewport_align)
@@ -3104,7 +3121,7 @@ size_t ass_composite_construct(void *key, void *value, void *priv)
     } else if (n_bm_o && alloc_composite_bitmap(&render_priv->engine, &v->bm_o, rect_o, bord, k)) {
         for (int i = 0; i < k->bitmap_count; i++)
             add_composite_bitmap(&render_priv->engine, &v->bm_o,
-                                  k->bitmaps[i].bm_o, k->bitmaps[i].pos_o);
+                                  bitmaps[i].bm_o, bitmaps[i].pos_o);
     }
 
     if (blur_fill && !fill_blurred)
@@ -3143,7 +3160,7 @@ size_t ass_composite_construct(void *key, void *value, void *priv)
             (uint64_t) v->bm_o.w * v->bm_o.h;
 #endif
     return sizeof(CompositeHashKey) + sizeof(CompositeHashValue) +
-        k->bitmap_count * sizeof(BitmapRef) +
+        (k->bitmaps ? k->bitmap_count * sizeof(BitmapRef) : 0) +
         bitmap_size(&v->bm) + bitmap_size(&v->bm_o) + bitmap_size(&v->bm_s);
 }
 
@@ -3563,6 +3580,7 @@ struct ass_event_pool {
     size_t glyph_budget, bitmap_budget, composite_budget;
     size_t worker_glyph_limit, worker_bitmap_limit, worker_composite_limit;
     int serial_frames;
+    unsigned lane_shift;
 };
 
 static void set_pool_cache_limits(struct ass_event_pool *pool, size_t glyphs,
@@ -3647,11 +3665,17 @@ static void restore_serial_cache_limits(struct ass_event_pool *pool)
         pool->cache_split = false;
 }
 
+static inline unsigned event_worker_lane(const struct ass_event_pool *pool,
+                                         const ASS_Event *event)
+{
+    return ((unsigned) event->ReadOrder >> pool->lane_shift) % (pool->count + 1);
+}
+
 static void queue_event(struct ass_event_pool *pool, int event_index,
                         int index, int **tail)
 {
     ASS_Event *event = pool->owner->track->events + event_index;
-    unsigned id = (unsigned) event->ReadOrder % (pool->count + 1);
+    unsigned id = event_worker_lane(pool, event);
     pool->events[index] = (EventTask) {event_index, -1};
     *tail[id] = index;
     tail[id] = &pool->events[index].next;
@@ -3842,7 +3866,7 @@ static bool certify_primary_events(ASS_Renderer *priv, ASS_Track *track,
         init_render_context(state, event);
         if (!parse_events(state, event))
             goto reject;
-        unsigned id = pool ? (unsigned) event->ReadOrder % (pool->count + 1) : 0;
+        unsigned id = pool ? event_worker_lane(pool, event) : 0;
         ASS_Renderer *worker = id ? pool->workers[id - 1].renderer : priv;
         if (worker->experimental_edges != priv->experimental_edges)
             goto reject;
@@ -3986,6 +4010,15 @@ static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
     }
     if (legacy)
         pool->legacy_events = true;
+    unsigned desired_shift = pool->lane_shift;
+    if (active >= 640)
+        desired_shift = 3;
+    else if (active < 320)
+        desired_shift = 0;
+    if (desired_shift != pool->lane_shift) {
+        pool->lane_shift = desired_shift;
+        queued = false;
+    }
     if (active > pool->capacity) {
         if (!ASS_REALLOC_ARRAY(pool->events, active)) goto serial;
         pool->capacity = active;
