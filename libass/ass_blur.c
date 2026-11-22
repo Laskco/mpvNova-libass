@@ -344,7 +344,7 @@ bool ass_gaussian_blur(ASS_Renderer *renderer, Bitmap *bm, const Bitmap *src,
                               stripe_width, output_capacity);
     size_t bytes = (reuse_output ? 2 : 4) * size;
     // Each event worker owns its renderer and scratch; never share this buffer.
-    size_t scratch_limit = (renderer->experimental_edges ? 32 : 8) * 1024 * 1024;
+    size_t scratch_limit = (renderer->experimental_edges ? 32 : 16) * 1024 * 1024;
     bool borrowed = bytes <= scratch_limit;
     if (borrowed && bytes > renderer->blur_scratch_size) {
         size_t capacity = ass_align(1024 * 1024, bytes);
@@ -389,7 +389,7 @@ bool ass_gaussian_blur(ASS_Renderer *renderer, Bitmap *bm, const Bitmap *src,
     index ^= 1;
     assert(blur_y.radius >= 4 && blur_y.radius <= 8);
     bool large_vertical = w &&
-        (w >= 128 * 1024 || h >= (128 * 1024 + w - 1) / w);
+        (w >= 16 * 1024 || h >= (16 * 1024 + w - 1) / w);
     if (!ass_run_vertical_filter(renderer, NULL, engine->blur_vert[blur_y.radius - 4],
             buf[index ^ 1], buf[index], w, h, h + 2 * blur_y.radius, blur_y.coeff) &&
         !(large_vertical && engine->align_order == 4 &&

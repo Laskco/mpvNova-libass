@@ -353,8 +353,6 @@ struct ass_renderer {
     unsigned primary_retry_frames;
     int last_active_events;
 #endif
-    uint8_t *raster_scratch;
-    size_t raster_scratch_size;
     bool experimental_edges;
     ASS_Outline raster_outline[2];
     void *blur_scratch;

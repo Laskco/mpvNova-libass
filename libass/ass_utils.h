@@ -299,6 +299,59 @@ static inline int32_t lshiftwrapi(int32_t i, int32_t shift)
 
 static inline int mystrtod(char **p, double *res)
 {
+    static const double pow10_tbl[16] = {
+        1.0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7,
+        1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15
+    };
+    char *s = *p;
+    while (*s == ' ' || *s == '\t')
+        s++;
+    bool neg = false;
+    if (*s == '-') {
+        neg = true;
+        s++;
+    } else if (*s == '+') {
+        s++;
+    }
+    uint64_t val = 0;
+    int sig_digits = 0;
+    bool has_digits = false;
+    while ((unsigned) (*s - '0') < 10u) {
+        unsigned d = (unsigned) (*s - '0');
+        has_digits = true;
+        if (val || d) {
+            if (++sig_digits > 15)
+                goto slow;
+            val = val * 10 + d;
+        }
+        s++;
+    }
+    int frac = 0;
+    if (*s == '.') {
+        s++;
+        while ((unsigned) (*s - '0') < 10u) {
+            unsigned d = (unsigned) (*s - '0');
+            has_digits = true;
+            if (++frac > 15)
+                goto slow;
+            if (val || d) {
+                if (++sig_digits > 15)
+                    goto slow;
+                val = val * 10 + d;
+            }
+            s++;
+        }
+    }
+    if (!has_digits || *s == 'e' || *s == 'E')
+        goto slow;
+    double v = (double) val;
+    if (frac)
+        v /= pow10_tbl[frac];
+    *res = neg ? -v : v;
+    *p = s;
+    return 1;
+
+slow:;
     char *start = *p;
     *res = ass_strtod(*p, p);
     return *p != start;
@@ -306,6 +359,75 @@ static inline int mystrtod(char **p, double *res)
 
 static inline int mystrtoi32(char **p, int base, int32_t *res)
 {
+    char *s = *p;
+    if (base == 10) {
+        while (*s == ' ' || *s == '\t')
+            s++;
+        bool neg = false;
+        if (*s == '-') {
+            neg = true;
+            s++;
+        } else if (*s == '+') {
+            s++;
+        }
+        if ((unsigned) (*s - '0') >= 10u)
+            goto slow;
+        while (*s == '0')
+            s++;
+        uint32_t val = 0;
+        int digits = 0;
+        while ((unsigned) (*s - '0') < 10u) {
+            if (++digits > 9)
+                goto slow;
+            val = val * 10u + (unsigned) (*s - '0');
+            s++;
+        }
+        *res = neg ? -(int32_t) val : (int32_t) val;
+        *p = s;
+        return 1;
+    }
+    if (base == 16) {
+        while (*s == ' ' || *s == '\t')
+            s++;
+        bool neg = false;
+        if (*s == '-') {
+            neg = true;
+            s++;
+        } else if (*s == '+') {
+            s++;
+        }
+        if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))
+            goto slow;
+        bool has_digits = false;
+        while (*s == '0') {
+            has_digits = true;
+            s++;
+        }
+        uint32_t val = 0;
+        int digits = 0;
+        for (;;) {
+            unsigned c = (unsigned char) *s;
+            unsigned d;
+            if (c - '0' < 10u)
+                d = c - '0';
+            else if ((c | 32u) - 'a' < 6u)
+                d = (c | 32u) - 'a' + 10u;
+            else
+                break;
+            has_digits = true;
+            if (++digits > 7)
+                goto slow;
+            val = (val << 4) | d;
+            s++;
+        }
+        if (!has_digits)
+            goto slow;
+        *res = neg ? -(int32_t) val : (int32_t) val;
+        *p = s;
+        return 1;
+    }
+
+slow:;
     char *start = *p;
     long long temp_res = strtoll(*p, p, base);
     *res = FFMINMAX(temp_res, INT32_MIN, INT32_MAX);

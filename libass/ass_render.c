@@ -238,7 +238,6 @@ void ass_renderer_done(ASS_Renderer *render_priv)
         FT_Done_FreeType(render_priv->ftlibrary);
     free(render_priv->eimg);
 
-    ass_aligned_free(render_priv->raster_scratch);
     ass_aligned_free(render_priv->blur_scratch);
     ass_outline_free(&render_priv->raster_outline[0]);
     ass_outline_free(&render_priv->raster_outline[1]);
@@ -2748,18 +2747,28 @@ static void set_composite_viewport(RenderContext *state, CombinedBitmapInfo *inf
     ass_gaussian_blur_bounds(r2y, &py, &ay);
     int64_t pad_x = px + info->filter.be + 4 + llabs((int64_t)info->filter.shadow.x) / 64;
     int64_t pad_y = py + info->filter.be + 4 + llabs((int64_t)info->filter.shadow.y) / 64;
-    int64_t x0 = -(int64_t)info->x - pad_x;
-    int64_t y0 = -(int64_t)info->y - pad_y;
-    int64_t x1 = (int64_t)renderer->settings.frame_width - info->x + pad_x;
-    int64_t y1 = (int64_t)renderer->settings.frame_height - info->y + pad_y;
+    int64_t vis_x0 = 0;
+    int64_t vis_y0 = 0;
+    int64_t vis_x1 = renderer->settings.frame_width;
+    int64_t vis_y1 = renderer->settings.frame_height;
+    if (!state->clip_mode) {
+        vis_x0 = FFMAX(vis_x0, (int64_t) state->clip_x0);
+        vis_y0 = FFMAX(vis_y0, (int64_t) state->clip_y0);
+        vis_x1 = FFMIN(vis_x1, (int64_t) state->clip_x1);
+        vis_y1 = FFMIN(vis_y1, (int64_t) state->clip_y1);
+    }
+    int64_t x0 = vis_x0 - info->x - pad_x;
+    int64_t y0 = vis_y0 - info->y - pad_y;
+    int64_t x1 = vis_x1 - info->x + pad_x;
+    int64_t y1 = vis_y1 - info->y + pad_y;
     bool conservative = !renderer->experimental_edges;
     if (conservative) {
         // Quantize outward to retain cache reuse while preserving the blur halo.
-        const int64_t viewport_mask = -INT64_C(512);
+        const int64_t viewport_mask = -INT64_C(128);
         x0 &= viewport_mask;
         y0 &= viewport_mask;
-        x1 = (x1 + 511) & viewport_mask;
-        y1 = (y1 + 511) & viewport_mask;
+        x1 = (x1 + 127) & viewport_mask;
+        y1 = (y1 + 127) & viewport_mask;
     }
     if (x0 < INT32_MIN || y0 < INT32_MIN || x1 > INT32_MAX || y1 > INT32_MAX)
         return;
@@ -2788,8 +2797,7 @@ static void set_composite_viewport(RenderContext *state, CombinedBitmapInfo *inf
     double visible = (double)FFMAX(0, FFMIN(bx1, x1 + crop_guard) - FFMAX(bx0, x0 - crop_guard)) *
         FFMAX(0, FFMIN(by1, y1 + crop_guard) - FFMAX(by0, y0 - crop_guard));
     // Preserve position-independent cache reuse for small or mostly visible runs.
-    bool worthwhile = conservative ? visible <= area / 2 :
-        area - visible >= FFMAX(256 * 1024, area / 4);
+    bool worthwhile = area - visible >= FFMAX(256 * 1024, area / 4);
     if (area >= 1024 * 1024 && worthwhile) {
         key->viewport = (ASS_Rect){x0, y0, x1, y1};
         key->viewport_align = viewport_align;
