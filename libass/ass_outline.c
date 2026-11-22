@@ -19,6 +19,10 @@
 #include "config.h"
 #include "ass_compat.h"
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
 #include "ass_utils.h"
 #include "ass_outline.h"
 
@@ -418,7 +422,107 @@ static bool outline_transform_2d(ASS_Outline *outline, const ASS_Outline *source
     }
 
     const ASS_Vector *pt = source->points;
-    for (size_t i = 0; i < source->n_points; i++) {
+    ASS_Vector *dst = outline->points;
+    size_t n = source->n_points;
+    size_t i = 0;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    float64x2_t vlim = vdupq_n_f64((double) OUTLINE_MAX);
+    uint64x2_t vok = vdupq_n_u64(~UINT64_C(0));
+    if (m[0][1] == 0.0 && m[1][0] == 0.0) {
+        float64x2_t vm00 = vdupq_n_f64(m[0][0]);
+        float64x2_t vm02 = vdupq_n_f64(m[0][2]);
+        float64x2_t vm11 = vdupq_n_f64(m[1][1]);
+        float64x2_t vm12 = vdupq_n_f64(m[1][2]);
+        for (; i + 4 <= n; i += 4) {
+            int32x4x2_t p = vld2q_s32((const int32_t *) (pt + i));
+            float64x2_t fx0 = vcvtq_f64_s64(vmovl_s32(vget_low_s32(p.val[0])));
+            float64x2_t fy0 = vcvtq_f64_s64(vmovl_s32(vget_low_s32(p.val[1])));
+            float64x2_t fx1 = vcvtq_f64_s64(vmovl_high_s32(p.val[0]));
+            float64x2_t fy1 = vcvtq_f64_s64(vmovl_high_s32(p.val[1]));
+
+            float64x2_t vx0 = vaddq_f64(vmulq_f64(vm00, fx0), vm02);
+            float64x2_t vy0 = vaddq_f64(vmulq_f64(vm11, fy0), vm12);
+            float64x2_t vx1 = vaddq_f64(vmulq_f64(vm00, fx1), vm02);
+            float64x2_t vy1 = vaddq_f64(vmulq_f64(vm11, fy1), vm12);
+
+            uint64x2_t ok0 = vandq_u64(vcltq_f64(vabsq_f64(vx0), vlim),
+                                       vcltq_f64(vabsq_f64(vy0), vlim));
+            uint64x2_t ok1 = vandq_u64(vcltq_f64(vabsq_f64(vx1), vlim),
+                                       vcltq_f64(vabsq_f64(vy1), vlim));
+            vok = vandq_u64(vok, vandq_u64(ok0, ok1));
+
+            int32x4x2_t out;
+            out.val[0] = vcombine_s32(vmovn_s64(vcvtnq_s64_f64(vx0)),
+                                      vmovn_s64(vcvtnq_s64_f64(vx1)));
+            out.val[1] = vcombine_s32(vmovn_s64(vcvtnq_s64_f64(vy0)),
+                                      vmovn_s64(vcvtnq_s64_f64(vy1)));
+            vst2q_s32((int32_t *) (dst + i), out);
+        }
+        for (; i + 2 <= n; i += 2) {
+            int32x2x2_t p = vld2_s32((const int32_t *) (pt + i));
+            float64x2_t fx = vcvtq_f64_s64(vmovl_s32(p.val[0]));
+            float64x2_t fy = vcvtq_f64_s64(vmovl_s32(p.val[1]));
+            float64x2_t vx = vaddq_f64(vmulq_f64(vm00, fx), vm02);
+            float64x2_t vy = vaddq_f64(vmulq_f64(vm11, fy), vm12);
+            vok = vandq_u64(vok, vandq_u64(vcltq_f64(vabsq_f64(vx), vlim),
+                                           vcltq_f64(vabsq_f64(vy), vlim)));
+            int32x2x2_t out;
+            out.val[0] = vmovn_s64(vcvtnq_s64_f64(vx));
+            out.val[1] = vmovn_s64(vcvtnq_s64_f64(vy));
+            vst2_s32((int32_t *) (dst + i), out);
+        }
+    } else {
+        float64x2_t vm00 = vdupq_n_f64(m[0][0]);
+        float64x2_t vm01 = vdupq_n_f64(m[0][1]);
+        float64x2_t vm02 = vdupq_n_f64(m[0][2]);
+        float64x2_t vm10 = vdupq_n_f64(m[1][0]);
+        float64x2_t vm11 = vdupq_n_f64(m[1][1]);
+        float64x2_t vm12 = vdupq_n_f64(m[1][2]);
+        for (; i + 4 <= n; i += 4) {
+            int32x4x2_t p = vld2q_s32((const int32_t *) (pt + i));
+            float64x2_t fx0 = vcvtq_f64_s64(vmovl_s32(vget_low_s32(p.val[0])));
+            float64x2_t fy0 = vcvtq_f64_s64(vmovl_s32(vget_low_s32(p.val[1])));
+            float64x2_t fx1 = vcvtq_f64_s64(vmovl_high_s32(p.val[0]));
+            float64x2_t fy1 = vcvtq_f64_s64(vmovl_high_s32(p.val[1]));
+
+            float64x2_t vx0 = vaddq_f64(vfmaq_f64(vmulq_f64(vm00, fx0), vm01, fy0), vm02);
+            float64x2_t vy0 = vaddq_f64(vfmaq_f64(vmulq_f64(vm10, fx0), vm11, fy0), vm12);
+            float64x2_t vx1 = vaddq_f64(vfmaq_f64(vmulq_f64(vm00, fx1), vm01, fy1), vm02);
+            float64x2_t vy1 = vaddq_f64(vfmaq_f64(vmulq_f64(vm10, fx1), vm11, fy1), vm12);
+
+            uint64x2_t ok0 = vandq_u64(vcltq_f64(vabsq_f64(vx0), vlim),
+                                       vcltq_f64(vabsq_f64(vy0), vlim));
+            uint64x2_t ok1 = vandq_u64(vcltq_f64(vabsq_f64(vx1), vlim),
+                                       vcltq_f64(vabsq_f64(vy1), vlim));
+            vok = vandq_u64(vok, vandq_u64(ok0, ok1));
+
+            int32x4x2_t out;
+            out.val[0] = vcombine_s32(vmovn_s64(vcvtnq_s64_f64(vx0)),
+                                      vmovn_s64(vcvtnq_s64_f64(vx1)));
+            out.val[1] = vcombine_s32(vmovn_s64(vcvtnq_s64_f64(vy0)),
+                                      vmovn_s64(vcvtnq_s64_f64(vy1)));
+            vst2q_s32((int32_t *) (dst + i), out);
+        }
+        for (; i + 2 <= n; i += 2) {
+            int32x2x2_t p = vld2_s32((const int32_t *) (pt + i));
+            float64x2_t fx = vcvtq_f64_s64(vmovl_s32(p.val[0]));
+            float64x2_t fy = vcvtq_f64_s64(vmovl_s32(p.val[1]));
+            float64x2_t vx = vaddq_f64(vfmaq_f64(vmulq_f64(vm00, fx), vm01, fy), vm02);
+            float64x2_t vy = vaddq_f64(vfmaq_f64(vmulq_f64(vm10, fx), vm11, fy), vm12);
+            vok = vandq_u64(vok, vandq_u64(vcltq_f64(vabsq_f64(vx), vlim),
+                                           vcltq_f64(vabsq_f64(vy), vlim)));
+            int32x2x2_t out;
+            out.val[0] = vmovn_s64(vcvtnq_s64_f64(vx));
+            out.val[1] = vmovn_s64(vcvtnq_s64_f64(vy));
+            vst2_s32((int32_t *) (dst + i), out);
+        }
+    }
+    if ((vgetq_lane_u64(vok, 0) & vgetq_lane_u64(vok, 1)) != ~UINT64_C(0)) {
+        ass_outline_free(outline);
+        return false;
+    }
+#endif
+    for (; i < n; i++) {
         double v[2];
         for (int k = 0; k < 2; k++)
             v[k] = m[k][0] * pt[i].x + m[k][1] * pt[i].y + m[k][2];
@@ -427,8 +531,8 @@ static bool outline_transform_2d(ASS_Outline *outline, const ASS_Outline *source
             ass_outline_free(outline);
             return false;
         }
-        outline->points[i].x = ass_lrint(v[0]);
-        outline->points[i].y = ass_lrint(v[1]);
+        dst[i].x = ass_lrint(v[0]);
+        dst[i].y = ass_lrint(v[1]);
     }
     memcpy(outline->segments, source->segments, source->n_segments);
     outline->n_points = source->n_points;
