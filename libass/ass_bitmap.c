@@ -26,6 +26,9 @@
 #include <math.h>
 #include <stdbool.h>
 #include <assert.h>
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 #include <ft2build.h>
 #include FT_GLYPH_H
 #include FT_OUTLINE_H
@@ -155,11 +158,12 @@ bool ass_outline_to_bitmap(RenderContext *state, Bitmap *bm,
     RasterizerData *rst = &state->rasterizer;
     // Contour rejection is opt-in because it can change edge rounding.
     const ASS_Rect *contour_clip = render_priv->experimental_edges ? clip : NULL;
+    int edges = render_priv->experimental_edges;
     bool complex = (outline1 && outline1->n_points >= 256) ||
                    (outline2 && outline2->n_points >= 256);
-    int simplify = render_priv->experimental_edges && !clip && complex ? 64 : 0;
+    int simplify = edges && !clip && complex ? (edges >= 2 ? 96 : 64) : 0;
     int original_error = rst->outline_error;
-    if (simplify) rst->outline_error = 24;
+    if (simplify) rst->outline_error = edges >= 2 ? 40 : 24;
     bool valid = (!outline1 || ass_rasterizer_set_outline(rst, outline1, false, contour_clip, simplify)) &&
                  (!outline2 || ass_rasterizer_set_outline(rst, outline2, !!outline1, contour_clip, simplify));
     rst->outline_error = original_error;
@@ -248,8 +252,19 @@ void ass_fix_outline(Bitmap *bm_g, Bitmap *bm_o)
     uint8_t *g = bm_g->buffer + (t - bm_g->top) * bm_g->stride + (l - bm_g->left);
     uint8_t *o = bm_o->buffer + (t - bm_o->top) * bm_o->stride + (l - bm_o->left);
 
+    int32_t w = r - l;
     for (int32_t y = 0; y < b - t; y++) {
-        for (int32_t x = 0; x < r - l; x++)
+        int32_t x = 0;
+#if defined(__ARM_NEON)
+        for (; x + 16 <= w; x += 16) {
+            uint8x16_t vg = vld1q_u8(g + x);
+            uint8x16_t vo = vld1q_u8(o + x);
+            uint8x16_t mask = vcgtq_u8(vo, vg);
+            uint8x16_t sub = vsubq_u8(vo, vshrq_n_u8(vg, 1));
+            vst1q_u8(o + x, vandq_u8(sub, mask));
+        }
+#endif
+        for (; x < w; x++)
             o[x] = (o[x] > g[x]) ? o[x] - (g[x] / 2) : 0;
         g += bm_g->stride;
         o += bm_o->stride;
@@ -272,22 +287,65 @@ void ass_shift_bitmap(Bitmap *bm, int shift_x, int shift_y)
     uint8_t *buf = bm->buffer;
 
     // Shift in x direction
-    if (shift_x)
+    if (shift_x && w > 1) {
+#if defined(__ARM_NEON)
+        uint8x8_t vsh = vdup_n_u8((uint8_t) shift_x);
+        uint8x16_t vzero = vdupq_n_u8(0);
+#endif
         for (int32_t y = 0; y < h; y++) {
-            for (int32_t x = w - 1; x > 0; x--) {
-                uint8_t b = buf[x + y * s - 1] * shift_x >> 6;
-                buf[x + y * s - 1] -= b;
-                buf[x + y * s] += b;
+            uint8_t *row = buf + y * s;
+            int32_t x = 0;
+            uint8_t prev_b = 0;
+#if defined(__ARM_NEON)
+            if (w > 16) {
+                uint8x16_t vprev = vzero;
+                for (; x + 16 < w; x += 16) {
+                    uint8x16_t cur = vld1q_u8(row + x);
+                    uint8x8_t blo = vshrn_n_u16(vmull_u8(vget_low_u8(cur), vsh), 6);
+                    uint8x8_t bhi = vshrn_n_u16(vmull_u8(vget_high_u8(cur), vsh), 6);
+                    uint8x16_t vb = vcombine_u8(blo, bhi);
+                    uint8x16_t vb_prev = vextq_u8(vprev, vb, 15);
+                    vst1q_u8(row + x, vaddq_u8(vsubq_u8(cur, vb), vb_prev));
+                    vprev = vb;
+                }
+                prev_b = vgetq_lane_u8(vprev, 15);
             }
+#endif
+            for (; x < w - 1; x++) {
+                uint8_t cur = row[x];
+                uint8_t b = (uint8_t) (cur * shift_x >> 6);
+                row[x] = (uint8_t) (cur - b + prev_b);
+                prev_b = b;
+            }
+            row[w - 1] = (uint8_t) (row[w - 1] + prev_b);
         }
+    }
 
     // Shift in y direction
-    if (shift_y)
+    if (shift_y) {
+#if defined(__ARM_NEON)
+        uint8x8_t vsh = vdup_n_u8((uint8_t) shift_y);
+#endif
         for (int32_t y = h - 1; y > 0; y--) {
-            for (int32_t x = 0; x < w; x++) {
-                uint8_t b = buf[x + y * s - s] * shift_y >> 6;
-                buf[x + y * s - s] -= b;
-                buf[x + y * s] += b;
+            uint8_t *prev = buf + (y - 1) * s;
+            uint8_t *cur = buf + y * s;
+            int32_t x = 0;
+#if defined(__ARM_NEON)
+            for (; x + 16 <= w; x += 16) {
+                uint8x16_t vp = vld1q_u8(prev + x);
+                uint8x16_t vc = vld1q_u8(cur + x);
+                uint8x8_t blo = vshrn_n_u16(vmull_u8(vget_low_u8(vp), vsh), 6);
+                uint8x8_t bhi = vshrn_n_u16(vmull_u8(vget_high_u8(vp), vsh), 6);
+                uint8x16_t vb = vcombine_u8(blo, bhi);
+                vst1q_u8(prev + x, vsubq_u8(vp, vb));
+                vst1q_u8(cur + x, vaddq_u8(vc, vb));
+            }
+#endif
+            for (; x < w; x++) {
+                uint8_t b = prev[x] * shift_y >> 6;
+                prev[x] -= b;
+                cur[x] += b;
             }
         }
+    }
 }

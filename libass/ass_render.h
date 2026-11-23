@@ -353,7 +353,7 @@ struct ass_renderer {
     unsigned primary_retry_frames;
     int last_active_events;
 #endif
-    bool experimental_edges;
+    int experimental_edges;
     ASS_Outline raster_outline[2];
     void *blur_scratch;
     size_t blur_scratch_size;
@@ -389,6 +389,9 @@ bool ass_run_vertical_filter(ASS_Renderer *renderer, FilterFunc *plain,
                              ParamFilterFunc *param_filter, int16_t *dst,
                              const int16_t *src, size_t width, size_t src_h,
                              size_t dst_h, const int16_t *coeff);
+typedef void BlurSliceFunc(void *ctx, unsigned lane, unsigned lanes);
+bool ass_run_blur_slices(ASS_Renderer *renderer, BlurSliceFunc *fn, void *ctx,
+                         size_t items, size_t width, size_t height);
 #ifdef ASS_EVENT_THREADS
 bool ass_clone_render_settings(ASS_Renderer *dst, const ASS_Renderer *src,
                                 unsigned *font_generation, int *render_id);

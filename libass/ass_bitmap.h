@@ -56,7 +56,7 @@ bool ass_outline_to_bitmap(struct render_context *state, Bitmap *bm,
                            ASS_Outline *outline1, ASS_Outline *outline2,
                            const ASS_Rect *clip, int clip_align);
 
-void ass_gaussian_blur_bounds(double r2, int *padding, int *alignment);
+void ass_gaussian_blur_bounds(double r2, bool fast_blur, int *padding, int *alignment);
 
 void ass_synth_blur(ASS_Renderer *renderer, Bitmap *bm,
                     int be, double blur_r2x, double blur_r2y);

@@ -61,6 +61,14 @@ jobs:
           ASAN_OPTIONS: detect_leaks=1
           UBSAN_OPTIONS: halt_on_error=1
         run: meson test -C build checkasm art-fuzz --timeout-multiplier 4 --print-errorlogs
+      - name: Exercise low-end mode with malformed subtitle inputs
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && matrix.source != 'baseline' }}
+        env:
+          LIBASS_EXPERIMENTAL_EDGES: '2'
+          LIBASS_RENDER_THREADS: '4'
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: halt_on_error=1
+        run: meson test -C build art-fuzz --timeout-multiplier 4 --print-errorlogs
       - name: Run upstream regression and malformed-input tests
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         env:
@@ -75,9 +83,20 @@ jobs:
         with:
           name: regression-${{ matrix.source }}
           path: build/meson-logs/testlog.txt
-  arm64:
+  android-bench:
+    name: ${{ matrix.arch }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            cc: aarch64-linux-android23-clang
+            cxx: aarch64-linux-android23-clang++
+          - arch: armv7l
+            cc: armv7a-linux-androideabi23-clang
+            cxx: armv7a-linux-androideabi23-clang++
     steps:
       - uses: actions/checkout@v6
       - uses: actions/checkout@v6
@@ -97,7 +116,7 @@ jobs:
             player/buildscripts/prefix
             player/buildscripts/deps
             player/buildscripts/sdk
-          key: fle-deps-arm64-ndk30-23c532f3-v2
+          key: fle-deps-${{ matrix.arch }}-ndk30-23c532f3-v2
       - name: Prepare pinned dependencies
         run: |
           set -euo pipefail
@@ -139,44 +158,46 @@ jobs:
       - name: Build same-version subtitle stack
         run: |
           set -euo pipefail
+          arch="${{ matrix.arch }}"
           cd player/buildscripts
           chmod +x buildall.sh scripts/*.sh
-          if [ ! -f prefix/arm64/lib/libfontconfig.a ]; then
-            ./buildall.sh --arch arm64 fontconfig
-            ./buildall.sh --arch arm64 harfbuzz
-            ./buildall.sh --arch arm64 fribidi
-            ./buildall.sh --arch arm64 unibreak
+          if [ ! -f "prefix/$arch/lib/libfontconfig.a" ]; then
+            ./buildall.sh --arch "$arch" fontconfig
+            ./buildall.sh --arch "$arch" harfbuzz
+            ./buildall.sh --arch "$arch" fribidi
+            ./buildall.sh --arch "$arch" unibreak
           fi
-          MPVNOVA_LIBASS_REF="$GITHUB_SHA" ./buildall.sh --arch arm64 -n libass
+          MPVNOVA_LIBASS_REF="$GITHUB_SHA" ./buildall.sh --arch "$arch" -n libass
           # Append timing instrumentation without replacing the production
           # CPPFLAGS, including the build script's Fontconfig atomic-ref check.
           export PATH="$PWD/sdk/android-ndk-r30/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
-          cd deps/libass/_build_arm64
+          cd "deps/libass/_build_$arch"
           make clean
           make -j2 -f Makefile -f - <<'MAKE'
           CPPFLAGS += -DASS_FLE_PROFILE
           MAKE
-          make DESTDIR="$GITHUB_WORKSPACE/player/buildscripts/prefix/arm64" install
+          make DESTDIR="$GITHUB_WORKSPACE/player/buildscripts/prefix/$arch" install
       - name: Link standalone benchmark
         run: |
           set -euo pipefail
-          prefix="$PWD/player/buildscripts/prefix/arm64"
+          arch="${{ matrix.arch }}"
+          prefix="$PWD/player/buildscripts/prefix/$arch"
           toolchain="$PWD/player/buildscripts/sdk/android-ndk-r30/toolchains/llvm/prebuilt/linux-x86_64/bin"
           export PKG_CONFIG_SYSROOT_DIR="$prefix"
           export PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig"
           mkdir -p collected
-          "$toolchain/aarch64-linux-android23-clang" -O2 -g -fno-omit-frame-pointer \
+          "$toolchain/${{ matrix.cc }}" -O2 -g -fno-omit-frame-pointer \
             profile/fle-bench.c $(pkg-config --cflags --static libass) -c -o collected/fle-bench.o
-          "$toolchain/aarch64-linux-android23-clang++" -static-libstdc++ \
+          "$toolchain/${{ matrix.cxx }}" -static-libstdc++ \
             collected/fle-bench.o $(pkg-config --libs --static libass) -o collected/fle-bench
-          cp player/buildscripts/deps/libass/_build_arm64/libass/.libs/libass.a collected/
-          cp player/buildscripts/deps/libass/_build_arm64/config.h collected/
+          cp "player/buildscripts/deps/libass/_build_$arch/libass/.libs/libass.a" collected/
+          cp "player/buildscripts/deps/libass/_build_$arch/config.h" collected/
           pkg-config --cflags --static libass > collected/cflags.txt
           pkg-config --libs --static libass > collected/ldflags.txt
           git rev-parse HEAD > collected/revision.txt
-          tar -czf collected/subtitle-prefix-arm64.tgz -C player/buildscripts prefix/arm64
+          tar -czf "collected/subtitle-prefix-$arch.tgz" -C player/buildscripts "prefix/$arch"
       - uses: actions/upload-artifact@v7
         with:
-          name: libass-arm64-profile
+          name: libass-${{ matrix.arch }}-profile
           if-no-files-found: error
           path: collected/

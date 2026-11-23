@@ -404,6 +404,19 @@ bool ass_outline_scale_pow2(ASS_Outline *outline, const ASS_Outline *source,
  */
 static bool reserve_temporary_outline(ASS_Outline *outline, size_t points, size_t segments);
 
+#if !defined(__aarch64__) && defined(__arm__) && !defined(__SOFTFP__) && \
+    defined(__ARM_FP) && (__ARM_FP & 8) && (defined(__GNUC__) || defined(__clang__))
+#define ASS_ARMV7_VFP_LRINT 1
+static inline int32_t armv7_lrint(double x)
+{
+    int32_t r;
+    float s;
+    __asm__("vcvtr.s32.f64 %0, %P1" : "=t"(s) : "w"(x));
+    __asm__("vmov %0, %1" : "=r"(r) : "t"(s));
+    return r;
+}
+#endif
+
 static bool outline_transform_2d(ASS_Outline *outline, const ASS_Outline *source,
                                   const double m[2][3], bool reuse)
 {
@@ -522,17 +535,96 @@ static bool outline_transform_2d(ASS_Outline *outline, const ASS_Outline *source
         return false;
     }
 #endif
-    for (; i < n; i++) {
-        double v[2];
-        for (int k = 0; k < 2; k++)
-            v[k] = m[k][0] * pt[i].x + m[k][1] * pt[i].y + m[k][2];
-
-        if (!(fabs(v[0]) < OUTLINE_MAX && fabs(v[1]) < OUTLINE_MAX)) {
-            ass_outline_free(outline);
-            return false;
+#if defined(ASS_ARMV7_VFP_LRINT)
+    if (fabs(m[0][0]) < 1e100 && fabs(m[0][1]) < 1e100 && fabs(m[0][2]) < 1e100 &&
+        fabs(m[1][0]) < 1e100 && fabs(m[1][1]) < 1e100 && fabs(m[1][2]) < 1e100) {
+        const uint32_t bias = (uint32_t) 1 << 27;
+        const uint32_t mask = ~((uint32_t) OUTLINE_MAX);
+        uint32_t oor = 0;
+        if (m[0][1] == 0.0 && m[1][0] == 0.0) {
+            double m00 = m[0][0], m02 = m[0][2], m11 = m[1][1], m12 = m[1][2];
+            for (; i + 4 <= n; i += 4) {
+                double vx0 = m00 * pt[i + 0].x + m02;
+                double vy0 = m11 * pt[i + 0].y + m12;
+                double vx1 = m00 * pt[i + 1].x + m02;
+                double vy1 = m11 * pt[i + 1].y + m12;
+                double vx2 = m00 * pt[i + 2].x + m02;
+                double vy2 = m11 * pt[i + 2].y + m12;
+                double vx3 = m00 * pt[i + 3].x + m02;
+                double vy3 = m11 * pt[i + 3].y + m12;
+                int32_t ix0 = armv7_lrint(vx0), iy0 = armv7_lrint(vy0);
+                int32_t ix1 = armv7_lrint(vx1), iy1 = armv7_lrint(vy1);
+                int32_t ix2 = armv7_lrint(vx2), iy2 = armv7_lrint(vy2);
+                int32_t ix3 = armv7_lrint(vx3), iy3 = armv7_lrint(vy3);
+                dst[i + 0].x = ix0; dst[i + 0].y = iy0;
+                dst[i + 1].x = ix1; dst[i + 1].y = iy1;
+                dst[i + 2].x = ix2; dst[i + 2].y = iy2;
+                dst[i + 3].x = ix3; dst[i + 3].y = iy3;
+                oor |= ((uint32_t) ix0 + bias) | ((uint32_t) iy0 + bias) |
+                       ((uint32_t) ix1 + bias) | ((uint32_t) iy1 + bias) |
+                       ((uint32_t) ix2 + bias) | ((uint32_t) iy2 + bias) |
+                       ((uint32_t) ix3 + bias) | ((uint32_t) iy3 + bias);
+            }
+            for (; i < n; i++) {
+                int32_t ix = armv7_lrint(m00 * pt[i].x + m02);
+                int32_t iy = armv7_lrint(m11 * pt[i].y + m12);
+                dst[i].x = ix;
+                dst[i].y = iy;
+                oor |= ((uint32_t) ix + bias) | ((uint32_t) iy + bias);
+            }
+        } else {
+            double m00 = m[0][0], m01 = m[0][1], m02 = m[0][2];
+            double m10 = m[1][0], m11 = m[1][1], m12 = m[1][2];
+            for (; i + 2 <= n; i += 2) {
+                double px0 = pt[i + 0].x, py0 = pt[i + 0].y;
+                double px1 = pt[i + 1].x, py1 = pt[i + 1].y;
+                double vx0 = m00 * px0 + m01 * py0 + m02;
+                double vy0 = m10 * px0 + m11 * py0 + m12;
+                double vx1 = m00 * px1 + m01 * py1 + m02;
+                double vy1 = m10 * px1 + m11 * py1 + m12;
+                int32_t ix0 = armv7_lrint(vx0), iy0 = armv7_lrint(vy0);
+                int32_t ix1 = armv7_lrint(vx1), iy1 = armv7_lrint(vy1);
+                dst[i + 0].x = ix0; dst[i + 0].y = iy0;
+                dst[i + 1].x = ix1; dst[i + 1].y = iy1;
+                oor |= ((uint32_t) ix0 + bias) | ((uint32_t) iy0 + bias) |
+                       ((uint32_t) ix1 + bias) | ((uint32_t) iy1 + bias);
+            }
+            for (; i < n; i++) {
+                double px = pt[i].x, py = pt[i].y;
+                int32_t ix = armv7_lrint(m00 * px + m01 * py + m02);
+                int32_t iy = armv7_lrint(m10 * px + m11 * py + m12);
+                dst[i].x = ix;
+                dst[i].y = iy;
+                oor |= ((uint32_t) ix + bias) | ((uint32_t) iy + bias);
+            }
         }
-        dst[i].x = ass_lrint(v[0]);
-        dst[i].y = ass_lrint(v[1]);
+        if (oor & mask)
+            i = 0;
+    }
+#endif
+    if (i < n && m[0][1] == 0.0 && m[1][0] == 0.0) {
+        double m00 = m[0][0], m02 = m[0][2], m11 = m[1][1], m12 = m[1][2];
+        for (; i < n; i++) {
+            double vx = m00 * pt[i].x + m02;
+            double vy = m11 * pt[i].y + m12;
+            if (!(fabs(vx) < OUTLINE_MAX && fabs(vy) < OUTLINE_MAX)) {
+                ass_outline_free(outline);
+                return false;
+            }
+            dst[i].x = ass_lrint(vx);
+            dst[i].y = ass_lrint(vy);
+        }
+    } else {
+        for (; i < n; i++) {
+            double vx = m[0][0] * pt[i].x + m[0][1] * pt[i].y + m[0][2];
+            double vy = m[1][0] * pt[i].x + m[1][1] * pt[i].y + m[1][2];
+            if (!(fabs(vx) < OUTLINE_MAX && fabs(vy) < OUTLINE_MAX)) {
+                ass_outline_free(outline);
+                return false;
+            }
+            dst[i].x = ass_lrint(vx);
+            dst[i].y = ass_lrint(vy);
+        }
     }
     memcpy(outline->segments, source->segments, source->n_segments);
     outline->n_points = source->n_points;
@@ -804,6 +896,50 @@ static bool outline_transform_3d(ASS_Outline *outline, const ASS_Outline *source
     if ((vgetq_lane_u64(vok, 0) & vgetq_lane_u64(vok, 1)) != ~UINT64_C(0)) {
         ass_outline_free(outline);
         return false;
+    }
+#endif
+#if defined(ASS_ARMV7_VFP_LRINT)
+    if (fabs(m[0][0]) < 1e100 && fabs(m[0][1]) < 1e100 && fabs(m[0][2]) < 1e100 &&
+        fabs(m[1][0]) < 1e100 && fabs(m[1][1]) < 1e100 && fabs(m[1][2]) < 1e100 &&
+        fabs(m[2][0]) < 1e100 && fabs(m[2][1]) < 1e100 && fabs(m[2][2]) < 1e100) {
+        const uint32_t bias = (uint32_t) 1 << 27;
+        const uint32_t mask = ~((uint32_t) OUTLINE_MAX);
+        uint32_t oor = 0;
+        double m00 = m[0][0], m01 = m[0][1], m02 = m[0][2];
+        double m10 = m[1][0], m11 = m[1][1], m12 = m[1][2];
+        double m20 = m[2][0], m21 = m[2][1], m22 = m[2][2];
+        for (; i + 2 <= n; i += 2) {
+            double px0 = pt[i + 0].x, py0 = pt[i + 0].y;
+            double px1 = pt[i + 1].x, py1 = pt[i + 1].y;
+            double vz0 = m20 * px0 + m21 * py0 + m22;
+            double vz1 = m20 * px1 + m21 * py1 + m22;
+            double nx0 = m00 * px0 + m01 * py0 + m02;
+            double ny0 = m10 * px0 + m11 * py0 + m12;
+            double nx1 = m00 * px1 + m01 * py1 + m02;
+            double ny1 = m10 * px1 + m11 * py1 + m12;
+            double w0 = 1.0 / (vz0 > 0.1 ? vz0 : 0.1);
+            double w1 = 1.0 / (vz1 > 0.1 ? vz1 : 0.1);
+            int32_t ix0 = armv7_lrint(nx0 * w0);
+            int32_t iy0 = armv7_lrint(ny0 * w0);
+            int32_t ix1 = armv7_lrint(nx1 * w1);
+            int32_t iy1 = armv7_lrint(ny1 * w1);
+            dst[i + 0].x = ix0; dst[i + 0].y = iy0;
+            dst[i + 1].x = ix1; dst[i + 1].y = iy1;
+            oor |= ((uint32_t) ix0 + bias) | ((uint32_t) iy0 + bias) |
+                   ((uint32_t) ix1 + bias) | ((uint32_t) iy1 + bias);
+        }
+        for (; i < n; i++) {
+            double px = pt[i].x, py = pt[i].y;
+            double vz = m20 * px + m21 * py + m22;
+            double w = 1.0 / (vz > 0.1 ? vz : 0.1);
+            int32_t ix = armv7_lrint((m00 * px + m01 * py + m02) * w);
+            int32_t iy = armv7_lrint((m10 * px + m11 * py + m12) * w);
+            dst[i].x = ix;
+            dst[i].y = iy;
+            oor |= ((uint32_t) ix + bias) | ((uint32_t) iy + bias);
+        }
+        if (oor & mask)
+            i = 0;
     }
 #endif
     for (; i < n; i++) {
