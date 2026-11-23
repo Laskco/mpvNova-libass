@@ -19,7 +19,7 @@
 #include "config.h"
 #include "ass_compat.h"
 
-#if defined(__aarch64__) && defined(__ARM_NEON)
+#if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
 
@@ -644,6 +644,15 @@ bool ass_outline_transform_2d_reuse(ASS_Outline *outline, const ASS_Outline *sou
     return outline_transform_2d(outline, source, m, true);
 }
 
+static inline int32_t outline_round(double x)
+{
+#if defined(ASS_ARMV7_VFP_LRINT)
+    return armv7_lrint(x);
+#else
+    return ass_lrint(x);
+#endif
+}
+
 static inline bool append_affine_point(ASS_Outline *outline, ASS_Vector p,
                                        const double m[2][3])
 {
@@ -651,8 +660,155 @@ static inline bool append_affine_point(ASS_Outline *outline, ASS_Vector p,
     double y = m[1][0] * p.x + m[1][1] * p.y + m[1][2];
     if (!(fabs(x) < OUTLINE_MAX && fabs(y) < OUTLINE_MAX))
         return false;
-    outline->points[outline->n_points++] = (ASS_Vector) {ass_lrint(x), ass_lrint(y)};
+    outline->points[outline->n_points++] = (ASS_Vector) {outline_round(x), outline_round(y)};
     return true;
+}
+
+static inline void compute_points_hull(const ASS_Vector *pt, size_t n, ASS_Rect *hull)
+{
+    int32_t x_min = INT32_MAX, y_min = INT32_MAX;
+    int32_t x_max = INT32_MIN, y_max = INT32_MIN;
+    size_t i = 0;
+#if defined(__ARM_NEON)
+    if (n >= 4) {
+        int32x4x2_t p0 = vld2q_s32((const int32_t *) pt);
+        int32x4_t vminx = p0.val[0], vmaxx = p0.val[0];
+        int32x4_t vminy = p0.val[1], vmaxy = p0.val[1];
+        for (i = 4; i + 4 <= n; i += 4) {
+            int32x4x2_t p = vld2q_s32((const int32_t *) (pt + i));
+            vminx = vminq_s32(vminx, p.val[0]);
+            vmaxx = vmaxq_s32(vmaxx, p.val[0]);
+            vminy = vminq_s32(vminy, p.val[1]);
+            vmaxy = vmaxq_s32(vmaxy, p.val[1]);
+        }
+        int32x2_t minx2 = vmin_s32(vget_low_s32(vminx), vget_high_s32(vminx));
+        int32x2_t maxx2 = vmax_s32(vget_low_s32(vmaxx), vget_high_s32(vmaxx));
+        int32x2_t miny2 = vmin_s32(vget_low_s32(vminy), vget_high_s32(vminy));
+        int32x2_t maxy2 = vmax_s32(vget_low_s32(vmaxy), vget_high_s32(vmaxy));
+        minx2 = vpmin_s32(minx2, minx2);
+        maxx2 = vpmax_s32(maxx2, maxx2);
+        miny2 = vpmin_s32(miny2, miny2);
+        maxy2 = vpmax_s32(maxy2, maxy2);
+        x_min = vget_lane_s32(minx2, 0);
+        x_max = vget_lane_s32(maxx2, 0);
+        y_min = vget_lane_s32(miny2, 0);
+        y_max = vget_lane_s32(maxy2, 0);
+    }
+#endif
+    for (; i < n; i++) {
+        int32_t x = pt[i].x, y = pt[i].y;
+        if (x < x_min) x_min = x;
+        if (x > x_max) x_max = x;
+        if (y < y_min) y_min = y;
+        if (y > y_max) y_max = y;
+    }
+    hull->x_min = x_min;
+    hull->y_min = y_min;
+    hull->x_max = x_max;
+    hull->y_max = y_max;
+}
+
+static void transform_affine_checked(ASS_Vector *dst, const ASS_Vector *pt, size_t n,
+                                     const double m[2][3], bool axis_aligned, bool float_safe)
+{
+    size_t i = 0;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    (void) float_safe;
+    if (axis_aligned) {
+        float64x2_t vm00 = vdupq_n_f64(m[0][0]);
+        float64x2_t vm02 = vdupq_n_f64(m[0][2]);
+        float64x2_t vm11 = vdupq_n_f64(m[1][1]);
+        float64x2_t vm12 = vdupq_n_f64(m[1][2]);
+        for (; i + 4 <= n; i += 4) {
+            int32x4x2_t p = vld2q_s32((const int32_t *) (pt + i));
+            float64x2_t vx0 = vfmaq_f64(vm02, vm00, vcvtq_f64_s64(vmovl_s32(vget_low_s32(p.val[0]))));
+            float64x2_t vy0 = vfmaq_f64(vm12, vm11, vcvtq_f64_s64(vmovl_s32(vget_low_s32(p.val[1]))));
+            float64x2_t vx1 = vfmaq_f64(vm02, vm00, vcvtq_f64_s64(vmovl_high_s32(p.val[0])));
+            float64x2_t vy1 = vfmaq_f64(vm12, vm11, vcvtq_f64_s64(vmovl_high_s32(p.val[1])));
+            int32x4x2_t out;
+            out.val[0] = vcombine_s32(vmovn_s64(vcvtnq_s64_f64(vx0)), vmovn_s64(vcvtnq_s64_f64(vx1)));
+            out.val[1] = vcombine_s32(vmovn_s64(vcvtnq_s64_f64(vy0)), vmovn_s64(vcvtnq_s64_f64(vy1)));
+            vst2q_s32((int32_t *) (dst + i), out);
+        }
+    } else {
+        float64x2_t vm00 = vdupq_n_f64(m[0][0]), vm01 = vdupq_n_f64(m[0][1]), vm02 = vdupq_n_f64(m[0][2]);
+        float64x2_t vm10 = vdupq_n_f64(m[1][0]), vm11 = vdupq_n_f64(m[1][1]), vm12 = vdupq_n_f64(m[1][2]);
+        for (; i + 4 <= n; i += 4) {
+            int32x4x2_t p = vld2q_s32((const int32_t *) (pt + i));
+            float64x2_t fx0 = vcvtq_f64_s64(vmovl_s32(vget_low_s32(p.val[0])));
+            float64x2_t fy0 = vcvtq_f64_s64(vmovl_s32(vget_low_s32(p.val[1])));
+            float64x2_t fx1 = vcvtq_f64_s64(vmovl_high_s32(p.val[0]));
+            float64x2_t fy1 = vcvtq_f64_s64(vmovl_high_s32(p.val[1]));
+            float64x2_t vx0 = vfmaq_f64(vfmaq_f64(vm02, vm00, fx0), vm01, fy0);
+            float64x2_t vy0 = vfmaq_f64(vfmaq_f64(vm12, vm10, fx0), vm11, fy0);
+            float64x2_t vx1 = vfmaq_f64(vfmaq_f64(vm02, vm00, fx1), vm01, fy1);
+            float64x2_t vy1 = vfmaq_f64(vfmaq_f64(vm12, vm10, fx1), vm11, fy1);
+            int32x4x2_t out;
+            out.val[0] = vcombine_s32(vmovn_s64(vcvtnq_s64_f64(vx0)), vmovn_s64(vcvtnq_s64_f64(vx1)));
+            out.val[1] = vcombine_s32(vmovn_s64(vcvtnq_s64_f64(vy0)), vmovn_s64(vcvtnq_s64_f64(vy1)));
+            vst2q_s32((int32_t *) (dst + i), out);
+        }
+    }
+#elif defined(__arm__) && defined(__ARM_NEON)
+    if (float_safe) {
+        uint32x4_t vsign = vdupq_n_u32(0x80000000u);
+        uint32x4_t vhalf = vreinterpretq_u32_f32(vdupq_n_f32(0.5f));
+        if (axis_aligned) {
+            float32x4_t vm00 = vdupq_n_f32((float) m[0][0]);
+            float32x4_t vm02 = vdupq_n_f32((float) m[0][2]);
+            float32x4_t vm11 = vdupq_n_f32((float) m[1][1]);
+            float32x4_t vm12 = vdupq_n_f32((float) m[1][2]);
+            for (; i + 4 <= n; i += 4) {
+                int32x4x2_t p = vld2q_s32((const int32_t *) (pt + i));
+                float32x4_t vx = vmlaq_f32(vm02, vm00, vcvtq_f32_s32(p.val[0]));
+                float32x4_t vy = vmlaq_f32(vm12, vm11, vcvtq_f32_s32(p.val[1]));
+                float32x4_t rx = vreinterpretq_f32_u32(vorrq_u32(vandq_u32(vreinterpretq_u32_f32(vx), vsign), vhalf));
+                float32x4_t ry = vreinterpretq_f32_u32(vorrq_u32(vandq_u32(vreinterpretq_u32_f32(vy), vsign), vhalf));
+                int32x4x2_t out;
+                out.val[0] = vcvtq_s32_f32(vaddq_f32(vx, rx));
+                out.val[1] = vcvtq_s32_f32(vaddq_f32(vy, ry));
+                vst2q_s32((int32_t *) (dst + i), out);
+            }
+        } else {
+            float32x4_t vm00 = vdupq_n_f32((float) m[0][0]);
+            float32x4_t vm01 = vdupq_n_f32((float) m[0][1]);
+            float32x4_t vm02 = vdupq_n_f32((float) m[0][2]);
+            float32x4_t vm10 = vdupq_n_f32((float) m[1][0]);
+            float32x4_t vm11 = vdupq_n_f32((float) m[1][1]);
+            float32x4_t vm12 = vdupq_n_f32((float) m[1][2]);
+            for (; i + 4 <= n; i += 4) {
+                int32x4x2_t p = vld2q_s32((const int32_t *) (pt + i));
+                float32x4_t fx = vcvtq_f32_s32(p.val[0]);
+                float32x4_t fy = vcvtq_f32_s32(p.val[1]);
+                float32x4_t vx = vmlaq_f32(vmlaq_f32(vm02, vm00, fx), vm01, fy);
+                float32x4_t vy = vmlaq_f32(vmlaq_f32(vm12, vm10, fx), vm11, fy);
+                float32x4_t rx = vreinterpretq_f32_u32(vorrq_u32(vandq_u32(vreinterpretq_u32_f32(vx), vsign), vhalf));
+                float32x4_t ry = vreinterpretq_f32_u32(vorrq_u32(vandq_u32(vreinterpretq_u32_f32(vy), vsign), vhalf));
+                int32x4x2_t out;
+                out.val[0] = vcvtq_s32_f32(vaddq_f32(vx, rx));
+                out.val[1] = vcvtq_s32_f32(vaddq_f32(vy, ry));
+                vst2q_s32((int32_t *) (dst + i), out);
+            }
+        }
+    }
+#else
+    (void) float_safe;
+#endif
+    if (axis_aligned) {
+        double m00 = m[0][0], m02 = m[0][2], m11 = m[1][1], m12 = m[1][2];
+        for (; i < n; i++) {
+            dst[i].x = outline_round(m00 * pt[i].x + m02);
+            dst[i].y = outline_round(m11 * pt[i].y + m12);
+        }
+    } else {
+        double m00 = m[0][0], m01 = m[0][1], m02 = m[0][2];
+        double m10 = m[1][0], m11 = m[1][1], m12 = m[1][2];
+        for (; i < n; i++) {
+            double px = pt[i].x, py = pt[i].y;
+            dst[i].x = outline_round(m00 * px + m01 * py + m02);
+            dst[i].y = outline_round(m10 * px + m11 * py + m12);
+        }
+    }
 }
 
 static bool reserve_temporary_outline(ASS_Outline *outline, size_t points, size_t segments)
@@ -702,24 +858,28 @@ bool ass_outline_transform_2d_clipped(ASS_Outline *outline, const ASS_Outline *s
         local_clip.y_max = FFMINMAX(ceil(FFMAX(y0, y1)) + 1, -OUTLINE_MAX, OUTLINE_MAX);
     }
 
+    bool small_matrix = fabs(m[0][0]) < 16.0 && fabs(m[0][1]) < 16.0 &&
+                        fabs(m[1][0]) < 16.0 && fabs(m[1][1]) < 16.0 &&
+                        fabs(m[0][2]) < (double) (1 << 21) &&
+                        fabs(m[1][2]) < (double) (1 << 21);
+
     size_t point = 0, segment = 0;
     while (segment < source->n_segments) {
         size_t first_point = point, first_segment = segment;
-        ASS_Rect hull;
-        rectangle_reset(&hull);
         bool closed = false;
         do {
             unsigned flags = source->segments[segment++];
             unsigned count = flags & OUTLINE_COUNT_MASK;
             if (count < 1 || count > 3 || count > source->n_points - point)
                 goto invalid;
-            for (unsigned j = 0; j < count; j++) {
-                ASS_Vector p = source->points[point++];
-                rectangle_update(&hull, p.x, p.y, p.x, p.y);
-            }
+            point += count;
             closed = flags & OUTLINE_CONTOUR_END;
         } while (!closed && segment < source->n_segments);
         if (!closed) goto invalid;
+
+        size_t n_pts = point - first_point;
+        ASS_Rect hull;
+        compute_points_hull(source->points + first_point, n_pts, &hull);
 
         // An affine transform maps the control hull inside this corner box.
         // Only reject closed contours wholly outside the padded clip.
@@ -730,7 +890,7 @@ bool ass_outline_transform_2d_clipped(ASS_Outline *outline, const ASS_Outline *s
             int32_t y = corner & 2 ? hull.y_max : hull.y_min;
             for (int k = 0; k < 2; k++) {
                 double v = m[k][0] * x + m[k][1] * y + m[k][2];
-                if (!(fabs(v) < OUTLINE_MAX)) {
+                if (!(fabs(v) < OUTLINE_MAX - 1)) {
                     ass_outline_free(outline);
                     return ass_outline_transform_2d(outline, source, m);
                 }
@@ -744,7 +904,17 @@ bool ass_outline_transform_2d_clipped(ASS_Outline *outline, const ASS_Outline *s
             lower[1] > (double) clip->y_max * 64 + 1)
             continue;
 
-        if (axis_aligned) {
+        bool float_safe = small_matrix &&
+            hull.x_min > -(1 << 20) && hull.x_max < (1 << 20) &&
+            hull.y_min > -(1 << 20) && hull.y_max < (1 << 20) &&
+            lower[0] > -(1 << 21) && upper[0] < (1 << 21) &&
+            lower[1] > -(1 << 21) && upper[1] < (1 << 21);
+
+        bool fully_inside = axis_aligned &&
+            hull.x_min >= local_clip.x_min && hull.x_max <= local_clip.x_max &&
+            hull.y_min >= local_clip.y_min && hull.y_max <= local_clip.y_max;
+
+        if (axis_aligned && !fully_inside) {
             // A run sharing an outside half-plane can be replaced by its
             // endpoint connection without changing winding inside the clip.
             unsigned pending_sides = 0;
@@ -792,8 +962,10 @@ bool ass_outline_transform_2d_clipped(ASS_Outline *outline, const ASS_Outline *s
             if (outline->n_segments > first_output)
                 outline->segments[outline->n_segments - 1] |= OUTLINE_CONTOUR_END;
         } else {
-            for (size_t i = first_point; i < point; i++)
-                if (!append_affine_point(outline, source->points[i], m)) goto invalid;
+            transform_affine_checked(outline->points + outline->n_points,
+                                     source->points + first_point, n_pts,
+                                     m, axis_aligned, float_safe);
+            outline->n_points += n_pts;
             size_t count = segment - first_segment;
             memcpy(outline->segments + outline->n_segments,
                    source->segments + first_segment, count);
