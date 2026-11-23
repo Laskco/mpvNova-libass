@@ -120,7 +120,8 @@ static bool render_context_init(RenderContext *state, ASS_Renderer *priv)
     if (!(state->shaper = ass_shaper_new(priv->cache.metrics_cache, priv->cache.face_size_metrics_cache)))
         return false;
 
-    int tolerance = priv->experimental_edges ? 2 * RASTERIZER_PRECISION : RASTERIZER_PRECISION;
+    int tolerance = priv->experimental_edges >= 2 ? 4 * RASTERIZER_PRECISION :
+                    (priv->experimental_edges ? 2 * RASTERIZER_PRECISION : RASTERIZER_PRECISION);
     return ass_rasterizer_init(&priv->engine, &state->rasterizer, tolerance);
 }
 
@@ -163,9 +164,10 @@ ASS_Renderer *ass_renderer_init(ASS_Library *library)
     priv->library = library;
     priv->ftlibrary = ft;
     const char *edges = getenv("LIBASS_EXPERIMENTAL_EDGES");
-    priv->experimental_edges = edges && !strcmp(edges, "1");
+    priv->experimental_edges = edges ? (!strcmp(edges, "2") ? 2 : (!strcmp(edges, "1") ? 1 : 0)) : 0;
     if (priv->experimental_edges)
-        ass_msg(library, MSGL_INFO, "Experimental ASS edge processing enabled");
+        ass_msg(library, MSGL_INFO, "Experimental ASS edge processing enabled (level %d)",
+                priv->experimental_edges);
     // images_root and related stuff is zero-filled in calloc
 
     unsigned flags = ASS_CPU_FLAG_ALL;
@@ -544,7 +546,7 @@ render_glyph(RenderContext *state, Bitmap *bm, int dst_x, int dst_y,
 
 static bool quantize_transform(double m[3][3], ASS_Vector *pos,
                                ASS_DVector *offset, bool first,
-                               BitmapHashKey *key)
+                               bool coarse_pos, BitmapHashKey *key)
 {
     // Full transform:
     // x_out = (m_xx * x + m_xy * y + m_xz) / z,
@@ -679,6 +681,10 @@ static bool quantize_transform(double m[3][3], ASS_Vector *pos,
         qm[2][j] = ass_lrint(val);
     }
 
+    if (coarse_pos) {
+        qr[0] = (qr[0] + (1 << (SUBPIXEL_ORDER - 1))) & ~((1 << SUBPIXEL_ORDER) - 1);
+        qr[1] = (qr[1] + (1 << (SUBPIXEL_ORDER - 1))) & ~((1 << SUBPIXEL_ORDER) - 1);
+    }
     if (first && offset) {
         offset->x = center[0] - qr[0];
         offset->y = center[1] - qr[1];
@@ -769,7 +775,7 @@ static Bitmap *get_vector_clip(RenderContext *state, ASS_Vector *pos,
     BitmapHashKey key = {0};
     key.outline = ass_cache_get(render_priv->cache.outline_cache, &ol_key, render_priv);
     if (!key.outline || !key.outline->valid ||
-            !quantize_transform(m, pos, NULL, true, &key))
+            !quantize_transform(m, pos, NULL, true, render_priv->experimental_edges >= 2, &key))
         return NULL;
 
     // Bound vector-clip rasterization to the screen (and quantized target
@@ -1618,8 +1624,9 @@ static void set_bitmap_clip(RenderContext *state, GlyphInfo *info,
     double r2x = restore_blur(filter->blur_x);
     double r2y = restore_blur(filter->blur_y);
     if (r2x > 0.001 || r2y > 0.001) {
-        ass_gaussian_blur_bounds(r2x, &pad_x, &align_x);
-        ass_gaussian_blur_bounds(r2y, &pad_y, &align_y);
+        bool fast_blur = state->renderer->experimental_edges >= 2;
+        ass_gaussian_blur_bounds(r2x, fast_blur, &pad_x, &align_x);
+        ass_gaussian_blur_bounds(r2y, fast_blur, &pad_y, &align_y);
     }
     pad_x += info->be + 6;
     pad_y += info->be + 6;
@@ -1662,7 +1669,7 @@ get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
 
     BitmapHashKey key = {0};
     key.outline = info->outline;
-    if (!quantize_transform(m, pos, offset, first, &key))
+    if (!quantize_transform(m, pos, offset, first, render_priv->experimental_edges >= 2, &key))
         return;
 
     set_bitmap_clip(state, info, *pos, &key, filter);
@@ -1787,7 +1794,7 @@ get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
 
     key.outline = ass_cache_get(render_priv->cache.outline_cache, &ol_key, render_priv);
     if (!key.outline || !key.outline->valid ||
-            !quantize_transform(m, pos_o, offset, false, &key))
+            !quantize_transform(m, pos_o, offset, false, render_priv->experimental_edges >= 2, &key))
         return;
 
     set_bitmap_clip(state, info, *pos_o, &key, filter);
@@ -2347,11 +2354,18 @@ static bool parse_events(RenderContext *state, ASS_Event *event)
         // this affects render_context
         unsigned code = 0;
         while (*p) {
-            if ((*p == '{') && (q = strchr(p, '}'))) {
-                p = ass_parse_tags(state, p, q, 1., false);
-                assert(*p == '}');
-                p++;
-            } else if (state->drawing_scale) {
+            if (*p == '{') {
+                q = p + 1;
+                while (*q && *q != '}')
+                    q++;
+                if (*q == '}') {
+                    p = ass_parse_tags(state, p, q, 1., false);
+                    assert(*p == '}');
+                    p++;
+                    continue;
+                }
+            }
+            if (state->drawing_scale) {
                 q = p;
                 if (*p == '{')
                     q++;
@@ -2743,8 +2757,9 @@ static void set_composite_viewport(RenderContext *state, CombinedBitmapInfo *inf
     if (!isfinite(r2x) || !isfinite(r2y) || r2x > 65536 || r2y > 65536)
         return;
     int px = 0, py = 0, ax = 1, ay = 1;
-    ass_gaussian_blur_bounds(r2x, &px, &ax);
-    ass_gaussian_blur_bounds(r2y, &py, &ay);
+    bool fast_blur = renderer->experimental_edges >= 2;
+    ass_gaussian_blur_bounds(r2x, fast_blur, &px, &ax);
+    ass_gaussian_blur_bounds(r2y, fast_blur, &py, &ay);
     int64_t pad_x = px + info->filter.be + 4 + llabs((int64_t)info->filter.shadow.x) / 64;
     int64_t pad_y = py + info->filter.be + 4 + llabs((int64_t)info->filter.shadow.y) / 64;
     int64_t vis_x0 = 0;
@@ -3549,7 +3564,13 @@ ass_start_frame(ASS_Renderer *render_priv, ASS_Track *track,
 typedef struct {
     int event_index;
     unsigned lane;
+    uint32_t cost_us;
 } EventTask;
+
+typedef struct {
+    const ASS_Event *event;
+    uint32_t cost_us;
+} EventCostHint;
 
 typedef struct {
     uint64_t range; // low 32 bits = head, high 32 bits = tail
@@ -3577,6 +3598,12 @@ typedef struct {
     bool prepared;
 } EventWorker;
 
+typedef struct {
+    BlurSliceFunc *fn;
+    void *ctx;
+    unsigned lanes;
+} BlurSliceTask;
+
 struct ass_event_pool {
     ASS_Renderer *owner;
     EventWorker workers[3];
@@ -3586,8 +3613,9 @@ struct ass_event_pool {
     int count, pending;
     bool stop, event_ready, legacy_events, cache_split;
     unsigned job_mask;
-    enum { JOB_IDLE, JOB_EVENTS, JOB_VERTICAL, JOB_PREPARE } job_kind;
+    enum { JOB_IDLE, JOB_EVENTS, JOB_VERTICAL, JOB_SLICE, JOB_PREPARE } job_kind;
     VerticalTask vertical;
+    BlurSliceTask slice;
     EventTask *events;
     int *lane_slots;
     LaneDeque lanes[4];
@@ -3596,6 +3624,9 @@ struct ass_event_pool {
     size_t worker_glyph_limit, worker_bitmap_limit, worker_composite_limit;
     int serial_frames;
     unsigned lane_shift;
+    bool measure_events;
+    const ASS_Track *cost_track;
+    EventCostHint cost_hints[256];
 };
 
 static void set_pool_cache_limits(struct ass_event_pool *pool, size_t glyphs,
@@ -3744,6 +3775,7 @@ static int steal_task(struct ass_event_pool *pool, int self_id)
 static uint64_t event_batch(struct ass_event_pool *pool, ASS_Renderer *renderer, int id)
 {
     uint64_t start = fle_clock();
+    bool measure = pool->measure_events;
     for (;;) {
         int pos = lane_pop_head(&pool->lanes[id]);
         if (pos < 0) {
@@ -3754,8 +3786,14 @@ static uint64_t event_batch(struct ass_event_pool *pool, ASS_Renderer *renderer,
         int slot = pool->lane_slots[pos];
         ASS_Event *event = pool->owner->track->events + pool->events[slot].event_index;
         EventImages *out = pool->owner->eimg + slot;
+        uint64_t ev_start = measure ? fle_clock() : 0;
         if (!ass_render_event(&renderer->state, event, out))
             out->event = NULL;
+        if (measure) {
+            uint64_t elapsed = event_elapsed_ns(ev_start, fle_clock());
+            pool->events[slot].cost_us = elapsed == UINT64_MAX ? 0 :
+                (uint32_t) FFMIN(elapsed >> 10, UINT32_MAX);
+        }
     }
     return event_elapsed_ns(start, fle_clock());
 }
@@ -3800,6 +3838,8 @@ static void *event_worker(void *arg)
         ass_msg_buffer_begin(&worker->messages, pool->owner->library);
         if (pool->job_kind == JOB_VERTICAL)
             vertical_batch(&pool->vertical, worker->id);
+        else if (pool->job_kind == JOB_SLICE)
+            pool->slice.fn(pool->slice.ctx, worker->id, pool->slice.lanes);
         else if (pool->job_kind == JOB_PREPARE)
             worker->prepared = ass_clone_render_settings(worker->renderer,
                     pool->owner, &worker->font_generation, &worker->render_id);
@@ -4006,7 +4046,7 @@ bool ass_run_vertical_filter(ASS_Renderer *renderer, FilterFunc *plain,
         !src || !dst || src == dst || !!plain == !!param_filter ||
         (param_filter && !coeff))
         return false;
-    if (width < 128 * 1024 && src_h < (128 * 1024 + width - 1) / width)
+    if (width < 64 * 1024 && src_h < (64 * 1024 + width - 1) / width)
         return false;
     size_t stripe = (size_t) 1 << (renderer->engine.align_order - 1);
     if (width > SIZE_MAX - (stripe - 1))
@@ -4044,6 +4084,42 @@ bool ass_run_vertical_filter(ASS_Renderer *renderer, FilterFunc *plain,
     return true;
 }
 
+bool ass_run_blur_slices(ASS_Renderer *renderer, BlurSliceFunc *fn, void *ctx,
+                         size_t items, size_t width, size_t height)
+{
+    if (renderer->is_event_worker || !fn || items < 2 || !width || !height)
+        return false;
+    if (width < 64 * 1024 && height < (64 * 1024 + width - 1) / width)
+        return false;
+    struct ass_event_pool *pool = renderer->event_pool;
+    if (pool && pool->job_kind != JOB_IDLE)
+        return false;
+    const char *value = getenv("LIBASS_RENDER_THREADS");
+    if (value && atoi(value) <= 1)
+        return false;
+    if (!pool) {
+        pool = event_pool_init(renderer);
+        if (!pool)
+            return false;
+        renderer->event_pool = pool;
+    }
+    unsigned lanes = (unsigned) FFMIN(items, (size_t) pool->count + 1);
+    pthread_mutex_lock(&pool->lock);
+    pool->slice = (BlurSliceTask) {fn, ctx, lanes};
+    pool->job_kind = JOB_SLICE;
+    start_worker_job(pool, (1U << lanes) - 1);
+    pthread_mutex_unlock(&pool->lock);
+    fn(ctx, 0, lanes);
+    pthread_mutex_lock(&pool->lock);
+    while (pool->pending)
+        pthread_cond_wait(&pool->done, &pool->lock);
+    pool->job_kind = JOB_IDLE;
+    memset(&pool->slice, 0, sizeof(pool->slice));
+    pthread_mutex_unlock(&pool->lock);
+    drain_worker_messages(pool);
+    return true;
+}
+
 static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
                                    long long now, int *rendered)
 {
@@ -4057,7 +4133,7 @@ static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
         ASS_Event *event = track->events + i;
         if (event->Start <= now && now < event->Start + event->Duration) {
             if (pool && active < pool->capacity)
-                pool->events[active] = (EventTask) {i, 0};
+                pool->events[active] = (EventTask) {i, 0, 0};
             active++;
         }
     }
@@ -4118,15 +4194,85 @@ static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
         for (int i = 0; i < track->n_events; i++) {
             ASS_Event *event = track->events + i;
             if (event->Start <= now && now < event->Start + event->Duration)
-                pool->events[index++] = (EventTask) {i, 0};
+                pool->events[index++] = (EventTask) {i, 0, 0};
         }
     }
     int n_lanes = pool->count + 1;
     int lane_counts[4] = {0, 0, 0, 0};
-    for (int i = 0; i < active; i++) {
-        unsigned lane = event_worker_lane(pool, track->events + pool->events[i].event_index);
-        pool->events[i].lane = lane;
-        lane_counts[lane]++;
+    pool->measure_events = active <= 64;
+    if (pool->cost_track != track) {
+        memset(pool->cost_hints, 0, sizeof(pool->cost_hints));
+        pool->cost_track = track;
+    }
+    bool use_lpt = false;
+    int order[64];
+    if (active <= 64) {
+        uint64_t lane_load[4] = {0, 0, 0, 0};
+        uint64_t total_load = 0;
+        uint32_t max_ev = 0;
+        int known = 0;
+        for (int i = 0; i < active; i++) {
+            ASS_Event *ev = track->events + pool->events[i].event_index;
+            unsigned lane = event_worker_lane(pool, ev);
+            pool->events[i].lane = lane;
+            const EventCostHint *h = pool->cost_hints + ((unsigned) ev->ReadOrder & 255);
+            uint32_t cost = 0;
+            if (h->event == ev) {
+                cost = h->cost_us;
+                known++;
+            }
+            pool->events[i].cost_us = cost;
+            lane_load[lane] += cost;
+            total_load += cost;
+            if (cost > max_ev)
+                max_ev = cost;
+            order[i] = i;
+        }
+        if (max_ev >= 2000 && known * 4 >= active * 3) {
+            use_lpt = true;
+            // Insertion sort active indices by descending previous render cost.
+            for (int i = 1; i < active; i++) {
+                int idx = order[i];
+                uint32_t c = pool->events[idx].cost_us;
+                int j = i - 1;
+                while (j >= 0 && pool->events[order[j]].cost_us < c) {
+                    order[j + 1] = order[j];
+                    j--;
+                }
+                order[j + 1] = idx;
+            }
+            uint64_t max_load = 0;
+            for (int l = 0; l < n_lanes; l++)
+                if (lane_load[l] > max_load)
+                    max_load = lane_load[l];
+            // Rebalance with greedy LPT only when default affinity is significantly skewed.
+            if (max_load > 8000 && max_load * (uint64_t) n_lanes * 4 > total_load * 5) {
+                uint64_t lpt_load[4] = {0, 0, 0, 0};
+                for (int k = 0; k < active; k++) {
+                    int idx = order[k];
+                    unsigned pref = pool->events[idx].lane;
+                    unsigned best = pref;
+                    uint64_t best_load = lpt_load[pref];
+                    for (int l = 0; l < n_lanes; l++) {
+                        if (lpt_load[l] < best_load) {
+                            best = (unsigned) l;
+                            best_load = lpt_load[l];
+                        }
+                    }
+                    pool->events[idx].lane = best;
+                    uint32_t c = pool->events[idx].cost_us;
+                    lpt_load[best] += c ? c : 250;
+                }
+            }
+        }
+        for (int i = 0; i < active; i++)
+            lane_counts[pool->events[i].lane]++;
+    } else {
+        for (int i = 0; i < active; i++) {
+            unsigned lane = event_worker_lane(pool, track->events + pool->events[i].event_index);
+            pool->events[i].lane = lane;
+            lane_counts[lane]++;
+        }
     }
     int lane_pos[4];
     int offset = 0;
@@ -4136,8 +4282,15 @@ static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
         pool->lanes[l].range = ((uint64_t) (uint32_t) end << 32) | (uint32_t) offset;
         offset = end;
     }
-    for (int i = 0; i < active; i++)
-        pool->lane_slots[lane_pos[pool->events[i].lane]++] = i;
+    if (use_lpt) {
+        for (int k = 0; k < active; k++) {
+            int idx = order[k];
+            pool->lane_slots[lane_pos[pool->events[idx].lane]++] = idx;
+        }
+    } else {
+        for (int i = 0; i < active; i++)
+            pool->lane_slots[lane_pos[pool->events[i].lane]++] = i;
+    }
 
     unsigned occupied = 0;
     int active_lanes = 0;
@@ -4205,6 +4358,14 @@ static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
         pthread_cond_wait(&pool->done, &pool->lock);
     pool->job_kind = JOB_IDLE;
     pthread_mutex_unlock(&pool->lock);
+    if (pool->measure_events) {
+        for (int i = 0; i < active; i++) {
+            ASS_Event *ev = track->events + pool->events[i].event_index;
+            EventCostHint *h = pool->cost_hints + ((unsigned) ev->ReadOrder & 255);
+            h->event = ev;
+            h->cost_us = pool->events[i].cost_us;
+        }
+    }
     drain_worker_messages(pool);
     if (restricted) {
         uint64_t work_ns = main_ns;
@@ -4259,6 +4420,14 @@ bool ass_run_vertical_filter(ASS_Renderer *renderer, FilterFunc *plain,
     (void) src_h;
     (void) dst_h;
     (void) coeff;
+    return false;
+}
+
+bool ass_run_blur_slices(ASS_Renderer *renderer, BlurSliceFunc *fn, void *ctx,
+                         size_t items, size_t width, size_t height)
+{
+    (void) renderer; (void) fn; (void) ctx;
+    (void) items; (void) width; (void) height;
     return false;
 }
 #endif

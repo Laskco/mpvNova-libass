@@ -75,12 +75,16 @@ bool ass_rasterizer_init(const BitmapEngine *engine, RasterizerData *rst, int ou
  * \param delta requested size increase
  * \return false on error
  */
-static inline bool check_capacity(RasterizerData *rst, int index, size_t delta)
-{
-    delta += rst->size[index];
-    if (rst->capacity[index] >= delta)
-        return true;
+#if defined(__GNUC__) || defined(__clang__)
+#define ASS_NOINLINE __attribute__((noinline))
+#define ASS_ALWAYS_INLINE static inline __attribute__((always_inline))
+#else
+#define ASS_NOINLINE
+#define ASS_ALWAYS_INLINE static inline
+#endif
 
+static ASS_NOINLINE bool check_capacity_grow(RasterizerData *rst, int index, size_t delta)
+{
     size_t capacity = FFMAX(2 * rst->capacity[index], 64);
     while (capacity < delta)
         capacity *= 2;
@@ -91,6 +95,14 @@ static inline bool check_capacity(RasterizerData *rst, int index, size_t delta)
     rst->linebuf[index] = (struct segment *) ptr;
     rst->capacity[index] = capacity;
     return true;
+}
+
+static inline bool check_capacity(RasterizerData *rst, int index, size_t delta)
+{
+    delta += rst->size[index];
+    if (rst->capacity[index] >= delta)
+        return true;
+    return check_capacity_grow(rst, index, delta);
 }
 
 void ass_rasterizer_done(RasterizerData *rst)
@@ -149,6 +161,17 @@ static inline bool segment_subdivide(const OutlineSegment *seg,
 {
     int32_t x = pt.x - beg.x;
     int32_t y = pt.y - beg.y;
+#if UINTPTR_MAX == UINT32_MAX
+    if (((uint32_t) (seg->r.x + 16384) | (uint32_t) (seg->r.y + 16384) |
+         (uint32_t) (x + 16384) | (uint32_t) (y + 16384)) < 32768U &&
+        seg->er <= 0x3FFFFFFF) {
+        int32_t pdr = seg->r.x * x + seg->r.y * y;
+        int32_t pcr = seg->r.x * y - seg->r.y * x;
+        int32_t er = (int32_t) seg->er;
+        int32_t r2 = (int32_t) seg->r2;
+        return pdr < -er || pdr > r2 + er || (pcr < 0 ? -pcr : pcr) > er;
+    }
+#endif
     int64_t pdr = seg->r.x * (int64_t) x + seg->r.y * (int64_t) y;
     int64_t pcr = seg->r.x * (int64_t) y - seg->r.y * (int64_t) x;
     return pdr < -seg->er || pdr > seg->r2 + seg->er ||
@@ -179,11 +202,68 @@ static void normalize_lines(RasterizerData *rst, size_t first)
         normalize_line(rst->linebuf[0] + i);
 }
 
+static inline bool quad_needs_split(ASS_Vector p0, ASS_Vector p1, ASS_Vector p2,
+                                    int32_t outline_error)
+{
+#if UINTPTR_MAX == UINT32_MAX
+    int32_t dx = p2.x - p0.x;
+    int32_t dy = p2.y - p0.y;
+    int32_t x1 = p1.x - p0.x;
+    int32_t y1 = p1.y - p0.y;
+    if (((uint32_t) (dx + 16384) | (uint32_t) (dy + 16384) |
+         (uint32_t) (x1 + 16384) | (uint32_t) (y1 + 16384)) < 32768U &&
+        outline_error <= 32768) {
+        int32_t abs_x = dx < 0 ? -dx : dx;
+        int32_t abs_y = dy < 0 ? -dy : dy;
+        int32_t r2 = dx * dx + dy * dy;
+        int32_t er = outline_error * (abs_x > abs_y ? abs_x : abs_y);
+        int32_t pdr = dx * x1 + dy * y1;
+        int32_t pcr = dx * y1 - dy * x1;
+        return pdr < -er || pdr > r2 + er || (pcr < 0 ? -pcr : pcr) > er;
+    }
+#endif
+    OutlineSegment seg;
+    segment_init(&seg, p0, p2, outline_error);
+    return segment_subdivide(&seg, p0, p1);
+}
+
+static inline bool cubic_needs_split(ASS_Vector p0, ASS_Vector p1, ASS_Vector p2, ASS_Vector p3,
+                                     int32_t outline_error)
+{
+#if UINTPTR_MAX == UINT32_MAX
+    int32_t dx = p3.x - p0.x;
+    int32_t dy = p3.y - p0.y;
+    int32_t x1 = p1.x - p0.x;
+    int32_t y1 = p1.y - p0.y;
+    int32_t x2 = p2.x - p0.x;
+    int32_t y2 = p2.y - p0.y;
+    if (((uint32_t) (dx + 16384) | (uint32_t) (dy + 16384) |
+         (uint32_t) (x1 + 16384) | (uint32_t) (y1 + 16384) |
+         (uint32_t) (x2 + 16384) | (uint32_t) (y2 + 16384)) < 32768U &&
+        outline_error <= 32768) {
+        int32_t abs_x = dx < 0 ? -dx : dx;
+        int32_t abs_y = dy < 0 ? -dy : dy;
+        int32_t r2 = dx * dx + dy * dy;
+        int32_t er = outline_error * (abs_x > abs_y ? abs_x : abs_y);
+        int32_t pdr1 = dx * x1 + dy * y1;
+        int32_t pcr1 = dx * y1 - dy * x1;
+        if (pdr1 < -er || pdr1 > r2 + er || (pcr1 < 0 ? -pcr1 : pcr1) > er)
+            return true;
+        int32_t pdr2 = dx * x2 + dy * y2;
+        int32_t pcr2 = dx * y2 - dy * x2;
+        return pdr2 < -er || pdr2 > r2 + er || (pcr2 < 0 ? -pcr2 : pcr2) > er;
+    }
+#endif
+    OutlineSegment seg;
+    segment_init(&seg, p0, p3, outline_error);
+    return segment_subdivide(&seg, p0, p1) || segment_subdivide(&seg, p0, p2);
+}
+
 /**
  * \brief Add new segment to polyline
  */
-static inline bool add_line_bbox(RasterizerData *rst, ASS_Vector pt0, ASS_Vector pt1,
-                                 bool normalize, ASS_Rect *bbox)
+ASS_ALWAYS_INLINE bool add_line_bbox(RasterizerData *rst, ASS_Vector pt0, ASS_Vector pt1,
+                                     bool normalize, ASS_Rect *bbox)
 {
     int32_t x = pt1.x - pt0.x;
     int32_t y = pt1.y - pt0.y;
@@ -191,7 +271,7 @@ static inline bool add_line_bbox(RasterizerData *rst, ASS_Vector pt0, ASS_Vector
         return true;
 
     size_t sz = rst->size[0];
-    if (sz >= rst->capacity[0] && !check_capacity(rst, 0, 1))
+    if (sz >= rst->capacity[0] && !check_capacity_grow(rst, 0, sz + 1))
         return false;
     struct segment *line = rst->linebuf[0] + sz;
     rst->size[0] = sz + 1;
@@ -244,87 +324,106 @@ static bool add_line(RasterizerData *rst, ASS_Vector pt0, ASS_Vector pt1,
 }
 
 /**
- * \brief Add quadratic spline to polyline
- * Performs recursive subdivision if necessary.
+ * \brief Add quadratic spline to polyline using iterative subdivision.
  */
-static bool add_quadratic_split(RasterizerData *rst, const ASS_Vector *pt,
-                                bool normalize, ASS_Rect *bbox);
-
-static bool add_quadratic(RasterizerData *rst, const ASS_Vector *pt,
-                          bool normalize, ASS_Rect *bbox)
-{
-    OutlineSegment seg;
-    segment_init(&seg, pt[0], pt[2], rst->outline_error);
-    if (!segment_subdivide(&seg, pt[0], pt[1]))
-        return add_line_bbox(rst, pt[0], pt[2], normalize, bbox);
-    return add_quadratic_split(rst, pt, normalize, bbox);
-}
-
-static bool add_quadratic_split(RasterizerData *rst, const ASS_Vector *pt,
+static bool add_quadratic_split(RasterizerData *rst, const ASS_Vector *pt_in,
                                 bool normalize, ASS_Rect *bbox)
 {
-    ASS_Vector next[5];
-    next[1].x = pt[0].x + pt[1].x;
-    next[1].y = pt[0].y + pt[1].y;
-    next[3].x = pt[1].x + pt[2].x;
-    next[3].y = pt[1].y + pt[2].y;
-    next[2].x = (next[1].x + next[3].x + 2) >> 2;
-    next[2].y = (next[1].y + next[3].y + 2) >> 2;
-    next[1].x >>= 1;
-    next[1].y >>= 1;
-    next[3].x >>= 1;
-    next[3].y >>= 1;
-    next[0] = pt[0];
-    next[4] = pt[2];
-    return add_quadratic(rst, next, normalize, bbox) &&
-           add_quadratic(rst, next + 2, normalize, bbox);
+    // Depth is bounded by log2(OUTLINE_MAX) <= 28, so 64 entries cannot overflow.
+    ASS_Vector stack[64][3];
+    int sp = 0;
+    int32_t err = rst->outline_error;
+    ASS_Vector p0 = pt_in[0], p1 = pt_in[1], p2 = pt_in[2];
+
+    for (;;) {
+        ASS_Vector m01 = { p0.x + p1.x, p0.y + p1.y };
+        ASS_Vector m12 = { p1.x + p2.x, p1.y + p2.y };
+        ASS_Vector mid = { (m01.x + m12.x + 2) >> 2, (m01.y + m12.y + 2) >> 2 };
+        m01.x >>= 1; m01.y >>= 1;
+        m12.x >>= 1; m12.y >>= 1;
+
+        // Push right half first so left half is emitted in exact original order.
+        if (sp < 64) {
+            stack[sp][0] = mid;
+            stack[sp][1] = m12;
+            stack[sp][2] = p2;
+            sp++;
+            p1 = m01;
+            p2 = mid;
+        } else {
+            ASS_Vector left[3]  = { p0, m01, mid };
+            ASS_Vector right[3] = { mid, m12, p2 };
+            if (!add_quadratic_split(rst, left, normalize, bbox) ||
+                !add_quadratic_split(rst, right, normalize, bbox))
+                return false;
+            if (!sp) return true;
+            sp--;
+            p0 = stack[sp][0]; p1 = stack[sp][1]; p2 = stack[sp][2];
+        }
+
+        while (!quad_needs_split(p0, p1, p2, err)) {
+            if (!add_line_bbox(rst, p0, p2, normalize, bbox))
+                return false;
+            if (!sp)
+                return true;
+            sp--;
+            p0 = stack[sp][0]; p1 = stack[sp][1]; p2 = stack[sp][2];
+        }
+    }
 }
 
 /**
- * \brief Add cubic spline to polyline
- * Performs recursive subdivision if necessary.
+ * \brief Add cubic spline to polyline using iterative subdivision.
  */
-static bool add_cubic_split(RasterizerData *rst, const ASS_Vector *pt,
-                            bool normalize, ASS_Rect *bbox);
-
-static bool add_cubic(RasterizerData *rst, const ASS_Vector *pt,
-                      bool normalize, ASS_Rect *bbox)
-{
-    OutlineSegment seg;
-    segment_init(&seg, pt[0], pt[3], rst->outline_error);
-    if (!segment_subdivide(&seg, pt[0], pt[1]) && !segment_subdivide(&seg, pt[0], pt[2]))
-        return add_line_bbox(rst, pt[0], pt[3], normalize, bbox);
-    return add_cubic_split(rst, pt, normalize, bbox);
-}
-
-static bool add_cubic_split(RasterizerData *rst, const ASS_Vector *pt,
+static bool add_cubic_split(RasterizerData *rst, const ASS_Vector *pt_in,
                             bool normalize, ASS_Rect *bbox)
 {
-    ASS_Vector next[7], center;
-    next[1].x = pt[0].x + pt[1].x;
-    next[1].y = pt[0].y + pt[1].y;
-    center.x = pt[1].x + pt[2].x + 2;
-    center.y = pt[1].y + pt[2].y + 2;
-    next[5].x = pt[2].x + pt[3].x;
-    next[5].y = pt[2].y + pt[3].y;
-    next[2].x = next[1].x + center.x;
-    next[2].y = next[1].y + center.y;
-    next[4].x = center.x + next[5].x;
-    next[4].y = center.y + next[5].y;
-    next[3].x = (next[2].x + next[4].x - 1) >> 3;
-    next[3].y = (next[2].y + next[4].y - 1) >> 3;
-    next[2].x >>= 2;
-    next[2].y >>= 2;
-    next[4].x >>= 2;
-    next[4].y >>= 2;
-    next[1].x >>= 1;
-    next[1].y >>= 1;
-    next[5].x >>= 1;
-    next[5].y >>= 1;
-    next[0] = pt[0];
-    next[6] = pt[3];
-    return add_cubic(rst, next, normalize, bbox) &&
-           add_cubic(rst, next + 3, normalize, bbox);
+    ASS_Vector stack[64][4];
+    int sp = 0;
+    int32_t err = rst->outline_error;
+    ASS_Vector p0 = pt_in[0], p1 = pt_in[1], p2 = pt_in[2], p3 = pt_in[3];
+
+    for (;;) {
+        ASS_Vector n1 = { p0.x + p1.x, p0.y + p1.y };
+        ASS_Vector center = { p1.x + p2.x + 2, p1.y + p2.y + 2 };
+        ASS_Vector n5 = { p2.x + p3.x, p2.y + p3.y };
+        ASS_Vector n2 = { n1.x + center.x, n1.y + center.y };
+        ASS_Vector n4 = { center.x + n5.x, center.y + n5.y };
+        ASS_Vector n3 = { (n2.x + n4.x - 1) >> 3, (n2.y + n4.y - 1) >> 3 };
+        n2.x >>= 2; n2.y >>= 2;
+        n4.x >>= 2; n4.y >>= 2;
+        n1.x >>= 1; n1.y >>= 1;
+        n5.x >>= 1; n5.y >>= 1;
+
+        if (sp < 64) {
+            stack[sp][0] = n3;
+            stack[sp][1] = n4;
+            stack[sp][2] = n5;
+            stack[sp][3] = p3;
+            sp++;
+            p1 = n1;
+            p2 = n2;
+            p3 = n3;
+        } else {
+            ASS_Vector left[4]  = { p0, n1, n2, n3 };
+            ASS_Vector right[4] = { n3, n4, n5, p3 };
+            if (!add_cubic_split(rst, left, normalize, bbox) ||
+                !add_cubic_split(rst, right, normalize, bbox))
+                return false;
+            if (!sp) return true;
+            sp--;
+            p0 = stack[sp][0]; p1 = stack[sp][1]; p2 = stack[sp][2]; p3 = stack[sp][3];
+        }
+
+        while (!cubic_needs_split(p0, p1, p2, p3, err)) {
+            if (!add_line_bbox(rst, p0, p3, normalize, bbox))
+                return false;
+            if (!sp)
+                return true;
+            sp--;
+            p0 = stack[sp][0]; p1 = stack[sp][1]; p2 = stack[sp][2]; p3 = stack[sp][3];
+        }
+    }
 }
 
 
@@ -400,8 +499,8 @@ static size_t contour_split32(const ASS_Vector *points, size_t begin,
 #if defined(__ARM_NEON)
 static bool contour_fits32(const ASS_Vector *points, size_t begin, size_t end)
 {
-    if (abs(points[end].x - points[begin].x) > 32700 ||
-        abs(points[end].y - points[begin].y) > 32700)
+    if (abs(points[end].x - points[begin].x) > 32500 ||
+        abs(points[end].y - points[begin].y) > 32500)
         return false;
     int32x4_t extent = vdupq_n_s32(0);
     size_t i = begin + 1;
@@ -418,7 +517,7 @@ static bool contour_fits32(const ASS_Vector *points, size_t begin, size_t end)
         bound = FFMAX(bound, abs(points[i].x - points[begin].x));
         bound = FFMAX(bound, abs(points[i].y - points[begin].y));
     }
-    return bound <= 32700;
+    return bound <= 32500;
 }
 #endif
 #endif
@@ -477,13 +576,13 @@ static bool simplify_contour(RasterizerData *rst, size_t first, int tolerance)
     }
 
 #if UINTPTR_MAX == UINT32_MAX || defined(__aarch64__)
-    // 2 * 32700^2 + 64 * 32700 fits INT32_MAX. Keep the original
+    // 2 * 32500^2 + 128 * 32500 fits INT32_MAX. Keep the original
     // wide arithmetic for larger contours or tolerances.
-    bool narrow = tolerance >= 0 && tolerance <= 64 &&
-        (int64_t) bounds.x_max - bounds.x_min <= 32700 &&
-        (int64_t) bounds.y_max - bounds.y_min <= 32700;
+    bool narrow = tolerance >= 0 && tolerance <= 128 &&
+        (int64_t) bounds.x_max - bounds.x_min <= 32500 &&
+        (int64_t) bounds.y_max - bounds.y_min <= 32500;
 #if defined(__ARM_NEON)
-    bool bounded = tolerance >= 0 && tolerance <= 64 &&
+    bool bounded = tolerance >= 0 && tolerance <= 128 &&
         (int64_t) bounds.x_max - bounds.x_min <= (1 << 29) &&
         (int64_t) bounds.y_max - bounds.y_min <= (1 << 29);
 #endif
@@ -590,9 +689,7 @@ bool ass_rasterizer_set_outline(RasterizerData *rst,
             break;
 
         case OUTLINE_QUADRATIC_SPLINE: {
-            OutlineSegment seg;
-            segment_init(&seg, cur[-2], *end, outline_error);
-            if (!segment_subdivide(&seg, cur[-2], cur[-1])) {
+            if (!quad_needs_split(cur[-2], cur[-1], *end, outline_error)) {
                 if (!add_line_bbox(rst, cur[-2], *end, normalize, bbox))
                     goto fail;
             } else {
@@ -604,10 +701,7 @@ bool ass_rasterizer_set_outline(RasterizerData *rst,
         }
 
         case OUTLINE_CUBIC_SPLINE: {
-            OutlineSegment seg;
-            segment_init(&seg, cur[-3], *end, outline_error);
-            if (!segment_subdivide(&seg, cur[-3], cur[-2]) &&
-                !segment_subdivide(&seg, cur[-3], cur[-1])) {
+            if (!cubic_needs_split(cur[-3], cur[-2], cur[-1], *end, outline_error)) {
                 if (!add_line_bbox(rst, cur[-3], *end, normalize, bbox))
                     goto fail;
             } else {
@@ -693,48 +787,6 @@ static void segment_move_y(struct segment *line, int32_t y)
         line->flags &= ~SEGFLAG_EXACT_LEFT;
 }
 
-static void segment_split_horz(struct segment *line, struct segment *next, int32_t x)
-{
-    assert(x > line->x_min && x < line->x_max);
-
-    *next = *line;
-    next->c -= line->a * (int64_t) x;
-    next->x_min = 0;
-    next->x_max -= x;
-    line->x_max = x;
-
-    line->flags &= ~SEGFLAG_EXACT_TOP;
-    next->flags &= ~SEGFLAG_EXACT_BOTTOM;
-    if (line->flags & SEGFLAG_UL_DR) {
-        int32_t tmp = line->flags;
-        line->flags = next->flags;
-        next->flags = tmp;
-    }
-    line->flags |= SEGFLAG_EXACT_RIGHT;
-    next->flags |= SEGFLAG_EXACT_LEFT;
-}
-
-static void segment_split_vert(struct segment *line, struct segment *next, int32_t y)
-{
-    assert(y > line->y_min && y < line->y_max);
-
-    *next = *line;
-    next->c -= line->b * (int64_t) y;
-    next->y_min = 0;
-    next->y_max -= y;
-    line->y_max = y;
-
-    line->flags &= ~SEGFLAG_EXACT_LEFT;
-    next->flags &= ~SEGFLAG_EXACT_RIGHT;
-    if (line->flags & SEGFLAG_UL_DR) {
-        int32_t tmp = line->flags;
-        line->flags = next->flags;
-        next->flags = tmp;
-    }
-    line->flags |= SEGFLAG_EXACT_BOTTOM;
-    next->flags |= SEGFLAG_EXACT_TOP;
-}
-
 static inline int segment_check_left(const struct segment *line, int32_t x)
 {
     if (line->flags & SEGFLAG_EXACT_LEFT)
@@ -800,6 +852,110 @@ static inline void polyline_split_horz_group(const struct segment *src, size_t n
     size_t n0 = 0, n1 = 0;
     int winding = *winding_p;
 
+    if (dst0 && dst1) {
+        for (; src != end; src++) {
+            int32_t xmax = src->x_max;
+            if (xmax <= x) {
+                if (!src->y_min && (src->flags & SEGFLAG_EXACT_TOP))
+                    winding += src->a < 0 ? 1 : -1;
+                if (src->x_min >= x)
+                    continue;
+                if (dst0 != src)
+                    *dst0 = *src;
+                dst0++;
+                n0++;
+                continue;
+            }
+            int32_t xmin = src->x_min;
+            if (xmin > x) {
+                int32_t a = src->a;
+                dst1->c = src->c - a * (int64_t) x;
+                dst1->a = a;
+                dst1->b = src->b;
+                dst1->scale = src->scale;
+                dst1->flags = src->flags;
+                dst1->x_min = xmin - x;
+                dst1->x_max = xmax - x;
+                dst1->y_min = src->y_min;
+                dst1->y_max = src->y_max;
+                dst1++;
+                n1++;
+                continue;
+            }
+
+            int delta = 0;
+            if (!src->y_min && (src->flags & SEGFLAG_EXACT_TOP))
+                delta = src->a < 0 ? 1 : -1;
+            if (segment_check_right(src, x)) {
+                winding += delta;
+                if (xmin >= x)
+                    continue;
+                if (dst0 != src)
+                    *dst0 = *src;
+                dst0->x_max = x;
+                dst0++;
+                n0++;
+                continue;
+            }
+            if (segment_check_left(src, x)) {
+                int32_t a = src->a;
+                int32_t flags = src->flags;
+                int32_t nxmin = xmin > x ? xmin - x : 0;
+                static const int test = SEGFLAG_EXACT_LEFT | SEGFLAG_UL_DR;
+                if (!nxmin && (flags & test) == test)
+                    flags &= ~SEGFLAG_EXACT_TOP;
+                dst1->c = src->c - a * (int64_t) x;
+                dst1->a = a;
+                dst1->b = src->b;
+                dst1->scale = src->scale;
+                dst1->flags = flags;
+                dst1->x_min = nxmin;
+                dst1->x_max = xmax - x;
+                dst1->y_min = src->y_min;
+                dst1->y_max = src->y_max;
+                dst1++;
+                n1++;
+                continue;
+            }
+            int32_t flags = src->flags;
+            if (flags & SEGFLAG_UL_DR)
+                winding += delta;
+            int32_t a = src->a;
+            int32_t f0 = flags & ~SEGFLAG_EXACT_TOP;
+            int32_t f1 = flags & ~SEGFLAG_EXACT_BOTTOM;
+            if (flags & SEGFLAG_UL_DR) {
+                int32_t tmp = f0;
+                f0 = f1;
+                f1 = tmp;
+            }
+            f0 |= SEGFLAG_EXACT_RIGHT;
+            f1 |= SEGFLAG_EXACT_LEFT;
+            dst1->c = src->c - a * (int64_t) x;
+            dst1->a = a;
+            dst1->b = src->b;
+            dst1->scale = src->scale;
+            dst1->flags = f1;
+            dst1->x_min = 0;
+            dst1->x_max = xmax - x;
+            dst1->y_min = src->y_min;
+            dst1->y_max = src->y_max;
+            if (dst0 != src)
+                *dst0 = *src;
+            dst0->x_max = x;
+            dst0->flags = f0;
+            dst0++;
+            dst1++;
+            n0++;
+            n1++;
+        }
+        *dst0_p = dst0;
+        *dst1_p = dst1;
+        *n0_p = n0;
+        *n1_p = n1;
+        *winding_p = winding;
+        return;
+    }
+
     for (; src != end; src++) {
         int32_t xmax = src->x_max;
         if (xmax <= x) {
@@ -818,10 +974,13 @@ static inline void polyline_split_horz_group(const struct segment *src, size_t n
         int32_t xmin = src->x_min;
         if (xmin > x) {
             if (dst1) {
-                *dst1 = *src;
+                int32_t a = src->a;
+                int64_t nc = src->c - a * (int64_t) x;
+                if (dst1 != src)
+                    *dst1 = *src;
+                dst1->c = nc;
                 dst1->x_min = xmin - x;
                 dst1->x_max = xmax - x;
-                dst1->c -= dst1->a * (int64_t) x;
                 dst1++;
             }
             n1++;
@@ -846,7 +1005,8 @@ static inline void polyline_split_horz_group(const struct segment *src, size_t n
         }
         if (segment_check_left(src, x)) {
             if (dst1) {
-                *dst1 = *src;
+                if (dst1 != src)
+                    *dst1 = *src;
                 segment_move_x(dst1, x);
                 dst1++;
             }
@@ -855,13 +1015,7 @@ static inline void polyline_split_horz_group(const struct segment *src, size_t n
         }
         if (src->flags & SEGFLAG_UL_DR)
             winding += delta;
-        if (dst0 && dst1) {
-            if (dst0 != src)
-                *dst0 = *src;
-            segment_split_horz(dst0, dst1, x);
-            dst0++;
-            dst1++;
-        } else if (dst0) {
+        if (dst0) {
             if (dst0 != src)
                 *dst0 = *src;
             dst0->x_max = x;
@@ -870,13 +1024,17 @@ static inline void polyline_split_horz_group(const struct segment *src, size_t n
             dst0->flags |= SEGFLAG_EXACT_RIGHT;
             dst0++;
         } else if (dst1) {
-            *dst1 = *src;
-            dst1->c -= src->a * (int64_t) x;
+            int32_t a = src->a;
+            int64_t nc = src->c - a * (int64_t) x;
+            int32_t flags = src->flags;
+            if (dst1 != src)
+                *dst1 = *src;
+            dst1->c = nc;
             dst1->x_min = 0;
             dst1->x_max = xmax - x;
-            dst1->flags &= ~(src->flags & SEGFLAG_UL_DR ?
-                             SEGFLAG_EXACT_TOP : SEGFLAG_EXACT_BOTTOM);
-            dst1->flags |= SEGFLAG_EXACT_LEFT;
+            dst1->flags = (flags & ~(flags & SEGFLAG_UL_DR ?
+                                     SEGFLAG_EXACT_TOP : SEGFLAG_EXACT_BOTTOM)) |
+                          SEGFLAG_EXACT_LEFT;
             dst1++;
         }
         n0++;
@@ -919,6 +1077,110 @@ static inline void polyline_split_vert_group(const struct segment *src, size_t n
     size_t n0 = 0, n1 = 0;
     int winding = *winding_p;
 
+    if (dst0 && dst1) {
+        for (; src != end; src++) {
+            int32_t ymax = src->y_max;
+            if (ymax <= y) {
+                if (!src->x_min && (src->flags & SEGFLAG_EXACT_LEFT))
+                    winding += src->b < 0 ? 1 : -1;
+                if (src->y_min >= y)
+                    continue;
+                if (dst0 != src)
+                    *dst0 = *src;
+                dst0++;
+                n0++;
+                continue;
+            }
+            int32_t ymin = src->y_min;
+            if (ymin > y) {
+                int32_t b = src->b;
+                dst1->c = src->c - b * (int64_t) y;
+                dst1->a = src->a;
+                dst1->b = b;
+                dst1->scale = src->scale;
+                dst1->flags = src->flags;
+                dst1->x_min = src->x_min;
+                dst1->x_max = src->x_max;
+                dst1->y_min = ymin - y;
+                dst1->y_max = ymax - y;
+                dst1++;
+                n1++;
+                continue;
+            }
+
+            int delta = 0;
+            if (!src->x_min && (src->flags & SEGFLAG_EXACT_LEFT))
+                delta = src->b < 0 ? 1 : -1;
+            if (segment_check_bottom(src, y)) {
+                winding += delta;
+                if (ymin >= y)
+                    continue;
+                if (dst0 != src)
+                    *dst0 = *src;
+                dst0->y_max = y;
+                dst0++;
+                n0++;
+                continue;
+            }
+            if (segment_check_top(src, y)) {
+                int32_t b = src->b;
+                int32_t flags = src->flags;
+                int32_t nymin = ymin > y ? ymin - y : 0;
+                static const int test = SEGFLAG_EXACT_TOP | SEGFLAG_UL_DR;
+                if (!nymin && (flags & test) == test)
+                    flags &= ~SEGFLAG_EXACT_LEFT;
+                dst1->c = src->c - b * (int64_t) y;
+                dst1->a = src->a;
+                dst1->b = b;
+                dst1->scale = src->scale;
+                dst1->flags = flags;
+                dst1->x_min = src->x_min;
+                dst1->x_max = src->x_max;
+                dst1->y_min = nymin;
+                dst1->y_max = ymax - y;
+                dst1++;
+                n1++;
+                continue;
+            }
+            int32_t flags = src->flags;
+            if (flags & SEGFLAG_UL_DR)
+                winding += delta;
+            int32_t b = src->b;
+            int32_t f0 = flags & ~SEGFLAG_EXACT_LEFT;
+            int32_t f1 = flags & ~SEGFLAG_EXACT_RIGHT;
+            if (flags & SEGFLAG_UL_DR) {
+                int32_t tmp = f0;
+                f0 = f1;
+                f1 = tmp;
+            }
+            f0 |= SEGFLAG_EXACT_BOTTOM;
+            f1 |= SEGFLAG_EXACT_TOP;
+            dst1->c = src->c - b * (int64_t) y;
+            dst1->a = src->a;
+            dst1->b = b;
+            dst1->scale = src->scale;
+            dst1->flags = f1;
+            dst1->x_min = src->x_min;
+            dst1->x_max = src->x_max;
+            dst1->y_min = 0;
+            dst1->y_max = ymax - y;
+            if (dst0 != src)
+                *dst0 = *src;
+            dst0->y_max = y;
+            dst0->flags = f0;
+            dst0++;
+            dst1++;
+            n0++;
+            n1++;
+        }
+        *dst0_p = dst0;
+        *dst1_p = dst1;
+        *n0_p = n0;
+        *n1_p = n1;
+        *winding_p = winding;
+        return;
+    }
+
     for (; src != end; src++) {
         int32_t ymax = src->y_max;
         if (ymax <= y) {
@@ -937,10 +1199,13 @@ static inline void polyline_split_vert_group(const struct segment *src, size_t n
         int32_t ymin = src->y_min;
         if (ymin > y) {
             if (dst1) {
-                *dst1 = *src;
+                int32_t b = src->b;
+                int64_t nc = src->c - b * (int64_t) y;
+                if (dst1 != src)
+                    *dst1 = *src;
+                dst1->c = nc;
                 dst1->y_min = ymin - y;
                 dst1->y_max = ymax - y;
-                dst1->c -= dst1->b * (int64_t) y;
                 dst1++;
             }
             n1++;
@@ -965,7 +1230,8 @@ static inline void polyline_split_vert_group(const struct segment *src, size_t n
         }
         if (segment_check_top(src, y)) {
             if (dst1) {
-                *dst1 = *src;
+                if (dst1 != src)
+                    *dst1 = *src;
                 segment_move_y(dst1, y);
                 dst1++;
             }
@@ -974,13 +1240,7 @@ static inline void polyline_split_vert_group(const struct segment *src, size_t n
         }
         if (src->flags & SEGFLAG_UL_DR)
             winding += delta;
-        if (dst0 && dst1) {
-            if (dst0 != src)
-                *dst0 = *src;
-            segment_split_vert(dst0, dst1, y);
-            dst0++;
-            dst1++;
-        } else if (dst0) {
+        if (dst0) {
             if (dst0 != src)
                 *dst0 = *src;
             dst0->y_max = y;
@@ -989,13 +1249,17 @@ static inline void polyline_split_vert_group(const struct segment *src, size_t n
             dst0->flags |= SEGFLAG_EXACT_BOTTOM;
             dst0++;
         } else if (dst1) {
-            *dst1 = *src;
-            dst1->c -= src->b * (int64_t) y;
+            int32_t b = src->b;
+            int64_t nc = src->c - b * (int64_t) y;
+            int32_t flags = src->flags;
+            if (dst1 != src)
+                *dst1 = *src;
+            dst1->c = nc;
             dst1->y_min = 0;
             dst1->y_max = ymax - y;
-            dst1->flags &= ~(src->flags & SEGFLAG_UL_DR ?
-                             SEGFLAG_EXACT_LEFT : SEGFLAG_EXACT_RIGHT);
-            dst1->flags |= SEGFLAG_EXACT_TOP;
+            dst1->flags = (flags & ~(flags & SEGFLAG_UL_DR ?
+                                     SEGFLAG_EXACT_LEFT : SEGFLAG_EXACT_RIGHT)) |
+                          SEGFLAG_EXACT_TOP;
             dst1++;
         }
         n0++;
@@ -1275,7 +1539,7 @@ bool ass_rasterizer_fill(const BitmapEngine *engine, RasterizerData *rst,
 
     struct segment *line = rst->linebuf[0];
     struct segment *end = line + rst->size[0];
-#if defined(__aarch64__) && defined(__ARM_NEON)
+#if defined(__ARM_NEON)
     int32_t shift_arr[4] = { x0, x0, y0, y0 };
     int32x4_t vshift = vld1q_s32(shift_arr);
     for (; line != end; line++) {

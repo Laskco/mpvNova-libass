@@ -380,7 +380,7 @@ Cache *ass_cache_create(const CacheDesc *desc)
     Cache *cache = calloc(1, sizeof(*cache));
     if (!cache)
         return NULL;
-    cache->buckets = 0xFFFF;
+    cache->buckets = 0x10000;
     cache->queue_last = &cache->queue_first;
     cache->desc = desc;
     cache->map = calloc(cache->buckets, sizeof(CacheItem *));
@@ -400,7 +400,10 @@ void *ass_cache_get(Cache *cache, void *key, void *priv)
 {
     const CacheDesc *desc = cache->desc;
     size_t key_offs = CACHE_ITEM_SIZE + align_cache(desc->value_size);
-    unsigned bucket = desc->hash_func(key, ASS_HASH_INIT) % cache->buckets;
+    ass_hashcode hash = desc->hash_func(key, ASS_HASH_INIT);
+    hash ^= hash >> 32;
+    hash ^= hash >> 16;
+    unsigned bucket = (unsigned) hash & (cache->buckets - 1);
     CacheItem *item = cache->map[bucket];
     while (item) {
         if (desc->compare_func(key, (char *) item + key_offs)) {

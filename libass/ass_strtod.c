@@ -17,6 +17,7 @@
 #include "ass_compat.h"
 
 #include <stdlib.h>
+#include <stdint.h>
 #include <float.h>
 #include <errno.h>
 #include "ass_string.h"
@@ -114,6 +115,62 @@ ass_strtod(
     size_t leadZeros;   /* Number of leading zeros in mantissa. */
     const char *pExp;       /* Temporarily holds location of exponent
                              * in string. */
+
+    /*
+     * Fast path for common short decimal numbers (<= 9 digits, no exponent),
+     * bit-exact with the general path below.
+     */
+    p = string;
+    while (ass_isspace(*p))
+        p += 1;
+    sign = 0;
+    if (*p == '-') {
+        sign = 1;
+        p += 1;
+    } else if (*p == '+') {
+        p += 1;
+    }
+    if (ass_isdigit(*p) || (*p == '.' && ass_isdigit(p[1]))) {
+        const char *fp = p;
+        uint32_t val = 0;
+        int digits = 0;
+        int frac_digits = 0;
+        while (*fp == '0')
+            fp++;
+        while (ass_isdigit(*fp) && digits < 9) {
+            val = val * 10u + (uint32_t) (*fp - '0');
+            digits++;
+            fp++;
+        }
+        if (*fp == '.') {
+            fp++;
+            if (digits == 0) {
+                while (*fp == '0') {
+                    frac_digits++;
+                    fp++;
+                }
+            }
+            while (ass_isdigit(*fp) && digits < 9 && frac_digits < 9) {
+                val = val * 10u + (uint32_t) (*fp - '0');
+                digits++;
+                frac_digits++;
+                fp++;
+            }
+        }
+        if (!ass_isdigit(*fp) && *fp != 'e' && *fp != 'E' &&
+            (digits > 0 || frac_digits > 0 || fp > p) && frac_digits <= 9) {
+            static const double exact_pow10[10] = {
+                1.0, 10.0, 100.0, 1000.0, 10000.0,
+                100000.0, 1000000.0, 10000000.0, 100000000.0, 1000000000.0
+            };
+            double res = (double) val;
+            if (frac_digits)
+                res /= exact_pow10[frac_digits];
+            if (endPtr != NULL)
+                *endPtr = (char *) fp;
+            return sign ? -res : res;
+        }
+    }
 
     /*
      * Strip off leading blanks and check for a sign.
