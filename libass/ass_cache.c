@@ -251,6 +251,10 @@ static void outline_destruct(void *key, void *value)
     OutlineHashKey *k = key;
     ass_outline_free(&v->outline[0]);
     ass_outline_free(&v->outline[1]);
+    for (int i = 0; i < OUTLINE_LOD_SLOTS; i++) {
+        ass_outline_free(&v->lod[i].outline[0]);
+        ass_outline_free(&v->lod[i].outline[1]);
+    }
     switch (k->type) {
     case OUTLINE_GLYPH:
         ass_cache_dec_ref(k->u.glyph.font);

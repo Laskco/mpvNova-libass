@@ -69,6 +69,9 @@ bool ass_rasterizer_set_outline(RasterizerData *rst,
                                 const ASS_Outline *path, bool extra,
                                 const ASS_Rect *clip, int simplify);
 
+bool ass_outline_simplify(ASS_Outline *dst, const ASS_Outline *src,
+                          int32_t tolerance);
+
 /**
  * \brief Polyline rasterization function
  * \param x0, y0, width, height in: source window (full pixel units)

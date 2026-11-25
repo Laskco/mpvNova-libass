@@ -54,9 +54,18 @@ typedef struct {
     int shift_direction;
 } EventHashValue;
 
+#define OUTLINE_LOD_SLOTS 2
+
+typedef struct {
+    int32_t tol;        // 0 = empty; source-space tolerance (power of 2)
+    ASS_Outline outline[2];
+} OutlineLod;
+
 typedef struct {
     bool valid;
     ASS_Outline outline[2];
+    OutlineLod lod[OUTLINE_LOD_SLOTS];
+    uint8_t lod_next;
     ASS_Rect cbox;  // bounding box of all control points
     int advance;    // 26.6, advance distance to the next outline in line
     int asc, desc;  // ascender/descender

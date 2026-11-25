@@ -762,6 +762,306 @@ fail:
     return false;
 }
 
+typedef struct {
+    ASS_Vector *pts;
+    size_t n, cap;
+} PointBuf;
+
+static bool point_buf_push(PointBuf *b, ASS_Vector p)
+{
+    if (b->n >= b->cap) {
+        size_t ncap = b->cap ? b->cap * 2 : 256;
+        if (!ASS_REALLOC_ARRAY(b->pts, ncap))
+            return false;
+        b->cap = ncap;
+    }
+    b->pts[b->n++] = p;
+    return true;
+}
+
+static bool flatten_quad_to_buf(PointBuf *b, const ASS_Vector *pt_in, int32_t err)
+{
+    ASS_Vector stack[32][3];
+    uint8_t depth[32];
+    int sp = 0;
+    uint8_t d = 0;
+    ASS_Vector p0 = pt_in[0], p1 = pt_in[1], p2 = pt_in[2];
+    for (;;) {
+        ASS_Vector m01 = { p0.x + p1.x, p0.y + p1.y };
+        ASS_Vector m12 = { p1.x + p2.x, p1.y + p2.y };
+        ASS_Vector mid = { (m01.x + m12.x + 2) >> 2, (m01.y + m12.y + 2) >> 2 };
+        m01.x >>= 1; m01.y >>= 1;
+        m12.x >>= 1; m12.y >>= 1;
+        if (d < 28 && sp < 32) {
+            stack[sp][0] = mid;
+            stack[sp][1] = m12;
+            stack[sp][2] = p2;
+            depth[sp] = (uint8_t) (d + 1);
+            sp++;
+            p1 = m01;
+            p2 = mid;
+            d++;
+        } else {
+            if (!point_buf_push(b, p2))
+                return false;
+            if (!sp)
+                return true;
+            sp--;
+            p0 = stack[sp][0]; p1 = stack[sp][1]; p2 = stack[sp][2]; d = depth[sp];
+        }
+        while (!quad_needs_split(p0, p1, p2, err)) {
+            if (!point_buf_push(b, p2))
+                return false;
+            if (!sp)
+                return true;
+            sp--;
+            p0 = stack[sp][0]; p1 = stack[sp][1]; p2 = stack[sp][2]; d = depth[sp];
+        }
+    }
+}
+
+static bool flatten_cubic_to_buf(PointBuf *b, const ASS_Vector *pt_in, int32_t err)
+{
+    ASS_Vector stack[32][4];
+    uint8_t depth[32];
+    int sp = 0;
+    uint8_t d = 0;
+    ASS_Vector p0 = pt_in[0], p1 = pt_in[1], p2 = pt_in[2], p3 = pt_in[3];
+    for (;;) {
+        ASS_Vector n1 = { p0.x + p1.x, p0.y + p1.y };
+        ASS_Vector center = { p1.x + p2.x + 2, p1.y + p2.y + 2 };
+        ASS_Vector n5 = { p2.x + p3.x, p2.y + p3.y };
+        ASS_Vector n2 = { n1.x + center.x, n1.y + center.y };
+        ASS_Vector n4 = { center.x + n5.x, center.y + n5.y };
+        ASS_Vector n3 = { (n2.x + n4.x - 1) >> 3, (n2.y + n4.y - 1) >> 3 };
+        n2.x >>= 2; n2.y >>= 2;
+        n4.x >>= 2; n4.y >>= 2;
+        n1.x >>= 1; n1.y >>= 1;
+        n5.x >>= 1; n5.y >>= 1;
+        if (d < 28 && sp < 32) {
+            stack[sp][0] = n3;
+            stack[sp][1] = n4;
+            stack[sp][2] = n5;
+            stack[sp][3] = p3;
+            depth[sp] = (uint8_t) (d + 1);
+            sp++;
+            p1 = n1;
+            p2 = n2;
+            p3 = n3;
+            d++;
+        } else {
+            if (!point_buf_push(b, p3))
+                return false;
+            if (!sp)
+                return true;
+            sp--;
+            p0 = stack[sp][0]; p1 = stack[sp][1]; p2 = stack[sp][2]; p3 = stack[sp][3]; d = depth[sp];
+        }
+        while (!cubic_needs_split(p0, p1, p2, p3, err)) {
+            if (!point_buf_push(b, p3))
+                return false;
+            if (!sp)
+                return true;
+            sp--;
+            p0 = stack[sp][0]; p1 = stack[sp][1]; p2 = stack[sp][2]; p3 = stack[sp][3]; d = depth[sp];
+        }
+    }
+}
+
+bool ass_outline_simplify(ASS_Outline *dst, const ASS_Outline *src,
+                          int32_t tolerance)
+{
+    ass_outline_clear(dst);
+    if (!src || !src->n_points || !src->n_segments)
+        return true;
+
+    PointBuf poly = {0};
+    size_t *stack = NULL;
+    size_t stack_cap = 0;
+    uint8_t *keep = NULL;
+    size_t keep_cap = 0;
+
+    if (!ass_outline_alloc(dst, FFMIN(src->n_points, (size_t) 256),
+                           FFMIN(src->n_segments, (size_t) 256)))
+        return false;
+
+    int32_t err = FFMAX(tolerance / 2, 16);
+    const ASS_Vector *start = src->points, *cur = start;
+    bool contour_begin = true;
+
+    for (size_t i = 0; i < src->n_segments; i++) {
+        char seg_tag = src->segments[i];
+        int n = seg_tag & OUTLINE_COUNT_MASK;
+        if (contour_begin) {
+            poly.n = 0;
+            if (!point_buf_push(&poly, *cur))
+                goto fail;
+            contour_begin = false;
+        }
+        cur += n;
+        const ASS_Vector *end = (seg_tag & OUTLINE_CONTOUR_END) ? start : cur;
+        if (seg_tag & OUTLINE_CONTOUR_END)
+            start = cur;
+
+        switch (n) {
+        case OUTLINE_LINE_SEGMENT:
+            if (!point_buf_push(&poly, *end))
+                goto fail;
+            break;
+        case OUTLINE_QUADRATIC_SPLINE:
+            if (!quad_needs_split(cur[-2], cur[-1], *end, err)) {
+                if (!point_buf_push(&poly, *end))
+                    goto fail;
+            } else {
+                ASS_Vector p[3] = { cur[-2], cur[-1], *end };
+                if (!flatten_quad_to_buf(&poly, p, err))
+                    goto fail;
+            }
+            break;
+        case OUTLINE_CUBIC_SPLINE:
+            if (!cubic_needs_split(cur[-3], cur[-2], cur[-1], *end, err)) {
+                if (!point_buf_push(&poly, *end))
+                    goto fail;
+            } else {
+                ASS_Vector p[4] = { cur[-3], cur[-2], cur[-1], *end };
+                if (!flatten_cubic_to_buf(&poly, p, err))
+                    goto fail;
+            }
+            break;
+        default:
+            goto fail;
+        }
+
+        if (!(seg_tag & OUTLINE_CONTOUR_END))
+            continue;
+        contour_begin = true;
+
+        size_t count = poly.n > 0 ? poly.n - 1 : 0;
+        if (count < 3)
+            continue;
+
+        const ASS_Vector *pts = poly.pts;
+        ASS_Rect bounds = {pts[0].x, pts[0].y, pts[0].x, pts[0].y};
+        size_t corner = 0;
+        int64_t furthest = 0;
+        for (size_t k = 1; k <= count; k++) {
+            rectangle_update(&bounds, pts[k].x, pts[k].y, pts[k].x, pts[k].y);
+            int64_t dx = (int64_t) pts[k].x - pts[0].x;
+            int64_t dy = (int64_t) pts[k].y - pts[0].y;
+            int64_t dist = llabs(dx) + llabs(dy);
+            if (dist > furthest) {
+                furthest = dist;
+                corner = k;
+            }
+        }
+        int64_t bw = (int64_t) bounds.x_max - bounds.x_min;
+        int64_t bh = (int64_t) bounds.y_max - bounds.y_min;
+        if (bw < tolerance / 4 && bh < tolerance / 4)
+            continue;
+
+        if (count < 4 || count > 65536 || !corner || corner == count) {
+            for (size_t k = 0; k < count; k++) {
+                char tag = OUTLINE_LINE_SEGMENT | (k + 1 == count ? OUTLINE_CONTOUR_END : 0);
+                if (!ass_outline_add_point(dst, pts[k], tag))
+                    goto fail;
+            }
+            continue;
+        }
+
+        if (2 * (count + 1) > stack_cap) {
+            size_t ncap = FFMAX(stack_cap * 2, 2 * (count + 1));
+            if (!ASS_REALLOC_ARRAY(stack, ncap))
+                goto fail;
+            stack_cap = ncap;
+        }
+        if (count + 1 > keep_cap) {
+            size_t ncap = FFMAX(keep_cap * 2, count + 1);
+            if (!ASS_REALLOC_ARRAY(keep, ncap))
+                goto fail;
+            keep_cap = ncap;
+        }
+        memset(keep, 0, count + 1);
+        keep[0] = keep[corner] = keep[count] = 1;
+
+#if UINTPTR_MAX == UINT32_MAX || defined(__aarch64__)
+        bool narrow = tolerance >= 0 && tolerance <= 128 &&
+            bw <= 32500 && bh <= 32500;
+#endif
+        size_t used = 0;
+        stack[used++] = 0;
+        stack[used++] = corner;
+        stack[used++] = corner;
+        stack[used++] = count;
+        while (used) {
+            size_t end_i = stack[--used], beg_i = stack[--used], split = beg_i;
+#if UINTPTR_MAX == UINT32_MAX || defined(__aarch64__)
+            if (narrow) {
+                split = contour_split32(pts, beg_i, end_i, tolerance);
+            } else
+#endif
+            {
+                int64_t dx = (int64_t) pts[end_i].x - pts[beg_i].x;
+                int64_t dy = (int64_t) pts[end_i].y - pts[beg_i].y;
+                int64_t length2 = dx * dx + dy * dy;
+                int64_t error = (int64_t) tolerance * FFMAX(llabs(dx), llabs(dy));
+                int64_t largest = 0;
+                for (size_t k = beg_i + 1; k < end_i; k++) {
+                    int64_t x = (int64_t) pts[k].x - pts[beg_i].x;
+                    int64_t y = (int64_t) pts[k].y - pts[beg_i].y;
+                    int64_t score;
+                    if (!length2) {
+                        score = llabs(x) + llabs(y);
+                    } else {
+                        int64_t dot = dx * x + dy * y;
+                        int64_t cross = dx * y - dy * x;
+                        score = FFMAX(llabs(cross) - error,
+                                      FFMAX(-dot - error, dot - length2 - error));
+                    }
+                    if (score > largest) {
+                        largest = score;
+                        split = k;
+                    }
+                }
+            }
+            if (split != beg_i) {
+                keep[split] = 1;
+                stack[used++] = beg_i;
+                stack[used++] = split;
+                stack[used++] = split;
+                stack[used++] = end_i;
+            }
+        }
+
+        size_t kept = 0;
+        for (size_t k = 0; k < count; k++)
+            kept += keep[k];
+        if (kept < 3)
+            continue;
+
+        size_t emitted = 0;
+        for (size_t k = 0; k < count; k++) {
+            if (!keep[k])
+                continue;
+            emitted++;
+            char tag = OUTLINE_LINE_SEGMENT | (emitted == kept ? OUTLINE_CONTOUR_END : 0);
+            if (!ass_outline_add_point(dst, pts[k], tag))
+                goto fail;
+        }
+    }
+
+    free(poly.pts);
+    free(stack);
+    free(keep);
+    return true;
+
+fail:
+    free(poly.pts);
+    free(stack);
+    free(keep);
+    ass_outline_free(dst);
+    return false;
+}
+
 
 static void segment_move_x(struct segment *line, int32_t x)
 {

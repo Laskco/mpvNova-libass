@@ -1887,6 +1887,84 @@ static inline size_t outline_size(const ASS_Outline* outline)
     return sizeof(ASS_Vector) * outline->n_points + outline->n_segments;
 }
 
+static bool copy_or_simplify_outline(ASS_Outline *dst, const ASS_Outline *src,
+                                     int32_t tol)
+{
+    if (src->n_points >= 256)
+        return ass_outline_simplify(dst, src, tol);
+    ass_outline_clear(dst);
+    if (!src->n_points || !src->n_segments)
+        return true;
+    if (!ass_outline_alloc(dst, src->n_points, src->n_segments))
+        return false;
+    memcpy(dst->points, src->points, src->n_points * sizeof(*dst->points));
+    memcpy(dst->segments, src->segments, src->n_segments * sizeof(*dst->segments));
+    dst->n_points = src->n_points;
+    dst->n_segments = src->n_segments;
+    return true;
+}
+
+static const ASS_Outline *select_outline_lod(OutlineHashValue *ov,
+                                             const BitmapHashKey *k,
+                                             const double m[3][3],
+                                             int edges,
+                                             bool *pre_simplified)
+{
+    *pre_simplified = false;
+    if (!edges ||
+        (ov->outline[0].n_points < 256 && ov->outline[1].n_points < 256))
+        return ov->outline;
+
+    double sx = hypot(m[0][0], m[1][0]);
+    double sy = hypot(m[0][1], m[1][1]);
+    if (k->matrix_z.x || k->matrix_z.y) {
+        const ASS_Rect *cb = &ov->cbox;
+        double dx = (cb->x_max - cb->x_min) * 0.5 + 64.0;
+        double dy = (cb->y_max - cb->y_min) * 0.5 + 64.0;
+        double x_lim = fabs(m[0][0]) * dx + fabs(m[0][1]) * dy;
+        double y_lim = fabs(m[1][0]) * dx + fabs(m[1][1]) * dy;
+        double p_lim = hypot(x_lim, y_lim);
+        sx += fabs(m[2][0]) * p_lim;
+        sy += fabs(m[2][1]) * p_lim;
+    }
+    double max_scale = FFMAX(sx, sy);
+    if (!(max_scale > 1e-6) || !isfinite(max_scale))
+        return ov->outline;
+
+    double screen_tol = edges >= 2 ? 96.0 : 64.0;
+    double raw_tol = screen_tol / max_scale;
+    if (!(raw_tol >= 8.0) || !isfinite(raw_tol))
+        return ov->outline;
+
+    uint32_t clamped = raw_tol >= (double) (1U << 20) ? (1U << 20) : (uint32_t) raw_tol;
+    int32_t tol = 8;
+    while ((uint32_t) tol <= (clamped >> 1))
+        tol <<= 1;
+
+    for (int i = 0; i < OUTLINE_LOD_SLOTS; i++) {
+        if (ov->lod[i].tol == tol) {
+            *pre_simplified = true;
+            return ov->lod[i].outline;
+        }
+    }
+
+    int slot = ov->lod_next % OUTLINE_LOD_SLOTS;
+    ov->lod_next = (uint8_t) ((slot + 1) % OUTLINE_LOD_SLOTS);
+    OutlineLod *lod = &ov->lod[slot];
+    ass_outline_free(&lod->outline[0]);
+    ass_outline_free(&lod->outline[1]);
+    lod->tol = 0;
+    if (!copy_or_simplify_outline(&lod->outline[0], &ov->outline[0], tol) ||
+        !copy_or_simplify_outline(&lod->outline[1], &ov->outline[1], tol)) {
+        ass_outline_free(&lod->outline[0]);
+        ass_outline_free(&lod->outline[1]);
+        return ov->outline;
+    }
+    lod->tol = tol;
+    *pre_simplified = true;
+    return lod->outline;
+}
+
 size_t ass_bitmap_construct(void *key, void *value, void *priv)
 {
     RenderContext *state = priv;
@@ -1900,32 +1978,38 @@ size_t ass_bitmap_construct(void *key, void *value, void *priv)
     double m[3][3];
     restore_transform(m, k);
 
+    bool pre_simplified = false;
+    const ASS_Outline *src_ol = select_outline_lod(k->outline, k, m,
+                                                   state->renderer->experimental_edges,
+                                                   &pre_simplified);
+
     ASS_Rect clip = {k->clip_min.x, k->clip_min.y, k->clip_max.x, k->clip_max.y};
     ASS_Outline temporary[2] = {{0}};
-    bool reuse = outline_size(&k->outline->outline[0]) <= 512 * 1024 &&
-        outline_size(&k->outline->outline[1]) <= 512 * 1024;
+    bool reuse = outline_size(&src_ol[0]) <= 512 * 1024 &&
+        outline_size(&src_ol[1]) <= 512 * 1024;
     ASS_Outline *outline = reuse ? state->renderer->raster_outline : temporary;
     if (k->matrix_z.x || k->matrix_z.y) {
         if (reuse) {
-            ass_outline_transform_3d_reuse(&outline[0], &k->outline->outline[0], m);
-            ass_outline_transform_3d_reuse(&outline[1], &k->outline->outline[1], m);
+            ass_outline_transform_3d_reuse(&outline[0], &src_ol[0], m);
+            ass_outline_transform_3d_reuse(&outline[1], &src_ol[1], m);
         } else {
-            ass_outline_transform_3d(&outline[0], &k->outline->outline[0], m);
-            ass_outline_transform_3d(&outline[1], &k->outline->outline[1], m);
+            ass_outline_transform_3d(&outline[0], &src_ol[0], m);
+            ass_outline_transform_3d(&outline[1], &src_ol[1], m);
         }
     } else if (state->renderer->experimental_edges && k->clip_align) {
-        ass_outline_transform_2d_clipped(&outline[0], &k->outline->outline[0], m, &clip);
-        ass_outline_transform_2d_clipped(&outline[1], &k->outline->outline[1], m, &clip);
+        ass_outline_transform_2d_clipped(&outline[0], &src_ol[0], m, &clip);
+        ass_outline_transform_2d_clipped(&outline[1], &src_ol[1], m, &clip);
     } else if (reuse) {
-        ass_outline_transform_2d_reuse(&outline[0], &k->outline->outline[0], m);
-        ass_outline_transform_2d_reuse(&outline[1], &k->outline->outline[1], m);
+        ass_outline_transform_2d_reuse(&outline[0], &src_ol[0], m);
+        ass_outline_transform_2d_reuse(&outline[1], &src_ol[1], m);
     } else {
-        ass_outline_transform_2d(&outline[0], &k->outline->outline[0], m);
-        ass_outline_transform_2d(&outline[1], &k->outline->outline[1], m);
+        ass_outline_transform_2d(&outline[0], &src_ol[0], m);
+        ass_outline_transform_2d(&outline[1], &src_ol[1], m);
     }
 
     if (!ass_outline_to_bitmap(state, bm, &outline[0], &outline[1],
-                               k->clip_align ? &clip : NULL, k->clip_align))
+                               k->clip_align ? &clip : NULL, k->clip_align,
+                               pre_simplified))
         memset(bm, 0, sizeof(*bm));
     if (!reuse) {
         ass_outline_free(&outline[0]);

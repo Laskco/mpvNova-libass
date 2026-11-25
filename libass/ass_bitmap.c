@@ -152,15 +152,17 @@ bool ass_copy_bitmap(const BitmapEngine *engine, Bitmap *dst, const Bitmap *src)
 
 bool ass_outline_to_bitmap(RenderContext *state, Bitmap *bm,
                            ASS_Outline *outline1, ASS_Outline *outline2,
-                           const ASS_Rect *clip, int clip_align)
+                           const ASS_Rect *clip, int clip_align,
+                           bool pre_simplified)
 {
     ASS_Renderer *render_priv = state->renderer;
     RasterizerData *rst = &state->rasterizer;
     // Contour rejection is opt-in because it can change edge rounding.
     const ASS_Rect *contour_clip = render_priv->experimental_edges ? clip : NULL;
     int edges = render_priv->experimental_edges;
-    bool complex = (outline1 && outline1->n_points >= 256) ||
-                   (outline2 && outline2->n_points >= 256);
+    bool complex = !pre_simplified &&
+                   ((outline1 && outline1->n_points >= 256) ||
+                    (outline2 && outline2->n_points >= 256));
     int simplify = edges && !clip && complex ? (edges >= 2 ? 96 : 64) : 0;
     int original_error = rst->outline_error;
     if (simplify) rst->outline_error = edges >= 2 ? 40 : 24;
