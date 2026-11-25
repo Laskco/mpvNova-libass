@@ -326,6 +326,7 @@ typedef struct {
 typedef struct {
     uint64_t hash;
     int64_t x0, y0, x1, y1;
+    long long last_time;
     bool moving;
 } ClipMemoEntry;
 

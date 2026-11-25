@@ -1605,21 +1605,29 @@ static void calc_transform_matrix(RenderContext *state,
  */
 static double restore_blur(int qblur);
 
-// Remember the last vector-clip crop window per (outline, transform). Once a
-// clip window moves from frame to frame, stop cropping so the uncropped bitmap
-// is cached once and masked by blend_vector_clip (pixel-identical to stock).
-static bool clip_window_moving(ASS_Renderer *r, const BitmapHashKey *k,
+// Remember the last vector-clip crop window per (outline, pos, transform,
+// blur). Once that stationary glyph's clip window moves across frames (even
+// across frame-by-frame separate Dialogue events), stop cropping so the
+// uncropped bitmap is cached once and masked by blend_vector_clip
+// (pixel-identical to stock). Including pos, blur, and last_time != r->time
+// prevents sibling events or repeated glyphs on the same frame from colliding.
+static bool clip_window_moving(const RenderContext *state, const BitmapHashKey *k,
+                               ASS_Vector pos, const FilterDesc *filter,
                                int64_t x0, int64_t y0, int64_t x1, int64_t y1)
 {
+    ASS_Renderer *r = state->renderer;
     uint64_t h = UINT64_C(1469598103934665603);
-    const uint64_t words[5] = {
+    const uint64_t words[7] = {
         (uint64_t) (uintptr_t) k->outline,
+        ((uint64_t) (uint32_t) pos.x << 32) | (uint32_t) pos.y,
         ((uint64_t) (uint32_t) k->offset.x << 32) | (uint32_t) k->offset.y,
         ((uint64_t) (uint32_t) k->matrix_x.x << 32) | (uint32_t) k->matrix_x.y,
         ((uint64_t) (uint32_t) k->matrix_y.x << 32) | (uint32_t) k->matrix_y.y,
         ((uint64_t) (uint32_t) k->matrix_z.x << 32) | (uint32_t) k->matrix_z.y,
+        (((uint64_t) (uint32_t) filter->blur_x << 32) | (uint32_t) filter->blur_y) ^
+            ((uint64_t) (uint32_t) filter->be << 16),
     };
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 7; i++) {
         h ^= words[i];
         h *= UINT64_C(1099511628211);
         h ^= h >> 29;
@@ -1633,11 +1641,14 @@ static bool clip_window_moving(ASS_Renderer *r, const BitmapHashKey *k,
         m->y0 = y0;
         m->x1 = x1;
         m->y1 = y1;
+        m->last_time = r->time;
         m->moving = false;
         return false;
     }
-    if (!m->moving && (m->x0 != x0 || m->y0 != y0 || m->x1 != x1 || m->y1 != y1))
+    if (!m->moving && m->last_time != r->time &&
+        (m->x0 != x0 || m->y0 != y0 || m->x1 != x1 || m->y1 != y1))
         m->moving = true;
+    m->last_time = r->time;
     return m->moving;
 }
 
@@ -1699,7 +1710,7 @@ static void set_bitmap_clip(RenderContext *state, GlyphInfo *info,
     int64_t y1 = (int64_t) ceil(cmax_y) - pos.y + pad_y;
     if (x0 < INT32_MIN || y0 < INT32_MIN || x1 > INT32_MAX || y1 > INT32_MAX)
         return;
-    if (clip_window_moving(state->renderer, key, x0, y0, x1, y1))
+    if (clip_window_moving(state, key, pos, filter, x0, y0, x1, y1))
         return;
     key->clip_min = (ASS_Vector) {x0, y0};
     key->clip_max = (ASS_Vector) {x1, y1};
