@@ -29,6 +29,7 @@
 #include "ass_font.h"
 #include "ass_outline.h"
 #include "ass_cache.h"
+#include "ass_render.h"
 
 // Always enable native-endian mode, since we don't care about cross-platform consistency of the hash
 #define WYHASH_LITTLE_ENDIAN 1
@@ -340,6 +341,82 @@ const CacheDesc glyph_metrics_cache_desc = {
 };
 
 
+// shaped run cache
+static bool shape_key_move(void *dst, void *src)
+{
+    ShapeHashKey *d = dst, *s = src;
+    if (!d)
+        return true;
+
+    *d = *s;
+    d->text.str = ass_copy_string(s->text);
+    if (!d->text.str)
+        return false;
+    ass_cache_inc_ref(s->font);
+    return true;
+}
+
+static void shape_destruct(void *key, void *value)
+{
+    ShapeHashKey *k = key;
+    ShapeHashValue *v = value;
+    free(v->glyphs);
+    free((char *) k->text.str);
+    ass_cache_dec_ref(k->font);
+}
+
+size_t ass_shape_construct(void *key, void *value, void *priv);
+
+const CacheDesc shape_cache_desc = {
+    .hash_func = shape_hash,
+    .compare_func = shape_compare,
+    .key_move_func = shape_key_move,
+    .construct_func = ass_shape_construct,
+    .destruct_func = shape_destruct,
+    .key_size = sizeof(ShapeHashKey),
+    .value_size = sizeof(ShapeHashValue)
+};
+
+
+// rendered event cache
+static bool event_key_move(void *dst, void *src)
+{
+    EventHashKey *d = dst, *s = src;
+    if (!d)
+        return true;
+
+    *d = *s;
+    d->effect.str = ass_copy_string(s->effect);
+    d->text.str = ass_copy_string(s->text);
+    if (d->effect.str && d->text.str)
+        return true;
+    free((char *) d->effect.str);
+    free((char *) d->text.str);
+    return false;
+}
+
+static void event_destruct(void *key, void *value)
+{
+    EventHashKey *k = key;
+    EventHashValue *v = value;
+    ass_frame_unref(v->imgs);
+    free((char *) k->effect.str);
+    free((char *) k->text.str);
+}
+
+size_t ass_event_construct(void *key, void *value, void *priv);
+
+const CacheDesc event_cache_desc = {
+    .hash_func = event_hash,
+    .compare_func = event_compare,
+    .key_move_func = event_key_move,
+    .construct_func = ass_event_construct,
+    .destruct_func = event_destruct,
+    .key_size = sizeof(EventHashKey),
+    .value_size = sizeof(EventHashValue)
+};
+
+
 
 // Cache data
 typedef struct cache_item {
@@ -348,6 +425,8 @@ typedef struct cache_item {
     struct cache_item *next, **prev;
     struct cache_item *queue_next, **queue_prev;
     size_t size, ref_count;
+    ass_hashcode hash;
+    unsigned frame;
 } CacheItem;
 
 struct cache {
@@ -358,6 +437,11 @@ struct cache {
     const CacheDesc *desc;
 
     size_t cache_size;
+    unsigned frame;
+
+    ass_hashcode *evicted;      // hashes of evicted items, one per slot
+    unsigned evicted_mask;
+    size_t returned;
 };
 
 #define CACHE_ALIGN 8
@@ -400,7 +484,8 @@ void *ass_cache_get(Cache *cache, void *key, void *priv)
 {
     const CacheDesc *desc = cache->desc;
     size_t key_offs = CACHE_ITEM_SIZE + align_cache(desc->value_size);
-    ass_hashcode hash = desc->hash_func(key, ASS_HASH_INIT);
+    ass_hashcode raw_hash = desc->hash_func(key, ASS_HASH_INIT);
+    ass_hashcode hash = raw_hash;
     hash ^= hash >> 32;
     hash ^= hash >> 16;
     unsigned bucket = (unsigned) hash & (cache->buckets - 1);
@@ -408,6 +493,7 @@ void *ass_cache_get(Cache *cache, void *key, void *priv)
     while (item) {
         if (desc->compare_func(key, (char *) item + key_offs)) {
             assert(item->size);
+            item->frame = cache->frame;
             if (!item->queue_prev || item->queue_next) {
                 if (item->queue_prev) {
                     item->queue_next->queue_prev = item->queue_prev;
@@ -433,6 +519,9 @@ void *ass_cache_get(Cache *cache, void *key, void *priv)
     }
     item->cache = cache;
     item->desc = desc;
+    ass_hashcode ev_hash = raw_hash ? raw_hash : 1;
+    item->hash = ev_hash;
+    item->frame = cache->frame;
     void *new_key = (char *) item + key_offs;
     if (!desc->key_move_func(new_key, key)) {
         free(item);
@@ -455,8 +544,49 @@ void *ass_cache_get(Cache *cache, void *key, void *priv)
     item->queue_next = NULL;
     item->ref_count = 1;
 
-    cache->cache_size += item->size + (item->size == 1 ? 0 : CACHE_ITEM_SIZE);
+    size_t cost = item->size + (item->size == 1 ? 0 : CACHE_ITEM_SIZE);
+    cache->cache_size += cost;
+    if (cache->evicted && cache->evicted[ev_hash & cache->evicted_mask] == ev_hash)
+        cache->returned += cost;
     return value;
+}
+
+void ass_cache_use(void *value)
+{
+    if (!value)
+        return;
+    CacheItem *item = value_to_item(value);
+    Cache *cache = item->cache;
+    if (!cache)
+        return;
+    item->frame = cache->frame;
+    if (!item->queue_prev || item->queue_next) {
+        if (item->queue_prev) {
+            item->queue_next->queue_prev = item->queue_prev;
+            *item->queue_prev = item->queue_next;
+        } else
+            item->ref_count++;
+        *cache->queue_last = item;
+        item->queue_prev = cache->queue_last;
+        cache->queue_last = &item->queue_next;
+        item->queue_next = NULL;
+    }
+}
+
+bool ass_cache_watch_returns(Cache *cache, unsigned slots_log2)
+{
+    free(cache->evicted);
+    cache->evicted = calloc(1u << slots_log2, sizeof(*cache->evicted));
+    cache->evicted_mask = cache->evicted ? (1u << slots_log2) - 1 : 0;
+    cache->returned = 0;
+    return cache->evicted != NULL;
+}
+
+size_t ass_cache_take_returned(Cache *cache)
+{
+    size_t ret = cache->returned;
+    cache->returned = 0;
+    return ret;
 }
 
 void *ass_cache_key(void *value)
@@ -498,38 +628,58 @@ void ass_cache_dec_ref(void *value)
         *item->prev = item->next;
 
         cache->cache_size -= item->size + (item->size == 1 ? 0 : CACHE_ITEM_SIZE);
+        if (cache->evicted)
+            cache->evicted[item->hash & cache->evicted_mask] = item->hash;
     }
     destroy_item(item->desc, item);
 }
 
+static void evict_queue_first(Cache *cache)
+{
+    CacheItem *item = cache->queue_first;
+    assert(item->size);
+
+    cache->queue_first = item->queue_next;
+    if (--item->ref_count) {
+        item->queue_prev = NULL;
+        return;
+    }
+
+    if (item->next)
+        item->next->prev = item->prev;
+    *item->prev = item->next;
+
+    cache->cache_size -= item->size + (item->size == 1 ? 0 : CACHE_ITEM_SIZE);
+    if (cache->evicted)
+        cache->evicted[item->hash & cache->evicted_mask] = item->hash;
+    destroy_item(cache->desc, item);
+}
+
 void ass_cache_cut(Cache *cache, size_t max_size)
 {
-    if (cache->cache_size <= max_size)
-        return;
+    if (cache->cache_size > max_size) {
+        do {
+            if (!cache->queue_first)
+                break;
+            evict_queue_first(cache);
+        } while (cache->cache_size > max_size);
+        if (cache->queue_first)
+            cache->queue_first->queue_prev = &cache->queue_first;
+        else
+            cache->queue_last = &cache->queue_first;
+    }
+    cache->frame++;
+}
 
-    do {
-        CacheItem *item = cache->queue_first;
-        if (!item)
-            break;
-        assert(item->size);
-
-        cache->queue_first = item->queue_next;
-        if (--item->ref_count) {
-            item->queue_prev = NULL;
-            continue;
-        }
-
-        if (item->next)
-            item->next->prev = item->prev;
-        *item->prev = item->next;
-
-        cache->cache_size -= item->size + (item->size == 1 ? 0 : CACHE_ITEM_SIZE);
-        destroy_item(cache->desc, item);
-    } while (cache->cache_size > max_size);
+void ass_cache_cut_unused(Cache *cache, unsigned frames)
+{
+    while (cache->queue_first && cache->frame - cache->queue_first->frame >= frames)
+        evict_queue_first(cache);
     if (cache->queue_first)
         cache->queue_first->queue_prev = &cache->queue_first;
     else
         cache->queue_last = &cache->queue_first;
+    cache->frame++;
 }
 
 void ass_cache_empty(Cache *cache)
@@ -553,11 +703,17 @@ void ass_cache_empty(Cache *cache)
     cache->queue_first = NULL;
     cache->queue_last = &cache->queue_first;
     cache->cache_size = 0;
+    if (cache->evicted)
+        memset(cache->evicted, 0, (cache->evicted_mask + 1) * sizeof(*cache->evicted));
+    cache->returned = 0;
 }
 
 void ass_cache_done(Cache *cache)
 {
+    if (!cache)
+        return;
     ass_cache_empty(cache);
+    free(cache->evicted);
     free(cache->map);
     free(cache);
 }
@@ -578,6 +734,11 @@ Cache *ass_glyph_metrics_cache_create(void)
     return ass_cache_create(&glyph_metrics_cache_desc);
 }
 
+Cache *ass_shape_cache_create(void)
+{
+    return ass_cache_create(&shape_cache_desc);
+}
+
 Cache *ass_face_size_metrics_cache_create(void)
 {
     return ass_cache_create(&face_size_metrics_cache_desc);
@@ -591,4 +752,9 @@ Cache *ass_bitmap_cache_create(void)
 Cache *ass_composite_cache_create(void)
 {
     return ass_cache_create(&composite_cache_desc);
+}
+
+Cache *ass_event_cache_create(void)
+{
+    return ass_cache_create(&event_cache_desc);
 }

@@ -45,13 +45,20 @@
 #define BITMAP_CACHE_MAX_SIZE (128 * MEGABYTE)
 #define COMPOSITE_CACHE_RATIO 2
 #define COMPOSITE_CACHE_MAX_SIZE (BITMAP_CACHE_MAX_SIZE / COMPOSITE_CACHE_RATIO)
+#define SHAPE_CACHE_MAX_SIZE (2 * MEGABYTE)
+#define DEFAULT_CACHE_FRAME_AREA (1920 * 1080)
+#define DEFAULT_CACHE_MIN_SIZE (64 * MEGABYTE)
+#define CACHE_RETURN_DECAY 8    // returned bytes fade by 1/this a frame
+#define CACHE_RETURN_LIMIT 8    // the default grows once they pass 1/this of it
+#define EVENT_CACHE_FRAMES 2    // a rendered event goes once this many frames in a row don't show it
+#define EVENT_CACHE_MIN_MS 50   // a shorter event is one frame of frame-by-frame typesetting
 
 #define PARSED_FADE (1<<0)
 #define PARSED_A    (1<<1)
 
 typedef struct {
     ASS_Image result;
-    CompositeHashValue *source;
+    void *source;               // the cache value its bitmap belongs to, held
     unsigned char *buffer;
     size_t ref_count;
 } ASS_ImagePriv;
@@ -220,6 +227,7 @@ struct render_context {
     double font_size;
     int parsed_tags;
     int flags;                  // decoration flags (underline/strike-through)
+    bool timed;                 // the event looks different at other times
 
     int alignment;              // alignment overrides go here; if zero, style value will be used
     int justify;                // justify instructions
@@ -304,10 +312,22 @@ typedef struct {
     Cache *composite_cache;
     Cache *face_size_metrics_cache;
     Cache *metrics_cache;
+    Cache *shape_cache;
+    Cache *event_cache;
     size_t glyph_max;
-    size_t bitmap_max_size;
+    size_t bitmap_max_size;     // 0 = adaptive default for the frame size
     size_t composite_max_size;
+    unsigned growth;            // multiplier for the adaptive default
+    size_t returned;            // bytes of evicted bitmaps made again, fading
 } CacheStore;
+
+#define CLIP_MEMO_SIZE 128
+
+typedef struct {
+    uint64_t hash;
+    int64_t x0, y0, x1, y1;
+    bool moving;
+} ClipMemoEntry;
 
 struct ass_renderer {
     ASS_Library *library;
@@ -316,6 +336,16 @@ struct ass_renderer {
     size_t num_emfonts;
     ASS_Settings settings;
     int render_id;
+    int reconfigure_id;
+
+    // What events' looks depend on beyond their own fields, and a generation
+    // number that changes with it for event cache keys.
+    uint32_t look_generation;
+    char *look;
+    size_t look_size, look_cap;
+    char *next_look;
+    size_t next_look_size, next_look_cap;
+    bool next_look_ok;
 
     ASS_Image *images_root;     // rendering result is stored here
     ASS_Image *prev_images_root;
@@ -360,11 +390,16 @@ struct ass_renderer {
     BlurMethodCacheEntry blur_methods[8];
     unsigned blur_method_next;
     uint64_t last_event_render_ns;
+    ClipMemoEntry clip_memo[CLIP_MEMO_SIZE];
 };
 
 typedef struct render_priv {
     int top, height, left, width;
     int render_id;
+    // The Text and look_generation it was found to change with time under:
+    // while both stay, it skips the event cache.
+    const char *timed_text;
+    uint32_t timed_look;
 } RenderPriv;
 
 typedef struct {
@@ -388,13 +423,13 @@ bool ass_trim_blur_vertical(ParamFilterFunc *filter, int16_t *dst,
 bool ass_run_vertical_filter(ASS_Renderer *renderer, FilterFunc *plain,
                              ParamFilterFunc *param_filter, int16_t *dst,
                              const int16_t *src, size_t width, size_t src_h,
-                             size_t dst_h, const int16_t *coeff);
+                             size_t dst_h, const int16_t *coeff, size_t weight);
 typedef void BlurSliceFunc(void *ctx, unsigned lane, unsigned lanes);
 bool ass_run_blur_slices(ASS_Renderer *renderer, BlurSliceFunc *fn, void *ctx,
-                         size_t items, size_t width, size_t height);
+                         size_t items, size_t width, size_t height, size_t weight);
 #ifdef ASS_EVENT_THREADS
 bool ass_clone_render_settings(ASS_Renderer *dst, const ASS_Renderer *src,
-                                unsigned *font_generation, int *render_id);
+                                unsigned *font_generation, int *reconfigure_id);
 void ass_event_pool_cache_limits(ASS_Renderer *renderer);
 #endif
 

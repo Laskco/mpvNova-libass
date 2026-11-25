@@ -835,7 +835,7 @@ bool ass_gaussian_blur(ASS_Renderer *renderer, Bitmap *bm, const Bitmap *src,
 
     {
         UnpackSliceCtx uctx = {engine->stripe_unpack, tmp, src->buffer, src->stride, w, h, (size_t) alignment};
-        if (!ass_run_blur_slices(renderer, unpack_slice_worker, &uctx, (w + alignment - 1) / alignment, w, h))
+        if (!ass_run_blur_slices(renderer, unpack_slice_worker, &uctx, (w + alignment - 1) / alignment, w, h, 1))
             engine->stripe_unpack(tmp, src->buffer, src->stride, w, h);
     }
     // Unpack first: bm may alias src, whose allocation is freed by reallocation.
@@ -848,7 +848,7 @@ bool ass_gaussian_blur(ASS_Renderer *renderer, Bitmap *bm, const Bitmap *src,
 
     for (int i = 0; i < blur_y.level; i++) {
         if (!ass_run_vertical_filter(renderer, engine->shrink_vert, NULL,
-                buf[index ^ 1], buf[index], w, h, (h + 5) >> 1, NULL))
+                buf[index ^ 1], buf[index], w, h, (h + 5) >> 1, NULL, 3))
             engine->shrink_vert(buf[index ^ 1], buf[index], w, h);
         h = (h + 5) >> 1;
         index ^= 1;
@@ -859,7 +859,7 @@ bool ass_gaussian_blur(ASS_Renderer *renderer, Bitmap *bm, const Bitmap *src,
         if (engine->align_order == 4) {
             HorzScaleSliceCtx hctx = {buf[index ^ 1], buf[index], w, h};
             size_t dst_stripes = (((w + 5) >> 1) + 7) >> 3;
-            done = ass_run_blur_slices(renderer, shrink_horz_slice_worker, &hctx, dst_stripes, w, h);
+            done = ass_run_blur_slices(renderer, shrink_horz_slice_worker, &hctx, dst_stripes, (w + 5) >> 1, h, 3);
         }
 #endif
         if (!done)
@@ -877,7 +877,8 @@ bool ass_gaussian_blur(ASS_Renderer *renderer, Bitmap *bm, const Bitmap *src,
                 blur_slice_probe_uniform(buf[index], w, h, blur_x.radius > 4)
             };
             size_t dst_stripes = (w + 2 * (size_t) blur_x.radius + 7) >> 3;
-            done = ass_run_blur_slices(renderer, blur_horz_slice_worker, &bctx, dst_stripes, w, h);
+            done = ass_run_blur_slices(renderer, blur_horz_slice_worker, &bctx, dst_stripes,
+                                       w + 2 * (size_t) blur_x.radius, h, (size_t) blur_x.radius);
         }
 #endif
         if (!done)
@@ -889,7 +890,7 @@ bool ass_gaussian_blur(ASS_Renderer *renderer, Bitmap *bm, const Bitmap *src,
     bool large_vertical = w &&
         (w >= 16 * 1024 || h >= (16 * 1024 + w - 1) / w);
     if (!ass_run_vertical_filter(renderer, NULL, engine->blur_vert[blur_y.radius - 4],
-            buf[index ^ 1], buf[index], w, h, h + 2 * blur_y.radius, blur_y.coeff) &&
+            buf[index ^ 1], buf[index], w, h, h + 2 * blur_y.radius, blur_y.coeff, (size_t) blur_y.radius) &&
         !(large_vertical && engine->align_order == 4 &&
           ass_trim_blur_vertical(engine->blur_vert[blur_y.radius - 4],
               buf[index ^ 1], buf[index], w, h, h + 2 * blur_y.radius, blur_y.coeff)))
@@ -903,7 +904,7 @@ bool ass_gaussian_blur(ASS_Renderer *renderer, Bitmap *bm, const Bitmap *src,
             HorzScaleSliceCtx hctx = {buf[index ^ 1], buf[index], w, h};
             size_t dst_w = 2 * w + 4;
             size_t items = (dst_w > 8 ? (dst_w + 7) >> 4 : 0) + (!((dst_w - 1) & 8) ? 1 : 0);
-            done = ass_run_blur_slices(renderer, expand_horz_slice_worker, &hctx, items, dst_w, h);
+            done = ass_run_blur_slices(renderer, expand_horz_slice_worker, &hctx, items, dst_w, h, 2);
         }
 #endif
         if (!done)
@@ -913,7 +914,7 @@ bool ass_gaussian_blur(ASS_Renderer *renderer, Bitmap *bm, const Bitmap *src,
     }
     for (int i = 0; i < blur_y.level; i++) {
         if (!ass_run_vertical_filter(renderer, engine->expand_vert, NULL,
-                buf[index ^ 1], buf[index], w, h, 2 * h + 4, NULL))
+                buf[index ^ 1], buf[index], w, h, 2 * h + 4, NULL, 2))
             engine->expand_vert(buf[index ^ 1], buf[index], w, h);
         h = 2 * h + 4;
         index ^= 1;
@@ -934,7 +935,7 @@ bool ass_gaussian_blur(ASS_Renderer *renderer, Bitmap *bm, const Bitmap *src,
 #if defined(__ARM_NEON)
         if (engine->align_order == 4) {
             PackSliceCtx pctx = {bm->buffer, bm->stride, buf[index], w, h};
-            done = ass_run_blur_slices(renderer, pack_slice_worker, &pctx, (w + 15) >> 4, w, h);
+            done = ass_run_blur_slices(renderer, pack_slice_worker, &pctx, (w + 15) >> 4, w, h, 1);
         }
 #endif
         if (!done)

@@ -480,6 +480,7 @@ char *ass_parse_tags(RenderContext *state, char *p, char *end, double pwr,
                 } else
                     state->frz = state->style->Angle;
             } else if (complex_tag("fade") || complex_tag("fad")) {
+                state->timed = true;
                 int32_t a1, a2, a3;
                 int32_t t1, t2, t3, t4;
                 if (nargs == 2) {
@@ -629,6 +630,7 @@ char *ass_parse_tags(RenderContext *state, char *p, char *end, double pwr,
             break;
         case 'm':
             if (complex_tag("move")) {
+                state->timed = true;
                 double x1, x2, y1, y2;
                 int32_t t1, t2, delta_t, t;
                 double x, y;
@@ -756,6 +758,7 @@ char *ass_parse_tags(RenderContext *state, char *p, char *end, double pwr,
             break;
         case 't':
             if (complex_tag("t")) {
+                state->timed = true;
                 double accel;
                 int cnt = nargs - 1;
                 int32_t t1, t2, t, delta_t;
@@ -947,6 +950,7 @@ char *ass_parse_tags(RenderContext *state, char *p, char *end, double pwr,
         case 'k':
             if (tag("kt")) {
                 // v4++
+                state->timed = true;
                 double val = 0;
                 if (nargs)
                     val = argtod(*args) * 10;
@@ -954,6 +958,7 @@ char *ass_parse_tags(RenderContext *state, char *p, char *end, double pwr,
                 state->effect_timing = 0;
                 state->reset_effect = true;
             } else if (tag("kf")) {
+                state->timed = true;
                 double val = 100;
                 if (nargs)
                     val = argtod(*args);
@@ -962,6 +967,7 @@ char *ass_parse_tags(RenderContext *state, char *p, char *end, double pwr,
                         (uint32_t) state->effect_timing;
                 state->effect_timing = dtoi32(val * 10);
             } else if (tag("ko")) {
+                state->timed = true;
                 double val = 100;
                 if (nargs)
                     val = argtod(*args);
@@ -970,6 +976,7 @@ char *ass_parse_tags(RenderContext *state, char *p, char *end, double pwr,
                         (uint32_t) state->effect_timing;
                 state->effect_timing = dtoi32(val * 10);
             } else if (tag("k")) {
+                state->timed = true;
                 double val = 100;
                 if (nargs)
                     val = argtod(*args);
@@ -981,6 +988,7 @@ char *ass_parse_tags(RenderContext *state, char *p, char *end, double pwr,
             break;
         case 'K':
             if (tag("K")) {
+                state->timed = true;
                 double val = 100;
                 if (nargs)
                     val = argtod(*args);
@@ -1089,6 +1097,7 @@ void ass_apply_transition_effects(RenderContext *state)
         state->scroll_shift =
             (render_priv->time - event->Start) / delay;
         state->evt_type |= EVENT_HSCROLL;
+        state->timed = true;
         state->detect_collisions = 0;
         state->wrap_style = 2;
         return;
@@ -1128,6 +1137,7 @@ void ass_apply_transition_effects(RenderContext *state)
         state->scroll_y0 = y0;
         state->scroll_y1 = y1;
         state->evt_type |= EVENT_VSCROLL;
+        state->timed = true;
         state->detect_collisions = 0;
     }
 

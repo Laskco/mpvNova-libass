@@ -35,6 +35,8 @@ typedef struct ass_font ASS_Font;
 #define VERTICAL_LOWER_BOUND 0x02f1
 
 #define ASS_FONT_MAX_FACES 10
+#define ASS_FONT_INDEX_CACHE_BITS 9
+#define ASS_FONT_MISSING_BITS 8
 #define DECO_UNDERLINE     1
 #define DECO_STRIKETHROUGH 2
 #define DECO_ROTATE        4
@@ -46,7 +48,11 @@ struct ass_font {
     int faces_uid[ASS_FONT_MAX_FACES];
     FT_Face faces[ASS_FONT_MAX_FACES];
     struct hb_font_t *hb_fonts[ASS_FONT_MAX_FACES];
+    // Per-face glyph index cache: (uint64_t) symbol << 32 | (glyph_index + 1)
+    uint64_t *char_indices[ASS_FONT_MAX_FACES];
     int n_faces;
+    // Codepoints no face has, so the fallback search can be skipped
+    uint64_t missing[1 << ASS_FONT_MISSING_BITS];
     // Immutable embedded backing data; NULL for unverified providers.
     const char *primary_data;
     size_t primary_size;
@@ -64,6 +70,7 @@ void ass_font_get_asc_desc(ASS_Font *font, int face_index,
                            int *asc, int *desc);
 int ass_font_get_index(ASS_FontSelector *fontsel, ASS_Font *font,
                        uint32_t symbol, int *face_index, int *glyph_index);
+uint32_t ass_font_get_char_index(ASS_Font *font, int face_index, uint32_t symbol);
 uint32_t ass_font_index_magic(FT_Face face, uint32_t symbol);
 bool ass_font_get_glyph(ASS_Font *font, int face_index, int index,
                         ASS_Hinting hinting);

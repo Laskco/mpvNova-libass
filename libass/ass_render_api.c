@@ -31,6 +31,9 @@ static void ass_reconfigure(ASS_Renderer *priv)
     ASS_Settings *settings = &priv->settings;
 
     priv->render_id++;
+    priv->reconfigure_id++;
+    memset(priv->clip_memo, 0, sizeof(priv->clip_memo));
+    ass_cache_empty(priv->cache.event_cache);
     ass_cache_empty(priv->cache.composite_cache);
     ass_cache_empty(priv->cache.bitmap_cache);
     ass_cache_empty(priv->cache.outline_cache);
@@ -139,9 +142,11 @@ void ass_set_line_spacing(ASS_Renderer *priv, double line_spacing)
 
 void ass_set_line_position(ASS_Renderer *priv, double line_position)
 {
+    // It only moves where events are placed, which bitmap/outline caches do not hold,
+    // so sliding subtitles above player controls keeps warm caches intact.
     if (priv->settings.line_position != line_position) {
         priv->settings.line_position = line_position;
-        ass_reconfigure(priv);
+        priv->render_id++;
     }
 }
 
@@ -166,6 +171,7 @@ static void set_fonts_from(ASS_Renderer *priv, const char *default_font,
 
     ass_cache_empty(priv->cache.font_cache);
     ass_cache_empty(priv->cache.metrics_cache);
+    ass_cache_empty(priv->cache.shape_cache);
 
     if (priv->fontselect)
         ass_fontselect_free(priv->fontselect);
@@ -188,12 +194,38 @@ void ass_set_selective_style_override_enabled(ASS_Renderer *priv, int bits)
     }
 }
 
+static bool same_style(const ASS_Style *a, const ASS_Style *b)
+{
+    bool same_font = (!a->FontName && !b->FontName) ||
+        (a->FontName && b->FontName && !strcmp(a->FontName, b->FontName));
+    return same_font &&
+        a->FontSize == b->FontSize &&
+        a->PrimaryColour == b->PrimaryColour &&
+        a->SecondaryColour == b->SecondaryColour &&
+        a->OutlineColour == b->OutlineColour &&
+        a->BackColour == b->BackColour &&
+        a->Bold == b->Bold && a->Italic == b->Italic &&
+        a->Underline == b->Underline && a->StrikeOut == b->StrikeOut &&
+        a->ScaleX == b->ScaleX && a->ScaleY == b->ScaleY &&
+        a->Spacing == b->Spacing && a->Angle == b->Angle &&
+        a->BorderStyle == b->BorderStyle &&
+        a->Outline == b->Outline && a->Shadow == b->Shadow &&
+        a->Alignment == b->Alignment &&
+        a->MarginL == b->MarginL && a->MarginR == b->MarginR &&
+        a->MarginV == b->MarginV && a->Encoding == b->Encoding &&
+        a->treat_fontname_as_pattern == b->treat_fontname_as_pattern &&
+        a->Blur == b->Blur && a->Justify == b->Justify;
+}
+
 void ass_set_selective_style_override(ASS_Renderer *priv, ASS_Style *style)
 {
     ASS_Style *user_style = &priv->user_override_style;
+    if (same_style(user_style, style))
+        return;
     free(user_style->FontName);
     *user_style = *style;
-    user_style->FontName = strdup(user_style->FontName);
+    user_style->Name = NULL;
+    user_style->FontName = style->FontName ? strdup(style->FontName) : NULL;
     ass_reconfigure(priv);
 }
 
@@ -214,11 +246,12 @@ void ass_set_cache_limits(ASS_Renderer *render_priv, int glyph_max,
         composite_cache = bitmap_cache / (COMPOSITE_CACHE_RATIO + 1);
         bitmap_cache -= composite_cache;
     } else {
-        bitmap_cache = BITMAP_CACHE_MAX_SIZE;
-        composite_cache = COMPOSITE_CACHE_MAX_SIZE;
+        bitmap_cache = composite_cache = 0;
     }
     render_priv->cache.bitmap_max_size = bitmap_cache;
     render_priv->cache.composite_max_size = composite_cache;
+    render_priv->cache.growth = 1;
+    render_priv->cache.returned = 0;
 #ifdef ASS_EVENT_THREADS
     ass_event_pool_cache_limits(render_priv);
 #endif
@@ -236,7 +269,7 @@ ass_create_font_provider(ASS_Renderer *priv, ASS_FontProviderFuncs *funcs,
 
 #ifdef ASS_EVENT_THREADS
 bool ass_clone_render_settings(ASS_Renderer *dst, const ASS_Renderer *src,
-                                unsigned *font_generation, int *render_id)
+                                unsigned *font_generation, int *reconfigure_id)
 {
     if (*font_generation != src->font_generation) {
         set_fonts_from(dst, src->settings.default_font, src->settings.default_family,
@@ -248,7 +281,7 @@ bool ass_clone_render_settings(ASS_Renderer *dst, const ASS_Renderer *src,
             return false;
         *font_generation = src->font_generation;
     }
-    if (*render_id != src->render_id) {
+    if (*reconfigure_id != src->reconfigure_id) {
         char *font = src->user_override_style.FontName ?
                      strdup(src->user_override_style.FontName) : NULL;
         if (src->user_override_style.FontName && !font) return false;
@@ -258,14 +291,17 @@ bool ass_clone_render_settings(ASS_Renderer *dst, const ASS_Renderer *src,
         dst->settings = settings;
         free(dst->user_override_style.FontName);
         dst->user_override_style = src->user_override_style;
+        dst->user_override_style.Name = NULL;
         dst->user_override_style.FontName = font;
         ass_reconfigure(dst);
-        *render_id = src->render_id;
+        *reconfigure_id = src->reconfigure_id;
     }
-    // These setters do not increment render_id.
+    // These setters do not require emptying worker caches.
     dst->settings.line_spacing = src->settings.line_spacing;
+    dst->settings.line_position = src->settings.line_position;
     dst->settings.shaper = src->settings.shaper;
     dst->settings.use_margins = src->settings.use_margins;
+    dst->render_id = src->render_id;
     return true;
 }
 #endif

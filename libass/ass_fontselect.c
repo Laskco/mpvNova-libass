@@ -103,6 +103,7 @@ struct font_selector {
     ASS_FontProvider *embedded_provider;
     ASS_DefaultFontProvider default_provider_id;
     size_t provider_count;
+    unsigned generation;    // changes whenever fonts come or go
 };
 
 struct font_provider {
@@ -536,6 +537,7 @@ ass_font_provider_add_font(ASS_FontProvider *provider,
     info->provider = provider;
 
     selector->n_font++;
+    selector->generation++;
 
     free_font_info(&implicit_meta);
     free(implicit_meta.postscript_name);
@@ -600,6 +602,12 @@ static void ass_fontselect_cleanup(ASS_FontSelector *selector)
     }
 
     selector->n_font = w;
+    selector->generation++;
+}
+
+unsigned ass_fontselect_generation(const ASS_FontSelector *priv)
+{
+    return priv->generation;
 }
 
 void ass_font_provider_free(ASS_FontProvider *provider)

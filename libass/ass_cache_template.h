@@ -87,6 +87,25 @@ START(glyph_metrics, glyph_metrics_hash_key)
     GENERIC(int, glyph_index)
 END(GlyphMetricsHashKey)
 
+// describes a run of text as HarfBuzz shapes it
+// font is refed when inserted and unrefed when dropped;
+// on call to ass_cache_get(), text is a non-owning view of the codepoints
+// HarfBuzz reads: context before, the run, context after;
+// its content is duplicated when inserted; the copy is freed when dropped
+START(shape, shape_hash_key)
+    GENERIC(ASS_Font *, font)
+    GENERIC(double, size)
+    GENERIC(int, face_index)
+    GENERIC(const void *, charmap)
+    GENERIC(int, direction)
+    GENERIC(unsigned, script)
+    GENERIC(const void *, language)
+    GENERIC(unsigned, features)  // bit i set when the shaper's feature i is on
+    GENERIC(int, context_before)
+    GENERIC(int, context_after)
+    STRING(text)
+END(ShapeHashKey)
+
 // describes an outline glyph
 // font is refed when inserted and unrefed when dropped
 START(glyph, glyph_hash_key)
@@ -134,6 +153,18 @@ START(bitmap_ref, bitmap_ref_key)
     VECTOR(pos)
     VECTOR(pos_o)
 END(BitmapRef)
+
+// describes a rendered event; look is the renderer's look_generation
+// on call to ass_cache_get(), effect and text are non-owning views
+START(event, event_hash_key)
+    GENERIC(uint32_t, look)
+    GENERIC(int, style)
+    GENERIC(int, margin_l)
+    GENERIC(int, margin_r)
+    GENERIC(int, margin_v)
+    STRING(effect)
+    STRING(text)
+END(EventHashKey)
 
 #undef START
 #undef GENERIC

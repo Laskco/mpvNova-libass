@@ -263,6 +263,7 @@ char *ass_font_select(ASS_FontSelector *priv,
                       const ASS_Font *font, int *index, char **postscript_name,
                       int *uid, ASS_FontStream *data, uint32_t code);
 void ass_fontselect_free(ASS_FontSelector *priv);
+unsigned ass_fontselect_generation(const ASS_FontSelector *priv);
 
 // Font provider functions
 ASS_FontProvider *ass_font_provider_new(ASS_FontSelector *selector,

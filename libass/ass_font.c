@@ -536,9 +536,13 @@ static int add_face(ASS_FontSelector *fontsel, ASS_Font *font, uint32_t ch)
     ass_charmap_magic(font->library, face);
     set_font_metrics(face);
 
+    font->char_indices[font->n_faces] = calloc(1 << ASS_FONT_INDEX_CACHE_BITS,
+                                               sizeof(*font->char_indices[0]));
     font->faces[font->n_faces] = face;
     font->faces_uid[font->n_faces] = uid;
-    if (!ass_create_hb_font(font, font->n_faces)) {
+    if (!font->char_indices[font->n_faces] || !ass_create_hb_font(font, font->n_faces)) {
+        free(font->char_indices[font->n_faces]);
+        font->char_indices[font->n_faces] = NULL;
         FT_Done_Face(face);
         goto fail;
     }
@@ -601,6 +605,8 @@ size_t ass_font_construct(void *key, void *value, void *priv)
     font->library = render_priv->library;
     font->ftlibrary = render_priv->ftlibrary;
     font->n_faces = 0;
+    memset(font->char_indices, 0, sizeof(font->char_indices));
+    memset(font->missing, 0, sizeof(font->missing));
     font->primary_data = NULL;
     font->primary_size = 0;
     font->uid = next_ass_font_uid();
@@ -733,6 +739,46 @@ static void ass_glyph_italicize(FT_Face face)
     FT_Outline_Transform(&face->glyph->outline, &xfrm);
 }
 
+static inline uint64_t *char_index_slot(ASS_Font *font, int face_index, uint32_t symbol)
+{
+    unsigned slot = (symbol * 2654435761u) >> (32 - ASS_FONT_INDEX_CACHE_BITS);
+    return &font->char_indices[face_index][slot];
+}
+
+static inline void clear_char_index_cache(ASS_Font *font, int face_index)
+{
+    if (font->char_indices[face_index])
+        memset(font->char_indices[face_index], 0,
+               (1 << ASS_FONT_INDEX_CACHE_BITS) * sizeof(*font->char_indices[0]));
+}
+
+uint32_t ass_font_get_char_index(ASS_Font *font, int face_index, uint32_t symbol)
+{
+    uint64_t *slot = char_index_slot(font, face_index, symbol);
+    uint64_t entry = *slot;
+    if (entry && (entry >> 32) == symbol)
+        return (uint32_t) entry - 1;
+
+    FT_Face face = font->faces[face_index];
+    uint32_t index = ass_font_index_magic(face, symbol);
+    if (index)
+        index = FT_Get_Char_Index(face, index);
+    *slot = ((uint64_t) symbol << 32) | (index + 1);
+    return index;
+}
+
+static inline uint64_t missing_tag(const ASS_FontSelector *fontsel, uint32_t symbol, int n_faces)
+{
+    return ((uint64_t) symbol << 32) |
+           ((uint64_t) (ass_fontselect_generation(fontsel) & 0xffff) << 16) |
+           ((uint64_t) n_faces << 8);
+}
+
+static inline uint64_t *missing_slot(ASS_Font *font, uint32_t symbol)
+{
+    return &font->missing[(symbol * 2654435761u) >> (32 - ASS_FONT_MISSING_BITS)];
+}
+
 /**
  * \brief Get glyph and face index
  * Finds a face that has the requested codepoint and returns both face
@@ -757,15 +803,26 @@ int ass_font_get_index(ASS_FontSelector *fontsel, ASS_Font *font,
     }
 
     for (i = 0; i < font->n_faces && index == 0; ++i) {
-        face = font->faces[i];
-        index = ass_font_index_magic(face, symbol);
-        if (index)
-            index = FT_Get_Char_Index(face, index);
+        index = ass_font_get_char_index(font, i, symbol);
         if (index)
             *face_index = i;
     }
 
-    if (index == 0) {
+    uint64_t *missing = missing_slot(font, symbol);
+    uint64_t known = index ? 0 : *missing;
+    if (known && (known >> 8) == (missing_tag(fontsel, symbol, font->n_faces) >> 8)) {
+        *face_index = (int) (known & 0xff) - 1;
+        if (*face_index >= 0) {
+            face = font->faces[*face_index];
+            if (face->num_charmaps > 0) {
+                FT_CharMap last = face->charmaps[face->num_charmaps - 1];
+                if (face->charmap != last) {
+                    FT_Set_Charmap(face, last);
+                    clear_char_index_cache(font, *face_index);
+                }
+            }
+        }
+    } else if (index == 0) {
         int face_idx;
         ass_msg(font->library, MSGL_INFO,
                 "Glyph 0x%X not found, selecting one more "
@@ -774,9 +831,7 @@ int ass_font_get_index(ASS_FontSelector *fontsel, ASS_Font *font,
         face_idx = *face_index = add_face(fontsel, font, symbol);
         if (face_idx >= 0) {
             face = font->faces[face_idx];
-            index = ass_font_index_magic(face, symbol);
-            if (index)
-                index = FT_Get_Char_Index(face, index);
+            index = ass_font_get_char_index(font, face_idx, symbol);
             if (index == 0 && face->num_charmaps > 0) {
                 int i;
                 ass_msg(font->library, MSGL_WARN,
@@ -788,6 +843,7 @@ int ass_font_get_index(ASS_FontSelector *fontsel, ASS_Font *font,
                         index = FT_Get_Char_Index(face, index);
                     if (index) break;
                 }
+                clear_char_index_cache(font, face_idx);
             }
             if (index == 0) {
                 ass_msg(font->library, MSGL_ERR,
@@ -795,6 +851,10 @@ int ass_font_get_index(ASS_FontSelector *fontsel, ASS_Font *font,
                         symbol, (int) font->desc.family.len, font->desc.family.str, font->desc.bold,
                         font->desc.italic);
             }
+        }
+        if (index == 0) {
+            *missing = missing_tag(fontsel, symbol, font->n_faces) |
+                       (uint64_t) (face_idx + 1);
         }
     }
 
@@ -856,6 +916,7 @@ void ass_font_clear(ASS_Font *font)
             FT_Done_Face(font->faces[i]);
         if (font->hb_fonts[i])
             hb_font_destroy(font->hb_fonts[i]);
+        free(font->char_indices[i]);
     }
     free((char *) font->desc.family.str);
 }

@@ -117,7 +117,9 @@ static bool render_context_init(RenderContext *state, ASS_Renderer *priv)
     if (!text_info_init(&state->text_info))
         return false;
 
-    if (!(state->shaper = ass_shaper_new(priv->cache.metrics_cache, priv->cache.face_size_metrics_cache)))
+    if (!(state->shaper = ass_shaper_new(priv->cache.metrics_cache,
+                                         priv->cache.face_size_metrics_cache,
+                                         priv->cache.shape_cache)))
         return false;
 
     int tolerance = priv->experimental_edges >= 2 ? 4 * RASTERIZER_PRECISION :
@@ -182,14 +184,18 @@ ASS_Renderer *ass_renderer_init(ASS_Library *library)
     priv->cache.outline_cache = ass_outline_cache_create();
     priv->cache.face_size_metrics_cache = ass_face_size_metrics_cache_create();
     priv->cache.metrics_cache = ass_glyph_metrics_cache_create();
+    priv->cache.shape_cache = ass_shape_cache_create();
+    priv->cache.event_cache = ass_event_cache_create();
     if (!priv->cache.font_cache || !priv->cache.bitmap_cache ||
         !priv->cache.composite_cache || !priv->cache.outline_cache ||
-        !priv->cache.face_size_metrics_cache || !priv->cache.metrics_cache)
+        !priv->cache.face_size_metrics_cache || !priv->cache.metrics_cache ||
+        !priv->cache.shape_cache || !priv->cache.event_cache)
         goto fail;
 
     priv->cache.glyph_max = GLYPH_CACHE_MAX;
-    priv->cache.bitmap_max_size = BITMAP_CACHE_MAX_SIZE;
-    priv->cache.composite_max_size = COMPOSITE_CACHE_MAX_SIZE;
+    priv->cache.growth = 1;
+    ass_cache_watch_returns(priv->cache.bitmap_cache, 13);
+    ass_cache_watch_returns(priv->cache.composite_cache, 13);
 
     if (!render_context_init(&priv->state, priv))
         goto fail;
@@ -227,11 +233,14 @@ void ass_renderer_done(ASS_Renderer *render_priv)
 
     render_context_done(&render_priv->state);
 
+    // Before composite_cache, whose values cached events hold.
+    ass_cache_done(render_priv->cache.event_cache);
     ass_cache_done(render_priv->cache.composite_cache);
     ass_cache_done(render_priv->cache.bitmap_cache);
     ass_cache_done(render_priv->cache.outline_cache);
     ass_cache_done(render_priv->cache.face_size_metrics_cache);
     ass_cache_done(render_priv->cache.metrics_cache);
+    ass_cache_done(render_priv->cache.shape_cache);
     ass_cache_done(render_priv->cache.font_cache);
 
     if (render_priv->fontselect)
@@ -244,6 +253,8 @@ void ass_renderer_done(ASS_Renderer *render_priv)
     ass_outline_free(&render_priv->raster_outline[0]);
     ass_outline_free(&render_priv->raster_outline[1]);
 
+    free(render_priv->look);
+    free(render_priv->next_look);
     free(render_priv->settings.default_font);
     free(render_priv->settings.default_family);
 
@@ -282,6 +293,21 @@ static ASS_Image *my_draw_bitmap(unsigned char *bitmap, int bitmap_w,
     img->ref_count = 0;
 
     return &img->result;
+}
+
+// A copy of `img` whose bitmap `holder`, a cache value, keeps alive.
+static ASS_Image *clone_image(const ASS_Image *img, void *holder)
+{
+    ASS_ImagePriv *clone = malloc(sizeof(ASS_ImagePriv));
+    if (!clone)
+        return NULL;
+    clone->result = *img;
+    clone->result.next = NULL;
+    clone->source = holder;
+    ass_cache_inc_ref(holder);
+    clone->buffer = NULL;
+    clone->ref_count = 0;
+    return &clone->result;
 }
 
 /**
@@ -1317,6 +1343,7 @@ init_render_context(RenderContext *state, ASS_Event *event)
     state->event = event;
     state->parsed_tags = 0;
     state->evt_type = EVENT_NORMAL;
+    state->timed = false;
 
     state->wrap_style = render_priv->track->WrapStyle;
 
@@ -1578,6 +1605,42 @@ static void calc_transform_matrix(RenderContext *state,
  */
 static double restore_blur(int qblur);
 
+// Remember the last vector-clip crop window per (outline, transform). Once a
+// clip window moves from frame to frame, stop cropping so the uncropped bitmap
+// is cached once and masked by blend_vector_clip (pixel-identical to stock).
+static bool clip_window_moving(ASS_Renderer *r, const BitmapHashKey *k,
+                               int64_t x0, int64_t y0, int64_t x1, int64_t y1)
+{
+    uint64_t h = UINT64_C(1469598103934665603);
+    const uint64_t words[5] = {
+        (uint64_t) (uintptr_t) k->outline,
+        ((uint64_t) (uint32_t) k->offset.x << 32) | (uint32_t) k->offset.y,
+        ((uint64_t) (uint32_t) k->matrix_x.x << 32) | (uint32_t) k->matrix_x.y,
+        ((uint64_t) (uint32_t) k->matrix_y.x << 32) | (uint32_t) k->matrix_y.y,
+        ((uint64_t) (uint32_t) k->matrix_z.x << 32) | (uint32_t) k->matrix_z.y,
+    };
+    for (int i = 0; i < 5; i++) {
+        h ^= words[i];
+        h *= UINT64_C(1099511628211);
+        h ^= h >> 29;
+    }
+    if (!h)
+        h = 1;
+    ClipMemoEntry *m = &r->clip_memo[(h ^ (h >> 32)) & (CLIP_MEMO_SIZE - 1)];
+    if (m->hash != h) {
+        m->hash = h;
+        m->x0 = x0;
+        m->y0 = y0;
+        m->x1 = x1;
+        m->y1 = y1;
+        m->moving = false;
+        return false;
+    }
+    if (!m->moving && (m->x0 != x0 || m->y0 != y0 || m->x1 != x1 || m->y1 != y1))
+        m->moving = true;
+    return m->moving;
+}
+
 static void set_bitmap_clip(RenderContext *state, GlyphInfo *info,
                             ASS_Vector pos, BitmapHashKey *key,
                             const FilterDesc *filter)
@@ -1635,6 +1698,8 @@ static void set_bitmap_clip(RenderContext *state, GlyphInfo *info,
     int64_t x1 = (int64_t) ceil(cmax_x) - pos.x + pad_x;
     int64_t y1 = (int64_t) ceil(cmax_y) - pos.y + pad_y;
     if (x0 < INT32_MIN || y0 < INT32_MIN || x1 > INT32_MAX || y1 > INT32_MAX)
+        return;
+    if (clip_window_moving(state->renderer, key, x0, y0, x1, y1))
         return;
     key->clip_min = (ASS_Vector) {x0, y0};
     key->clip_max = (ASS_Vector) {x1, y1};
@@ -3248,11 +3313,11 @@ static bool event_is_transparent(RenderContext *state)
  * Process event, appending resulting ASS_Image's to images_root.
  */
 static bool
-ass_render_event(RenderContext *state, ASS_Event *event,
-                 EventImages *event_images)
+render_event(RenderContext *state, ASS_Event *event,
+             EventImages *event_images)
 {
     ASS_Renderer *render_priv = state->renderer;
-    if (event->Style >= render_priv->track->n_styles) {
+    if (event->Style < 0 || event->Style >= render_priv->track->n_styles) {
         ass_msg(render_priv->library, MSGL_WARN, "No style found");
         return false;
     }
@@ -3478,14 +3543,220 @@ ass_render_event(RenderContext *state, ASS_Event *event,
     return true;
 }
 
+static ASS_Image *ass_free_image(ASS_Image *img);
+
+struct event_construct {
+    RenderContext *state;
+    ASS_Event *event;
+    EventImages images;
+    bool rendered, ok;
+};
+
+size_t ass_event_construct(void *key, void *value, void *priv)
+{
+    EventHashKey *k = key;
+    EventHashValue *v = value;
+    struct event_construct *c = priv;
+
+    c->state->timed = false;
+    c->ok = render_event(c->state, c->event, &c->images);
+    c->rendered = true;
+    *v = (EventHashValue) { .timed = c->state->timed, .rendered = c->ok };
+    size_t size = sizeof(*v) + k->effect.len + k->text.len;
+    if (!c->ok || v->timed)
+        return size;
+
+    v->imgs = c->images.imgs;
+    ass_frame_ref(v->imgs);
+    v->top = c->images.top;
+    v->height = c->images.height;
+    v->left = c->images.left;
+    v->width = c->images.width;
+    v->detect_collisions = c->images.detect_collisions;
+    v->shift_direction = c->images.shift_direction;
+    return size;
+}
+
+// Fast single-pass scan computing text length and hinting whether an event
+// uses time-dependent tags/effects so timed events bypass event_cache on
+// their very first frame without hashing or copying keys.
+static bool event_has_timed_hint(const ASS_Event *event, size_t *text_len_out)
+{
+    if (event->Effect && event->Effect[0]) {
+        if (!strncmp(event->Effect, "Banner;", 7) ||
+            !strncmp(event->Effect, "Scroll up;", 10) ||
+            !strncmp(event->Effect, "Scroll down;", 12))
+            return true;
+    }
+    const char *p = event->Text;
+    const char *start = p;
+    bool in_tags = false;
+    while (*p) {
+        char c = *p++;
+        if (c == '{') {
+            in_tags = true;
+        } else if (c == '}') {
+            in_tags = false;
+        } else if (in_tags && c == '\\') {
+            while (*p == ' ' || *p == '\t')
+                p++;
+            switch (*p) {
+            case 't':
+                if (p[1] == '(')
+                    return true;
+                break;
+            case 'm':
+                if (p[1] == 'o' && p[2] == 'v' && p[3] == 'e' && p[4] == '(')
+                    return true;
+                break;
+            case 'f':
+                if (p[1] == 'a' && p[2] == 'd' &&
+                    (p[3] == '(' || (p[3] == 'e' && p[4] == '(')))
+                    return true;
+                break;
+            case 'k':
+            case 'K':
+                return true;
+            default:
+                break;
+            }
+        }
+    }
+    *text_len_out = (size_t) (p - start);
+    return false;
+}
+
+/**
+ * \brief Render an event, or copy its images from the event cache when it
+ * does not change with time; collisions move the copies.
+ */
+static bool
+ass_render_event(RenderContext *state, ASS_Event *event,
+                 EventImages *event_images)
+{
+    ASS_Renderer *render_priv = state->renderer;
+    ASS_RenderPriv *known = event->render_priv;
+    size_t text_len = 0;
+    if (!event->Text || event->Duration < EVENT_CACHE_MIN_MS ||
+        (known && known->timed_text == event->Text &&
+         known->timed_look == render_priv->look_generation) ||
+        event_has_timed_hint(event, &text_len))
+        return render_event(state, event, event_images);
+
+    const char *effect = event->Effect ? event->Effect : "";
+    EventHashKey key = {
+        .look = render_priv->look_generation,
+        .style = event->Style,
+        .margin_l = event->MarginL,
+        .margin_r = event->MarginR,
+        .margin_v = event->MarginV,
+        .effect = { effect, strlen(effect) },
+        .text = { event->Text, text_len },
+    };
+    struct event_construct c = { .state = state, .event = event };
+    EventHashValue *v = ass_cache_get(render_priv->cache.event_cache, &key, &c);
+    if (!v)
+        return render_event(state, event, event_images);
+    if (v->timed) {
+        if (!known) {
+            known = event->render_priv = calloc(1, sizeof(ASS_RenderPriv));
+            if (known)
+                known->render_id = render_priv->render_id;
+        }
+        if (known) {
+            known->timed_text = event->Text;
+            known->timed_look = render_priv->look_generation;
+        }
+        if (!c.rendered)
+            return render_event(state, event, event_images);
+        if (!c.ok)
+            return false;
+        *event_images = c.images;
+        return true;
+    }
+    if (!v->rendered)
+        return false;
+
+    ASS_Image *head = NULL, **tail = &head;
+    for (ASS_Image *img = v->imgs; img; img = img->next) {
+        // Its composite ages as it would had the event been rendered.
+        void *composite = ((ASS_ImagePriv *) img)->source;
+        if (composite)
+            ass_cache_use(composite);
+        ASS_Image *clone = clone_image(img, v);
+        if (!clone) {
+            while (head)
+                head = ass_free_image(head);
+            return false;
+        }
+        *tail = clone;
+        tail = &clone->next;
+    }
+
+    memset(event_images, 0, sizeof(*event_images));
+    event_images->imgs = head;
+    event_images->top = v->top;
+    event_images->height = v->height;
+    event_images->left = v->left;
+    event_images->width = v->width;
+    event_images->detect_collisions = v->detect_collisions;
+    event_images->shift_direction = v->shift_direction;
+    event_images->event = event;
+    return true;
+}
+
+static void effective_cache_budgets(ASS_Renderer *priv, CacheStore *cache,
+                                    size_t extra_returned, bool update_growth,
+                                    size_t *bitmap_out, size_t *composite_out)
+{
+    size_t bitmap_max = cache->bitmap_max_size;
+    size_t composite_max = cache->composite_max_size;
+#ifdef ASS_EVENT_THREADS
+    if (!bitmap_max && !priv->is_event_worker) {
+#else
+    if (!bitmap_max) {
+#endif
+        // Bitmaps grow with the frame's area, so a smaller frame fits as many in less memory.
+        double area = (double) priv->settings.frame_width * priv->settings.frame_height;
+        double scale = FFMINMAX(area / DEFAULT_CACHE_FRAME_AREA,
+                                (double) DEFAULT_CACHE_MIN_SIZE / (BITMAP_CACHE_MAX_SIZE + COMPOSITE_CACHE_MAX_SIZE), 1);
+        if (update_growth) {
+            size_t returned = ass_cache_take_returned(cache->bitmap_cache) +
+                              ass_cache_take_returned(cache->composite_cache) +
+                              extra_returned;
+            // Evicted bitmaps that keep being made again outgrew the budget:
+            // double it, up to the default for the largest frames.
+            cache->returned -= cache->returned / CACHE_RETURN_DECAY;
+            cache->returned = returned > SIZE_MAX - cache->returned ?
+                              SIZE_MAX : cache->returned + returned;
+        }
+        double grown = FFMIN(scale * cache->growth, 1);
+        if (update_growth && grown < 1 && cache->returned >
+                (BITMAP_CACHE_MAX_SIZE + COMPOSITE_CACHE_MAX_SIZE) * grown / CACHE_RETURN_LIMIT) {
+            cache->growth *= 2;
+            cache->returned = 0;
+            grown = FFMIN(scale * cache->growth, 1);
+        }
+        bitmap_max = BITMAP_CACHE_MAX_SIZE * grown;
+        composite_max = COMPOSITE_CACHE_MAX_SIZE * grown;
+    }
+    *bitmap_out = bitmap_max;
+    *composite_out = composite_max;
+}
+
 /**
  * \brief Check cache limits and reset cache if they are exceeded
  */
 static void check_cache_limits(ASS_Renderer *priv, CacheStore *cache)
 {
-    ass_cache_cut(cache->composite_cache, cache->composite_max_size);
-    ass_cache_cut(cache->bitmap_cache, cache->bitmap_max_size);
+    size_t bitmap_max, composite_max;
+    effective_cache_budgets(priv, cache, 0, true, &bitmap_max, &composite_max);
+    // An event that stopped showing would keep its composites from being evicted.
+    ass_cache_cut_unused(cache->event_cache, EVENT_CACHE_FRAMES);
+    ass_cache_cut(cache->composite_cache, composite_max);
+    ass_cache_cut(cache->bitmap_cache, bitmap_max);
     ass_cache_cut(cache->outline_cache, cache->glyph_max);
+    ass_cache_cut(cache->shape_cache, cache->glyph_max ? SHAPE_CACHE_MAX_SIZE : 0);
 }
 
 static void setup_shaper(ASS_Shaper *shaper, ASS_Renderer *render_priv)
@@ -3501,6 +3772,152 @@ static void setup_shaper(ASS_Shaper *shaper, ASS_Renderer *render_priv)
 #endif
     ass_shaper_set_whole_text_layout(shaper,
             track->parser_priv->feature_flags & FEATURE_MASK(ASS_FEATURE_WHOLE_TEXT_LAYOUT));
+}
+
+static void look_append(ASS_Renderer *priv, const void *data, size_t size)
+{
+    if (!size || !priv->next_look_ok)
+        return;
+    if (priv->next_look_size + size > priv->next_look_cap) {
+        size_t cap = FFMAX(2 * priv->next_look_cap, priv->next_look_size + size);
+        char *grown = realloc(priv->next_look, cap);
+        if (!grown) {
+            priv->next_look_ok = false;
+            return;
+        }
+        priv->next_look = grown;
+        priv->next_look_cap = cap;
+    }
+    memcpy(priv->next_look + priv->next_look_size, data, size);
+    priv->next_look_size += size;
+}
+
+static void look_append_string(ASS_Renderer *priv, const char *str)
+{
+    size_t len = str ? strlen(str) : 0;
+    look_append(priv, &len, sizeof(len));
+    look_append(priv, str, len);
+}
+
+static inline void look_append_int(ASS_Renderer *priv, int val)
+{
+    look_append(priv, &val, sizeof(val));
+}
+
+static inline void look_append_u32(ASS_Renderer *priv, uint32_t val)
+{
+    look_append(priv, &val, sizeof(val));
+}
+
+static inline void look_append_size(ASS_Renderer *priv, size_t val)
+{
+    look_append(priv, &val, sizeof(val));
+}
+
+static inline void look_append_double(ASS_Renderer *priv, double val)
+{
+    look_append(priv, &val, sizeof(val));
+}
+
+static void look_append_style(ASS_Renderer *priv, const ASS_Style *style, bool include_name)
+{
+    look_append_double(priv, style->FontSize);
+    look_append_u32(priv, style->PrimaryColour);
+    look_append_u32(priv, style->SecondaryColour);
+    look_append_u32(priv, style->OutlineColour);
+    look_append_u32(priv, style->BackColour);
+    look_append_int(priv, style->Bold);
+    look_append_int(priv, style->Italic);
+    look_append_int(priv, style->Underline);
+    look_append_int(priv, style->StrikeOut);
+    look_append_double(priv, style->ScaleX);
+    look_append_double(priv, style->ScaleY);
+    look_append_double(priv, style->Spacing);
+    look_append_double(priv, style->Angle);
+    look_append_int(priv, style->BorderStyle);
+    look_append_double(priv, style->Outline);
+    look_append_double(priv, style->Shadow);
+    look_append_int(priv, style->Alignment);
+    look_append_int(priv, style->MarginL);
+    look_append_int(priv, style->MarginR);
+    look_append_int(priv, style->MarginV);
+    look_append_int(priv, style->Encoding);
+    look_append_int(priv, style->treat_fontname_as_pattern);
+    look_append_double(priv, style->Blur);
+    look_append_int(priv, style->Justify);
+    if (include_name)
+        look_append_string(priv, style->Name);
+    look_append_string(priv, style->FontName);
+}
+
+/**
+ * \brief Change look_generation when the settings or track state that events'
+ * looks depend on change.
+ */
+static void update_look(ASS_Renderer *priv)
+{
+    ASS_Track *track = priv->track;
+    ASS_Settings *s = &priv->settings;
+
+    priv->next_look_size = 0;
+    priv->next_look_ok = true;
+    look_append_int(priv, s->frame_width);
+    look_append_int(priv, s->frame_height);
+    look_append_int(priv, s->storage_width);
+    look_append_int(priv, s->storage_height);
+    look_append_double(priv, s->font_size_coeff);
+    look_append_double(priv, s->line_spacing);
+    look_append_double(priv, s->line_position);
+    look_append_int(priv, s->top_margin);
+    look_append_int(priv, s->bottom_margin);
+    look_append_int(priv, s->left_margin);
+    look_append_int(priv, s->right_margin);
+    look_append_int(priv, s->use_margins);
+    look_append_double(priv, s->par);
+    look_append_int(priv, s->hinting);
+    look_append_int(priv, s->shaper);
+    look_append_int(priv, s->selective_style_overrides);
+    look_append_string(priv, s->default_font);
+    look_append_string(priv, s->default_family);
+    look_append_style(priv, &priv->user_override_style, false);
+    look_append_int(priv, priv->render_id);
+    look_append_int(priv, priv->experimental_edges);
+    look_append_size(priv, priv->num_emfonts);
+    look_append_u32(priv, ass_fontselect_generation(priv->fontselect));
+    look_append_double(priv, priv->par_scale_x);
+    look_append_int(priv, track->track_type);
+    look_append_int(priv, track->PlayResX);
+    look_append_int(priv, track->PlayResY);
+    look_append_double(priv, track->Timer);
+    look_append_int(priv, track->WrapStyle);
+    look_append_int(priv, track->ScaledBorderAndShadow);
+    look_append_int(priv, track->Kerning);
+    look_append_string(priv, track->Language);
+    look_append_int(priv, track->YCbCrMatrix);
+    look_append_int(priv, track->LayoutResX);
+    look_append_int(priv, track->LayoutResY);
+    look_append_u32(priv, track->parser_priv->feature_flags);
+    for (int i = 0; i < track->n_styles; i++)
+        look_append_style(priv, track->styles + i, true);
+
+    if (!priv->next_look_ok) {
+        // An incomplete look can't be compared, so nothing rendered with it is reused.
+        free(priv->look);
+        priv->look = NULL;
+        priv->look_size = 0;
+        priv->look_cap = 0;
+        priv->look_generation++;
+    } else if (!priv->look || priv->next_look_size != priv->look_size ||
+               memcmp(priv->next_look, priv->look, priv->look_size)) {
+        char *old = priv->look;
+        size_t old_cap = priv->look_cap;
+        priv->look = priv->next_look;
+        priv->look_size = priv->next_look_size;
+        priv->look_cap = priv->next_look_cap;
+        priv->next_look = old;
+        priv->next_look_cap = old_cap;
+        priv->look_generation++;
+    }
 }
 
 /**
@@ -3551,6 +3968,10 @@ ass_start_frame(ASS_Renderer *render_priv, ASS_Track *track,
             par = 1.0;
     }
     render_priv->par_scale_x = par;
+#ifdef ASS_EVENT_THREADS
+    if (!render_priv->is_event_worker)
+#endif
+        update_look(render_priv);
 
     render_priv->prev_images_root = render_priv->images_root;
     render_priv->images_root = NULL;
@@ -3593,7 +4014,7 @@ typedef struct {
     pthread_cond_t work;
     ASS_MsgBuffer messages;
     unsigned font_generation;
-    int render_id, id;
+    int reconfigure_id, id;
     uint64_t batch_ns;
     bool prepared;
 } EventWorker;
@@ -3611,7 +4032,7 @@ struct ass_event_pool {
     pthread_cond_t done;
     uint64_t generation;
     int count, pending;
-    bool stop, event_ready, legacy_events, cache_split;
+    bool stop, event_ready, legacy_events, cache_split, adaptive_default;
     unsigned job_mask;
     enum { JOB_IDLE, JOB_EVENTS, JOB_VERTICAL, JOB_SLICE, JOB_PREPARE } job_kind;
     VerticalTask vertical;
@@ -3649,21 +4070,49 @@ static void set_pool_cache_limits(struct ass_event_pool *pool, size_t glyphs,
     }
 }
 
+static void refresh_pool_adaptive_budgets(struct ass_event_pool *pool, bool update_growth)
+{
+    if (!pool->adaptive_default)
+        return;
+    ASS_Renderer *owner = pool->owner;
+    size_t extra_returned = 0;
+    if (update_growth) {
+        for (int i = 0; i < pool->count; i++) {
+            ASS_Renderer *w = pool->workers[i].renderer;
+            if (w)
+                extra_returned += ass_cache_take_returned(w->cache.bitmap_cache) +
+                                  ass_cache_take_returned(w->cache.composite_cache);
+        }
+    }
+    size_t saved_bm = owner->cache.bitmap_max_size;
+    size_t saved_comp = owner->cache.composite_max_size;
+    owner->cache.bitmap_max_size = 0;
+    owner->cache.composite_max_size = 0;
+    effective_cache_budgets(owner, &owner->cache, extra_returned, update_growth,
+                            &pool->bitmap_budget, &pool->composite_budget);
+    owner->cache.bitmap_max_size = saved_bm;
+    owner->cache.composite_max_size = saved_comp;
+}
+
 void ass_event_pool_cache_limits(ASS_Renderer *renderer)
 {
     struct ass_event_pool *pool = renderer->event_pool;
     if (!pool || !pool->event_ready)
         return;
+    pool->adaptive_default = (renderer->cache.bitmap_max_size == 0);
+    if (pool->adaptive_default) {
+        refresh_pool_adaptive_budgets(pool, false);
+    } else {
+        pool->bitmap_budget = renderer->cache.bitmap_max_size;
+        pool->composite_budget = renderer->cache.composite_max_size;
+    }
+    pool->glyph_budget = renderer->cache.glyph_max;
     if (pool->cache_split) {
-        set_pool_cache_limits(pool, renderer->cache.glyph_max,
-                renderer->cache.bitmap_max_size, renderer->cache.composite_max_size);
+        set_pool_cache_limits(pool, pool->glyph_budget,
+                pool->bitmap_budget, pool->composite_budget);
         for (int i = 0; i < pool->count; i++)
             check_cache_limits(pool->workers[i].renderer,
                                &pool->workers[i].renderer->cache);
-    } else {
-        pool->glyph_budget = renderer->cache.glyph_max;
-        pool->bitmap_budget = renderer->cache.bitmap_max_size;
-        pool->composite_budget = renderer->cache.composite_max_size;
     }
 }
 
@@ -3707,8 +4156,13 @@ static void restore_serial_cache_limits(struct ass_event_pool *pool)
     pool->owner->cache.composite_max_size =
         pool->composite_budget - pool->worker_composite_limit * (size_t) pool->count;
     if (!pool->worker_glyph_limit && !pool->worker_bitmap_limit &&
-        !pool->worker_composite_limit)
+        !pool->worker_composite_limit) {
         pool->cache_split = false;
+        if (pool->adaptive_default) {
+            pool->owner->cache.bitmap_max_size = 0;
+            pool->owner->cache.composite_max_size = 0;
+        }
+    }
 }
 
 static inline unsigned event_worker_lane(const struct ass_event_pool *pool,
@@ -3842,7 +4296,7 @@ static void *event_worker(void *arg)
             pool->slice.fn(pool->slice.ctx, worker->id, pool->slice.lanes);
         else if (pool->job_kind == JOB_PREPARE)
             worker->prepared = ass_clone_render_settings(worker->renderer,
-                    pool->owner, &worker->font_generation, &worker->render_id);
+                    pool->owner, &worker->font_generation, &worker->reconfigure_id);
         else
             worker->batch_ns = event_batch(pool, worker->renderer, worker->id);
         ass_msg_buffer_end(&worker->messages);
@@ -3913,7 +4367,7 @@ static struct ass_event_pool *event_pool_init(ASS_Renderer *owner)
         EventWorker *worker = pool->workers + i;
         worker->pool = pool;
         worker->id = i + 1;
-        worker->render_id = -1;
+        worker->reconfigure_id = -1;
         if (pthread_cond_init(&worker->work, NULL)) {
             event_pool_done(pool);
             return NULL;
@@ -3950,8 +4404,13 @@ static bool event_pool_prepare_events(struct ass_event_pool *pool)
     pool->event_ready = true;
     ASS_Renderer *owner = pool->owner;
     pool->glyph_budget = owner->cache.glyph_max;
-    pool->bitmap_budget = owner->cache.bitmap_max_size;
-    pool->composite_budget = owner->cache.composite_max_size;
+    pool->adaptive_default = (owner->cache.bitmap_max_size == 0);
+    if (pool->adaptive_default) {
+        refresh_pool_adaptive_budgets(pool, false);
+    } else {
+        pool->bitmap_budget = owner->cache.bitmap_max_size;
+        pool->composite_budget = owner->cache.composite_max_size;
+    }
     return true;
 }
 
@@ -3995,8 +4454,7 @@ static bool certify_primary_events(ASS_Renderer *priv, ASS_Track *track,
             // Do not resolve fallback here, even on a rejected frame.
             FT_UInt glyph = 0;
             if (info->symbol >= 0x20) {
-                uint32_t code = ass_font_index_magic(font->faces[0], info->symbol);
-                if (!code || !(glyph = FT_Get_Char_Index(font->faces[0], code)))
+                if (!(glyph = ass_font_get_char_index(font, 0, info->symbol)))
                     goto reject;
             }
             if (!pool)
@@ -4020,8 +4478,7 @@ static bool certify_primary_events(ASS_Renderer *priv, ASS_Track *track,
                     ASS_Font *match = last_matches[w];
                     if (!match)
                         continue;
-                    uint32_t code = ass_font_index_magic(match->faces[0], info->symbol);
-                    if (!code || FT_Get_Char_Index(match->faces[0], code) != glyph)
+                    if (ass_font_get_char_index(match, 0, info->symbol) != glyph)
                         goto reject;
                 }
             }
@@ -4040,13 +4497,14 @@ reject:
 bool ass_run_vertical_filter(ASS_Renderer *renderer, FilterFunc *plain,
                              ParamFilterFunc *param_filter, int16_t *dst,
                              const int16_t *src, size_t width, size_t src_h,
-                             size_t dst_h, const int16_t *coeff)
+                             size_t dst_h, const int16_t *coeff, size_t weight)
 {
-    if (renderer->is_event_worker || !width || !src_h || !dst_h ||
+    if (renderer->is_event_worker || !width || !src_h || !dst_h || !weight ||
         !src || !dst || src == dst || !!plain == !!param_filter ||
         (param_filter && !coeff))
         return false;
-    if (width < 64 * 1024 && src_h < (64 * 1024 + width - 1) / width)
+    size_t min_pixels = (64 * 1024 + weight - 1) / weight;
+    if (width < min_pixels && src_h < (min_pixels + width - 1) / width)
         return false;
     size_t stripe = (size_t) 1 << (renderer->engine.align_order - 1);
     if (width > SIZE_MAX - (stripe - 1))
@@ -4085,11 +4543,12 @@ bool ass_run_vertical_filter(ASS_Renderer *renderer, FilterFunc *plain,
 }
 
 bool ass_run_blur_slices(ASS_Renderer *renderer, BlurSliceFunc *fn, void *ctx,
-                         size_t items, size_t width, size_t height)
+                         size_t items, size_t width, size_t height, size_t weight)
 {
-    if (renderer->is_event_worker || !fn || items < 2 || !width || !height)
+    if (renderer->is_event_worker || !fn || items < 2 || !width || !height || !weight)
         return false;
-    if (width < 64 * 1024 && height < (64 * 1024 + width - 1) / width)
+    size_t min_pixels = (64 * 1024 + weight - 1) / weight;
+    if (width < min_pixels && height < (min_pixels + width - 1) / width)
         return false;
     struct ass_event_pool *pool = renderer->event_pool;
     if (pool && pool->job_kind != JOB_IDLE)
@@ -4330,6 +4789,15 @@ static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
         pthread_mutex_unlock(&pool->lock);
         drain_worker_messages(pool);
     }
+    // When already split, ass_start_frame(priv) skipped adaptive growth because
+    // owner->cache.bitmap_max_size != 0, so update growth here across all lanes.
+    // When transitioning from serial, ass_start_frame(priv) already ran growth;
+    // just refresh the budget numbers without decaying twice.
+    refresh_pool_adaptive_budgets(pool, pool->cache_split);
+    size_t lanes = (size_t) pool->count + 1;
+    size_t w_glyph = pool->glyph_budget / lanes;
+    size_t w_bitmap = pool->bitmap_budget / lanes;
+    size_t w_composite = pool->composite_budget / lanes;
     for (int i = 0; i < pool->count; i++) {
         EventWorker *worker = pool->workers + i;
         worker->batch_ns = 0;
@@ -4338,9 +4806,13 @@ static bool render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
 #endif
         if (!(occupied & (1U << worker->id)))
             continue;
+        worker->renderer->look_generation = priv->look_generation;
+        worker->renderer->cache.glyph_max = w_glyph;
+        worker->renderer->cache.bitmap_max_size = w_bitmap;
+        worker->renderer->cache.composite_max_size = w_composite;
         if (!(prepare_parallel ? worker->prepared :
                 ass_clone_render_settings(worker->renderer, priv,
-                    &worker->font_generation, &worker->render_id)) ||
+                    &worker->font_generation, &worker->reconfigure_id)) ||
             !ass_start_frame(worker->renderer, track, now))
             goto serial;
     }
@@ -4409,7 +4881,7 @@ serial:
 bool ass_run_vertical_filter(ASS_Renderer *renderer, FilterFunc *plain,
                              ParamFilterFunc *param_filter, int16_t *dst,
                              const int16_t *src, size_t width, size_t src_h,
-                             size_t dst_h, const int16_t *coeff)
+                             size_t dst_h, const int16_t *coeff, size_t weight)
 {
     (void) renderer;
     (void) plain;
@@ -4420,14 +4892,15 @@ bool ass_run_vertical_filter(ASS_Renderer *renderer, FilterFunc *plain,
     (void) src_h;
     (void) dst_h;
     (void) coeff;
+    (void) weight;
     return false;
 }
 
 bool ass_run_blur_slices(ASS_Renderer *renderer, BlurSliceFunc *fn, void *ctx,
-                         size_t items, size_t width, size_t height)
+                         size_t items, size_t width, size_t height, size_t weight)
 {
     (void) renderer; (void) fn; (void) ctx;
-    (void) items; (void) width; (void) height;
+    (void) items; (void) width; (void) height; (void) weight;
     return false;
 }
 #endif
@@ -4456,8 +4929,12 @@ static ASS_RenderPriv *get_render_priv(ASS_Renderer *render_priv,
             return NULL;
     }
     if (render_priv->render_id != event->render_priv->render_id) {
+        const char *timed_text = event->render_priv->timed_text;
+        uint32_t timed_look = event->render_priv->timed_look;
         memset(event->render_priv, 0, sizeof(ASS_RenderPriv));
         event->render_priv->render_id = render_priv->render_id;
+        event->render_priv->timed_text = timed_text;
+        event->render_priv->timed_look = timed_look;
     }
 
     return event->render_priv;

@@ -35,6 +35,26 @@ typedef struct {
 } CompositeHashValue;
 
 typedef struct {
+    uint32_t cluster, glyph;
+    int32_t x_offset, y_offset, x_advance, y_advance;
+} ShapedGlyph;
+
+typedef struct {
+    int count;  // -1 when the result could not be stored
+    ShapedGlyph *glyphs;
+} ShapeHashValue;
+
+// A rendered event that does not change with time
+typedef struct {
+    bool timed;             // changes with time: rendered every frame, nothing kept
+    bool rendered;
+    ASS_Image *imgs;        // before collisions move them; held
+    int top, height, left, width;
+    int detect_collisions;
+    int shift_direction;
+} EventHashValue;
+
+typedef struct {
     bool valid;
     ASS_Outline outline[2];
     ASS_Rect cbox;  // bounding box of all control points
@@ -106,14 +126,20 @@ void *ass_cache_get(Cache *cache, void *key, void *priv);
 void *ass_cache_key(void *value);
 void ass_cache_inc_ref(void *value);
 void ass_cache_dec_ref(void *value);
+void ass_cache_use(void *value);
 void ass_cache_cut(Cache *cache, size_t max_size);
+void ass_cache_cut_unused(Cache *cache, unsigned frames);
+bool ass_cache_watch_returns(Cache *cache, unsigned slots_log2);
+size_t ass_cache_take_returned(Cache *cache);
 void ass_cache_empty(Cache *cache);
 void ass_cache_done(Cache *cache);
 Cache *ass_font_cache_create(void);
 Cache *ass_outline_cache_create(void);
 Cache *ass_face_size_metrics_cache_create(void);
 Cache *ass_glyph_metrics_cache_create(void);
+Cache *ass_shape_cache_create(void);
 Cache *ass_bitmap_cache_create(void);
 Cache *ass_composite_cache_create(void);
+Cache *ass_event_cache_create(void);
 
 #endif                          /* LIBASS_CACHE_H */
