@@ -509,11 +509,40 @@ char *ass_parse_tags(RenderContext *state, char *p, char *end, double pwr,
                     t3 = (uint32_t) t4 - t3;
                 }
                 if ((state->parsed_tags & PARSED_FADE) == 0) {
+                    long long rel = render_priv->time - state->event->Start;
                     state->fade =
-                        interpolate_alpha(render_priv->time -
-                                state->event->Start, t1, t2,
+                        interpolate_alpha(rel, t1, t2,
                                 t3, t4, a1, a2, a3);
                     state->parsed_tags |= PARSED_FADE;
+                    if (t1 <= t2 && t2 <= t3 && t3 <= t4) {
+                        if (rel < t1) {
+                            state->plateau_until = FFMIN(state->plateau_until, (long long) t1);
+                        } else if (rel < t2) {
+                            if (a1 != a2) {
+                                state->plateau_valid = false;
+                                state->plateau_active_end = FFMAX(state->plateau_active_end, (long long) t2);
+                            } else {
+                                state->plateau_from = FFMAX(state->plateau_from, (long long) t1);
+                                state->plateau_until = FFMIN(state->plateau_until, (long long) t2);
+                            }
+                        } else if (rel < t3) {
+                            state->plateau_from = FFMAX(state->plateau_from, (long long) t2);
+                            state->plateau_until = FFMIN(state->plateau_until, (long long) t3);
+                        } else if (rel < t4) {
+                            if (a2 != a3) {
+                                state->plateau_valid = false;
+                                state->plateau_active_end = FFMAX(state->plateau_active_end, (long long) t4);
+                            } else {
+                                state->plateau_from = FFMAX(state->plateau_from, (long long) t3);
+                                state->plateau_until = FFMIN(state->plateau_until, (long long) t4);
+                            }
+                        } else {
+                            state->plateau_from = FFMAX(state->plateau_from, (long long) t4);
+                        }
+                    } else {
+                        state->plateau_valid = false;
+                        state->plateau_unbounded = true;
+                    }
                 }
             } else if (tag("fax")) {
                 if (nargs) {
@@ -667,6 +696,16 @@ char *ass_parse_tags(RenderContext *state, char *p, char *end, double pwr,
                 x = k * (x2 - x1) + x1;
                 y = k * (y2 - y1) + y1;
                 if (!(state->evt_type & EVENT_POSITIONED)) {
+                    if (x1 != x2 || y1 != y2) {
+                        if (t < t1) {
+                            state->plateau_until = FFMIN(state->plateau_until, (long long) t1);
+                        } else if (t >= t2) {
+                            state->plateau_from = FFMAX(state->plateau_from, (long long) t2);
+                        } else {
+                            state->plateau_valid = false;
+                            state->plateau_active_end = FFMAX(state->plateau_active_end, (long long) t2);
+                        }
+                    }
                     state->pos_x = x;
                     state->pos_y = y;
                     state->detect_collisions = 0;
@@ -787,14 +826,18 @@ char *ass_parse_tags(RenderContext *state, char *p, char *end, double pwr,
                     t2 = state->event->Duration;
                 delta_t = (uint32_t) t2 - t1;
                 t = render_priv->time - state->event->Start;        // FIXME: move to render_context
-                if (t < t1)
+                if (t < t1) {
                     k = 0.;
-                else if (t >= t2)
+                    state->plateau_until = FFMIN(state->plateau_until, (long long) t1);
+                } else if (t >= t2) {
                     k = 1.;
-                else {
+                    state->plateau_from = FFMAX(state->plateau_from, (long long) FFMAX(t1, t2));
+                } else {
                     assert(delta_t != 0.);
                     double ratio = (double) (int32_t) ((uint32_t) t - t1) / delta_t;
                     k = (accel == 1.0) ? ratio : pow(ratio, accel);
+                    state->plateau_valid = false;
+                    state->plateau_active_end = FFMAX(state->plateau_active_end, (long long) t2);
                 }
                 if (nested)
                     pwr = k;
@@ -951,6 +994,8 @@ char *ass_parse_tags(RenderContext *state, char *p, char *end, double pwr,
             if (tag("kt")) {
                 // v4++
                 state->timed = true;
+                state->plateau_valid = false;
+                state->plateau_unbounded = true;
                 double val = 0;
                 if (nargs)
                     val = argtod(*args) * 10;
@@ -959,6 +1004,8 @@ char *ass_parse_tags(RenderContext *state, char *p, char *end, double pwr,
                 state->reset_effect = true;
             } else if (tag("kf")) {
                 state->timed = true;
+                state->plateau_valid = false;
+                state->plateau_unbounded = true;
                 double val = 100;
                 if (nargs)
                     val = argtod(*args);
@@ -968,6 +1015,8 @@ char *ass_parse_tags(RenderContext *state, char *p, char *end, double pwr,
                 state->effect_timing = dtoi32(val * 10);
             } else if (tag("ko")) {
                 state->timed = true;
+                state->plateau_valid = false;
+                state->plateau_unbounded = true;
                 double val = 100;
                 if (nargs)
                     val = argtod(*args);
@@ -977,6 +1026,8 @@ char *ass_parse_tags(RenderContext *state, char *p, char *end, double pwr,
                 state->effect_timing = dtoi32(val * 10);
             } else if (tag("k")) {
                 state->timed = true;
+                state->plateau_valid = false;
+                state->plateau_unbounded = true;
                 double val = 100;
                 if (nargs)
                     val = argtod(*args);
@@ -989,6 +1040,8 @@ char *ass_parse_tags(RenderContext *state, char *p, char *end, double pwr,
         case 'K':
             if (tag("K")) {
                 state->timed = true;
+                state->plateau_valid = false;
+                state->plateau_unbounded = true;
                 double val = 100;
                 if (nargs)
                     val = argtod(*args);

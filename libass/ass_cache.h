@@ -44,10 +44,14 @@ typedef struct {
     ShapedGlyph *glyphs;
 } ShapeHashValue;
 
-// A rendered event that does not change with time
+// A rendered event that does not change with time (or stays constant on a plateau)
 typedef struct {
-    bool timed;             // changes with time: rendered every frame, nothing kept
+    bool timed;             // changes with time
     bool rendered;
+    bool plateau;           // valid for [valid_from, valid_until) relative to event->Start
+    long long duration;     // event->Duration when plateau was built
+    long long valid_from;
+    long long valid_until;
     ASS_Image *imgs;        // before collisions move them; held
     int top, height, left, width;
     int detect_collisions;

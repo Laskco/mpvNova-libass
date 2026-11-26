@@ -228,6 +228,11 @@ struct render_context {
     int parsed_tags;
     int flags;                  // decoration flags (underline/strike-through)
     bool timed;                 // the event looks different at other times
+    bool plateau_valid;         // current timestamp lies on a static plateau
+    bool plateau_unbounded;     // karaoke/scroll/banner: never cache plateau
+    long long plateau_from;     // inclusive event-relative ms of current plateau
+    long long plateau_until;    // exclusive event-relative ms of current plateau
+    long long plateau_active_end; // latest end ms of currently active animations
 
     int alignment;              // alignment overrides go here; if zero, style value will be used
     int justify;                // justify instructions
@@ -388,6 +393,8 @@ struct ass_renderer {
     ASS_Outline raster_outline[2];
     void *blur_scratch;
     size_t blur_scratch_size;
+    void *composite_scratch;
+    size_t composite_scratch_size;
     BlurMethodCacheEntry blur_methods[8];
     unsigned blur_method_next;
     uint64_t last_event_render_ns;
@@ -398,9 +405,11 @@ typedef struct render_priv {
     int top, height, left, width;
     int render_id;
     // The Text and look_generation it was found to change with time under:
-    // while both stay, it skips the event cache.
+    // while both stay, it skips the event cache except inside a known plateau.
     const char *timed_text;
     uint32_t timed_look;
+    long long plateau_from;
+    long long plateau_until;    // < 0 means re-probe once rel >= plateau_from
 } RenderPriv;
 
 typedef struct {

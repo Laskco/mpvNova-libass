@@ -145,22 +145,27 @@ static void calc_coeff(double mu[], int n, double r2, double mul)
 }
 
 // Select the cascade geometry for r2 >= 0.5 without computing coefficients.
-static double find_method_geometry(BlurMethod *blur, double r2, bool fast_blur)
+// blur_mode: 0 = exact, 1 = performance (9-tap at exact level), 2 = ultra.
+static double find_method_geometry(BlurMethod *blur, double r2, int blur_mode)
 {
     double frac = frexp(sqrt(0.11569 * r2 + 0.20591047), &blur->level);
-    if (fast_blur) {
+    if (blur_mode >= 2) {
         if (blur->level < 6 && r2 * pow(0.25, blur->level + 1) >= 0.85)
             blur->level++;
         blur->radius = 4;
         return pow(0.25, blur->level);
     }
     double mul = pow(0.25, blur->level);
+    if (blur_mode == 1) {
+        blur->radius = 4;
+        return mul;
+    }
     blur->radius = 8 - (int) ((10.1525 + 0.8335 * mul) * (1 - frac));
     blur->radius = FFMAX(blur->radius, 4);
     return mul;
 }
 
-static void find_best_method(BlurMethod *blur, double r2, bool fast_blur)
+static void find_best_method(BlurMethod *blur, double r2, int blur_mode)
 {
     *blur = (BlurMethod) {0};
     double mu[8];
@@ -171,7 +176,7 @@ static void find_best_method(BlurMethod *blur, double r2, bool fast_blur)
         mu[0] = 0.5 * r2 - 4 * mu[1];
         mu[2] = mu[3] = 0;
     } else {
-        double mul = find_method_geometry(blur, r2, fast_blur);
+        double mul = find_method_geometry(blur, r2, blur_mode);
         calc_coeff(mu, blur->radius, r2, mul);
     }
     for (int i = 0; i < blur->radius; i++)
@@ -190,7 +195,7 @@ static void get_blur_method(ASS_Renderer *renderer, BlurMethod *blur, double r2)
         }
     }
 
-    find_best_method(blur, r2, renderer->experimental_edges >= 2);
+    find_best_method(blur, r2, renderer->experimental_edges);
     // Exact keys preserve the computed coefficients; evict in round-robin order.
     renderer->blur_methods[renderer->blur_method_next] = (BlurMethodCacheEntry) {
         .r2 = r2,
@@ -205,14 +210,14 @@ static void get_blur_method(ASS_Renderer *renderer, BlurMethod *blur, double r2)
  * \param r2x in: desired standard deviation along X axis squared
  * \param r2y in: desired standard deviation along Y axis squared
  */
-void ass_gaussian_blur_bounds(double r2, bool fast_blur, int *padding, int *alignment)
+void ass_gaussian_blur_bounds(double r2, int blur_mode, int *padding, int *alignment)
 {
     BlurMethod blur;
     if (r2 < 0.5) {
         blur.level = 0;
         blur.radius = 4;
     } else {
-        find_method_geometry(&blur, r2, fast_blur);
+        find_method_geometry(&blur, r2, blur_mode);
     }
     // The shrink/expand cascade contributes at most 5 * (2^level - 1)
     // source pixels per side, in addition to the scaled convolution radius.
@@ -573,6 +578,118 @@ DEFINE_HORZ_BLUR_SLICE(4, 0,
     SLICE_BLUR_TAP_LANE(acc_lo, acc_hi, vc, vextq_s16(s1,s0,2), vextq_s16(s1,s0,6), p0, 1);
     SLICE_BLUR_TAP_LANE(acc_lo, acc_hi, vc, vextq_s16(s1,s0,3), vextq_s16(s1,s0,5), p0, 0);
 )
+static void blur2_horz_slice_run(const HorzBlurSliceCtx *c, size_t begin, size_t end)
+{
+    size_t size = ((c->src_w + 7) & ~(size_t) 7) * c->src_h;
+    size_t step = 8 * c->src_h;
+    size_t src_stripes = (c->src_w + 7) >> 3;
+    int16x4_t p0 = vld1_s16(c->coeff);
+    int32x4_t vhalf = vdupq_n_s32(0x8000);
+    int16_t *dst = c->dst + begin * step;
+    size_t offs = begin * step;
+    for (size_t sx = begin; sx < end; sx++) {
+        bool interior = (sx >= 1 && sx < src_stripes);
+        if (interior && c->use_uniform) {
+            const int16_t *p_s0 = c->src + offs;
+            const int16_t *p_s1 = p_s0 - step;
+            for (size_t y = 0; y < c->src_h; y++) {
+                int16x8_t s0 = vld1q_s16(p_s0);
+                int16x8_t s1 = vld1q_s16(p_s1);
+                int16x8_t s2 = s1;
+                (void) s2;
+                SLICE_BLUR_HORZ_STEP(4, 0, 1,
+                    SLICE_BLUR_TAP_LANE(acc_lo, acc_hi, vc, vextq_s16(s1,s0,2), vextq_s16(s1,s0,6), p0, 1);
+                    SLICE_BLUR_TAP_LANE(acc_lo, acc_hi, vc, vextq_s16(s1,s0,3), vextq_s16(s1,s0,5), p0, 0);
+                );
+                dst += 8; p_s0 += 8; p_s1 += 8;
+            }
+            offs += step;
+        } else if (interior) {
+            const int16_t *p_s0 = c->src + offs;
+            const int16_t *p_s1 = p_s0 - step;
+            for (size_t y = 0; y < c->src_h; y++) {
+                int16x8_t s0 = vld1q_s16(p_s0);
+                int16x8_t s1 = vld1q_s16(p_s1);
+                int16x8_t s2 = s1;
+                (void) s2;
+                SLICE_BLUR_HORZ_STEP(4, 0, 0,
+                    SLICE_BLUR_TAP_LANE(acc_lo, acc_hi, vc, vextq_s16(s1,s0,2), vextq_s16(s1,s0,6), p0, 1);
+                    SLICE_BLUR_TAP_LANE(acc_lo, acc_hi, vc, vextq_s16(s1,s0,3), vextq_s16(s1,s0,5), p0, 0);
+                );
+                dst += 8; p_s0 += 8; p_s1 += 8;
+            }
+            offs += step;
+        } else {
+            for (size_t y = 0; y < c->src_h; y++) {
+                int16x8_t s0 = vld1q_s16(blur_slice_line(c->src, offs, size));
+                int16x8_t s1 = vld1q_s16(blur_slice_line(c->src, offs - step, size));
+                int16x8_t s2 = s1;
+                (void) s2;
+                SLICE_BLUR_HORZ_STEP(4, 0, c->use_uniform,
+                    SLICE_BLUR_TAP_LANE(acc_lo, acc_hi, vc, vextq_s16(s1,s0,2), vextq_s16(s1,s0,6), p0, 1);
+                    SLICE_BLUR_TAP_LANE(acc_lo, acc_hi, vc, vextq_s16(s1,s0,3), vextq_s16(s1,s0,5), p0, 0);
+                );
+                dst += 8; offs += 8;
+            }
+        }
+    }
+}
+
+// Bit-exact 2-tap vertical blur for radius=4 kernels with coeff[2]==coeff[3]==0.
+// Preserves the exact src_h + 8 output geometry and rounding of ass_blur4_vert16_neon.
+static void blur2_vert16_neon(int16_t *restrict dst, const int16_t *restrict src,
+                              size_t src_w, size_t src_h, const int16_t *restrict coeff)
+{
+    size_t dst_h = src_h + 8;
+    size_t rounded_w = (src_w + 7) & ~(size_t) 7;
+    int16x4_t p0 = vld1_s16(coeff);
+    int32x4_t vhalf = vdupq_n_s32(0x8000);
+    int16x8_t vzero = vdupq_n_s16(0);
+
+    for (size_t x = 0; x < rounded_w; x += 8) {
+        const int16_t *in = src + x * src_h;
+        int16_t *out = dst + x * dst_h;
+        size_t first = 0, end = src_h;
+        while (first < end) {
+            uint64_t bits[2];
+            memcpy(bits, in + 8 * first, sizeof(bits));
+            if (bits[0] | bits[1]) break;
+            first++;
+        }
+        if (first == end) {
+            memset(out, 0, dst_h * 16);
+            continue;
+        }
+        while (end > first + 1) {
+            uint64_t bits[2];
+            memcpy(bits, in + 8 * (end - 1), sizeof(bits));
+            if (bits[0] | bits[1]) break;
+            end--;
+        }
+        size_t out_first = first + 2;
+        size_t out_end = end + 6;
+        memset(out, 0, out_first * 16);
+        int16x8_t rm2 = vzero, rm1 = vzero, rc = vzero, rp1 = vzero;
+        int16x8_t rp2 = vld1q_s16(in + 8 * first);
+        int16_t *o = out + 8 * out_first;
+        for (size_t y = out_first; y < out_end; y++) {
+            int32x4_t acc_lo = vhalf, acc_hi = vhalf;
+            SLICE_BLUR_TAP_LANE(acc_lo, acc_hi, rc, rm2, rp2, p0, 1);
+            SLICE_BLUR_TAP_LANE(acc_lo, acc_hi, rc, rm1, rp1, p0, 0);
+            int16x8_t delta = vcombine_s16(vshrn_n_s32(acc_lo, 16), vshrn_n_s32(acc_hi, 16));
+            vst1q_s16(o, vaddq_s16(rc, delta));
+            o += 8;
+            rm2 = rm1;
+            rm1 = rc;
+            rc = rp1;
+            rp1 = rp2;
+            size_t next_in = y - 1;
+            rp2 = next_in < end ? vld1q_s16(in + 8 * next_in) : vzero;
+        }
+        if (out_end < dst_h)
+            memset(out + 8 * out_end, 0, (dst_h - out_end) * 16);
+    }
+}
 DEFINE_HORZ_BLUR_SLICE(5, 1,
     SLICE_BLUR_TAP_LANE(acc_lo, acc_hi, vc, vextq_s16(s2,s1,6), s0,                 p1, 0);
     SLICE_BLUR_TAP_LANE(acc_lo, acc_hi, vc, vextq_s16(s2,s1,7), vextq_s16(s1,s0,7), p0, 3);
@@ -653,7 +770,12 @@ static void blur_horz_slice_worker(void *arg, unsigned lane, unsigned lanes)
     if (begin == end)
         return;
     switch (c->radius) {
-    case 4: blur4_horz_slice_run(c, begin, end); break;
+    case 4:
+        if (!c->coeff[2] && !c->coeff[3])
+            blur2_horz_slice_run(c, begin, end);
+        else
+            blur4_horz_slice_run(c, begin, end);
+        break;
     case 5: blur5_horz_slice_run(c, begin, end); break;
     case 6: blur6_horz_slice_run(c, begin, end); break;
     case 7: blur7_horz_slice_run(c, begin, end); break;
@@ -872,13 +994,19 @@ bool ass_gaussian_blur(ASS_Renderer *renderer, Bitmap *bm, const Bitmap *src,
         bool done = false;
 #if defined(__ARM_NEON)
         if (engine->align_order == 4) {
+            bool two_tap_x = blur_x.radius == 4 && !blur_x.coeff[2] && !blur_x.coeff[3];
             HorzBlurSliceCtx bctx = {
                 buf[index ^ 1], buf[index], blur_x.coeff, w, h, blur_x.radius,
                 blur_slice_probe_uniform(buf[index], w, h, blur_x.radius > 4)
             };
             size_t dst_stripes = (w + 2 * (size_t) blur_x.radius + 7) >> 3;
             done = ass_run_blur_slices(renderer, blur_horz_slice_worker, &bctx, dst_stripes,
-                                       w + 2 * (size_t) blur_x.radius, h, (size_t) blur_x.radius);
+                                       w + 2 * (size_t) blur_x.radius, h,
+                                       two_tap_x ? 2 : (size_t) blur_x.radius);
+            if (!done && (two_tap_x || bctx.use_uniform)) {
+                blur_horz_slice_worker(&bctx, 0, 1);
+                done = true;
+            }
         }
 #endif
         if (!done)
@@ -887,14 +1015,26 @@ bool ass_gaussian_blur(ASS_Renderer *renderer, Bitmap *bm, const Bitmap *src,
     w += 2 * blur_x.radius;
     index ^= 1;
     assert(blur_y.radius >= 4 && blur_y.radius <= 8);
-    bool large_vertical = w &&
-        (w >= 16 * 1024 || h >= (16 * 1024 + w - 1) / w);
-    if (!ass_run_vertical_filter(renderer, NULL, engine->blur_vert[blur_y.radius - 4],
-            buf[index ^ 1], buf[index], w, h, h + 2 * blur_y.radius, blur_y.coeff, (size_t) blur_y.radius) &&
-        !(large_vertical && engine->align_order == 4 &&
-          ass_trim_blur_vertical(engine->blur_vert[blur_y.radius - 4],
-              buf[index ^ 1], buf[index], w, h, h + 2 * blur_y.radius, blur_y.coeff)))
-        engine->blur_vert[blur_y.radius - 4](buf[index ^ 1], buf[index], w, h, blur_y.coeff);
+    {
+        ParamFilterFunc *vert_fn = engine->blur_vert[blur_y.radius - 4];
+        size_t vert_weight = (size_t) blur_y.radius;
+#if defined(__ARM_NEON)
+        bool two_tap_y = engine->align_order == 4 &&
+            blur_y.radius == 4 && !blur_y.coeff[2] && !blur_y.coeff[3];
+        if (two_tap_y) {
+            vert_fn = blur2_vert16_neon;
+            vert_weight = 2;
+        }
+#endif
+        bool large_vertical = w &&
+            (w >= 16 * 1024 || h >= (16 * 1024 + w - 1) / w);
+        if (!ass_run_vertical_filter(renderer, NULL, vert_fn,
+                buf[index ^ 1], buf[index], w, h, h + 2 * blur_y.radius, blur_y.coeff, vert_weight) &&
+            !(large_vertical && engine->align_order == 4 &&
+              ass_trim_blur_vertical(vert_fn,
+                  buf[index ^ 1], buf[index], w, h, h + 2 * blur_y.radius, blur_y.coeff)))
+            vert_fn(buf[index ^ 1], buf[index], w, h, blur_y.coeff);
+    }
     h += 2 * blur_y.radius;
     index ^= 1;
     for (int i = 0; i < blur_x.level; i++) {

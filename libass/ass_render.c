@@ -23,6 +23,9 @@
 #include <math.h>
 #include <string.h>
 #include <stdbool.h>
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 #ifdef ASS_EVENT_THREADS
 #include <pthread.h>
 #include <unistd.h>
@@ -250,6 +253,7 @@ void ass_renderer_done(ASS_Renderer *render_priv)
     free(render_priv->eimg);
 
     ass_aligned_free(render_priv->blur_scratch);
+    ass_aligned_free(render_priv->composite_scratch);
     ass_outline_free(&render_priv->raster_outline[0]);
     ass_outline_free(&render_priv->raster_outline[1]);
 
@@ -572,7 +576,7 @@ render_glyph(RenderContext *state, Bitmap *bm, int dst_x, int dst_y,
 
 static bool quantize_transform(double m[3][3], ASS_Vector *pos,
                                ASS_DVector *offset, bool first,
-                               bool coarse_pos, BitmapHashKey *key)
+                               int pos_shift, BitmapHashKey *key)
 {
     // Full transform:
     // x_out = (m_xx * x + m_xy * y + m_xz) / z,
@@ -707,9 +711,10 @@ static bool quantize_transform(double m[3][3], ASS_Vector *pos,
         qm[2][j] = ass_lrint(val);
     }
 
-    if (coarse_pos) {
-        qr[0] = (qr[0] + (1 << (SUBPIXEL_ORDER - 1))) & ~((1 << SUBPIXEL_ORDER) - 1);
-        qr[1] = (qr[1] + (1 << (SUBPIXEL_ORDER - 1))) & ~((1 << SUBPIXEL_ORDER) - 1);
+    if (pos_shift) {
+        int32_t step = 1 << pos_shift;
+        qr[0] = (qr[0] + (step >> 1)) & ~(step - 1);
+        qr[1] = (qr[1] + (step >> 1)) & ~(step - 1);
     }
     if (first && offset) {
         offset->x = center[0] - qr[0];
@@ -801,7 +806,8 @@ static Bitmap *get_vector_clip(RenderContext *state, ASS_Vector *pos,
     BitmapHashKey key = {0};
     key.outline = ass_cache_get(render_priv->cache.outline_cache, &ol_key, render_priv);
     if (!key.outline || !key.outline->valid ||
-            !quantize_transform(m, pos, NULL, true, render_priv->experimental_edges >= 2, &key))
+            !quantize_transform(m, pos, NULL, true,
+                                render_priv->experimental_edges >= 2 ? SUBPIXEL_ORDER : 0, &key))
         return NULL;
 
     // Bound vector-clip rasterization to the screen (and quantized target
@@ -836,6 +842,40 @@ static Bitmap *get_vector_clip(RenderContext *state, ASS_Vector *pos,
 }
 
 static ASS_Image *ass_free_image(ASS_Image *img);
+
+static bool clip_mask_preserves_src(const uint8_t *src, ptrdiff_t src_stride,
+                                    const uint8_t *mask, ptrdiff_t mask_stride,
+                                    int w, int h, bool inverse)
+{
+    for (int y = 0; y < h; y++) {
+        const uint8_t *s = src + (ptrdiff_t) y * src_stride;
+        const uint8_t *m = mask + (ptrdiff_t) y * mask_stride;
+        int x = 0;
+#if defined(__ARM_NEON)
+        uint8x16_t acc = vdupq_n_u8(0);
+        if (!inverse) {
+            for (; x + 16 <= w; x += 16)
+                acc = vorrq_u8(acc, vminq_u8(vld1q_u8(s + x), vmvnq_u8(vld1q_u8(m + x))));
+        } else {
+            for (; x + 16 <= w; x += 16)
+                acc = vorrq_u8(acc, vminq_u8(vld1q_u8(s + x), vld1q_u8(m + x)));
+        }
+        uint64x2_t u = vreinterpretq_u64_u8(acc);
+        if (vgetq_lane_u64(u, 0) | vgetq_lane_u64(u, 1))
+            return false;
+#endif
+        if (!inverse) {
+            for (; x < w; x++)
+                if (s[x] && m[x] != 255)
+                    return false;
+        } else {
+            for (; x < w; x++)
+                if (s[x] && m[x])
+                    return false;
+        }
+    }
+    return true;
+}
 
 // Rotated lettering can occupy a thin diagonal of a large transparent bitmap.
 // Keep at most eight horizontal strips, and only split when it saves enough
@@ -887,15 +927,27 @@ static ASS_Image *clip_sparse_strips(const BitmapEngine *engine, ASS_Image *cur,
     if (area > (int64_t) w * h / 2)
         return NULL;
 
+    ASS_ImagePriv *priv = (ASS_ImagePriv *) cur;
     ASS_Image *first = NULL, *last = NULL;
     unsigned align = 1U << engine->align_order;
     for (int i = 0; i < n; i++) {
         ASS_Rect r = strips[i];
         int sw = r.x_max - r.x_min, sh = r.y_max - r.y_min;
-        unsigned stride = ass_align(align, sw);
-        uint8_t *buf = ass_aligned_alloc(align, (size_t) stride * sh + align, false);
-        ASS_Image *img = buf ? my_draw_bitmap(buf, sw, sh, stride, left + r.x_min,
-                                              top + r.y_min, cur->color, NULL) : NULL;
+        const uint8_t *s_ptr = src + (ptrdiff_t) r.y_min * cur->stride + r.x_min;
+        const uint8_t *m_ptr = mask + (ptrdiff_t) r.y_min * mask_stride + r.x_min;
+        ASS_Image *img;
+        if (priv->source &&
+            clip_mask_preserves_src(s_ptr, cur->stride, m_ptr, mask_stride, sw, sh, false)) {
+            img = my_draw_bitmap((unsigned char *) s_ptr, sw, sh, cur->stride,
+                                 left + r.x_min, top + r.y_min, cur->color, priv->source);
+        } else {
+            unsigned stride = ass_align(align, sw);
+            uint8_t *buf = ass_aligned_alloc(align, (size_t) stride * sh + align, false);
+            img = buf ? my_draw_bitmap(buf, sw, sh, stride, left + r.x_min,
+                                       top + r.y_min, cur->color, NULL) : NULL;
+            if (img)
+                engine->mul_bitmaps(buf, stride, s_ptr, cur->stride, m_ptr, mask_stride, sw, sh);
+        }
         if (!img) {
             while (first) first = ass_free_image(first);
             return NULL;
@@ -905,12 +957,9 @@ static ASS_Image *clip_sparse_strips(const BitmapEngine *engine, ASS_Image *cur,
         if (last) last->next = img;
         else first = img;
         last = img;
-        engine->mul_bitmaps(buf, stride, src + (ptrdiff_t) r.y_min * cur->stride + r.x_min,
-                            cur->stride, mask + (ptrdiff_t) r.y_min * mask_stride + r.x_min,
-                            mask_stride, sw, sh);
     }
     last->next = cur->next;
-    ASS_ImagePriv *priv = (ASS_ImagePriv *) cur, *replacement = (ASS_ImagePriv *) first;
+    ASS_ImagePriv *replacement = (ASS_ImagePriv *) first;
     ass_cache_dec_ref(priv->source);
     ass_aligned_free(priv->buffer);
     *priv = *replacement;
@@ -984,6 +1033,10 @@ static void blend_vector_clip(RenderContext *state, ASS_Image *head)
                 ay > by + bh || !h || !w) {
                 continue;
             }
+            if (clip_mask_preserves_src(abuffer + (ptrdiff_t) atop * as + aleft, as,
+                                        bbuffer + (ptrdiff_t) btop * bs + bleft, bs,
+                                        w, h, true))
+                continue;
 
             // Allocate new buffer and add to free list
             nbuffer = ass_aligned_alloc(align, as * ah + align, false);
@@ -1010,6 +1063,16 @@ static void blend_vector_clip(RenderContext *state, ASS_Image *head)
                                                  bbuffer + (ptrdiff_t) btop * bs + bleft, bs);
             if (last) {
                 cur = last;
+                continue;
+            }
+            if (clip_mask_preserves_src(abuffer + (ptrdiff_t) atop * as + aleft, as,
+                                        bbuffer + (ptrdiff_t) btop * bs + bleft, bs,
+                                        w, h, false)) {
+                cur->bitmap = abuffer + (ptrdiff_t) atop * as + aleft;
+                cur->dst_x += aleft;
+                cur->dst_y += atop;
+                cur->w = w;
+                cur->h = h;
                 continue;
             }
             nbuffer = ass_aligned_alloc(align, ns * h + align, false);
@@ -1344,6 +1407,11 @@ init_render_context(RenderContext *state, ASS_Event *event)
     state->parsed_tags = 0;
     state->evt_type = EVENT_NORMAL;
     state->timed = false;
+    state->plateau_valid = true;
+    state->plateau_unbounded = false;
+    state->plateau_from = 0;
+    state->plateau_until = event->Duration;
+    state->plateau_active_end = 0;
 
     state->wrap_style = render_priv->track->WrapStyle;
 
@@ -1367,6 +1435,10 @@ init_render_context(RenderContext *state, ASS_Event *event)
     state->reset_effect = false;
 
     ass_apply_transition_effects(state);
+    if (state->timed) {
+        state->plateau_valid = false;
+        state->plateau_unbounded = true;
+    }
     state->explicit = state->evt_type != EVENT_NORMAL ||
                       ass_event_has_hard_overrides(event->Text);
 
@@ -1698,9 +1770,9 @@ static void set_bitmap_clip(RenderContext *state, GlyphInfo *info,
     double r2x = restore_blur(filter->blur_x);
     double r2y = restore_blur(filter->blur_y);
     if (r2x > 0.001 || r2y > 0.001) {
-        bool fast_blur = state->renderer->experimental_edges >= 2;
-        ass_gaussian_blur_bounds(r2x, fast_blur, &pad_x, &align_x);
-        ass_gaussian_blur_bounds(r2y, fast_blur, &pad_y, &align_y);
+        int blur_mode = state->renderer->experimental_edges;
+        ass_gaussian_blur_bounds(r2x, blur_mode, &pad_x, &align_x);
+        ass_gaussian_blur_bounds(r2y, blur_mode, &pad_y, &align_y);
     }
     pad_x += info->be + 6;
     pad_y += info->be + 6;
@@ -1743,9 +1815,11 @@ get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
     if (info->effect_type == EF_KARAOKE_KF)
         ass_outline_update_min_transformed_x(&info->outline->outline[0], m, leftmost_x);
 
+    int pos_shift = render_priv->experimental_edges >= 2 ? SUBPIXEL_ORDER :
+                    (render_priv->experimental_edges ? SUBPIXEL_ORDER - 1 : 0);
     BitmapHashKey key = {0};
     key.outline = info->outline;
-    if (!quantize_transform(m, pos, offset, first, render_priv->experimental_edges >= 2, &key))
+    if (!quantize_transform(m, pos, offset, first, pos_shift, &key))
         return;
 
     set_bitmap_clip(state, info, *pos, &key, filter);
@@ -1870,7 +1944,7 @@ get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
 
     key.outline = ass_cache_get(render_priv->cache.outline_cache, &ol_key, render_priv);
     if (!key.outline || !key.outline->valid ||
-            !quantize_transform(m, pos_o, offset, false, render_priv->experimental_edges >= 2, &key))
+            !quantize_transform(m, pos_o, offset, false, pos_shift, &key))
         return;
 
     set_bitmap_clip(state, info, *pos_o, &key, filter);
@@ -2917,9 +2991,9 @@ static void set_composite_viewport(RenderContext *state, CombinedBitmapInfo *inf
     if (!isfinite(r2x) || !isfinite(r2y) || r2x > 65536 || r2y > 65536)
         return;
     int px = 0, py = 0, ax = 1, ay = 1;
-    bool fast_blur = renderer->experimental_edges >= 2;
-    ass_gaussian_blur_bounds(r2x, fast_blur, &px, &ax);
-    ass_gaussian_blur_bounds(r2y, fast_blur, &py, &ay);
+    int blur_mode = renderer->experimental_edges;
+    ass_gaussian_blur_bounds(r2x, blur_mode, &px, &ax);
+    ass_gaussian_blur_bounds(r2y, blur_mode, &py, &ay);
     int64_t pad_x = px + info->filter.be + 4 + llabs((int64_t)info->filter.shadow.x) / 64;
     int64_t pad_y = py + info->filter.be + 4 + llabs((int64_t)info->filter.shadow.y) / 64;
     int64_t vis_x0 = 0;
@@ -3191,6 +3265,42 @@ int ass_be_padding(int be)
 }
 
 
+static bool alloc_composite_scratch(ASS_Renderer *render_priv, Bitmap *bm,
+                                    ASS_Rect rect, int border)
+{
+    int64_t left = (int64_t) rect.x_min - border;
+    int64_t top = (int64_t) rect.y_min - border;
+    int64_t width = (int64_t) rect.x_max - rect.x_min + 2 * border;
+    int64_t height = (int64_t) rect.y_max - rect.y_min + 2 * border;
+    if (width <= 0 || height <= 0 || width > INT_MAX || height > INT_MAX ||
+        left < INT_MIN || top < INT_MIN || left > INT_MAX || top > INT_MAX)
+        return false;
+    unsigned align = 1U << render_priv->engine.align_order;
+    size_t stride = ass_align(align, (size_t) width);
+    if (stride > (INT_MAX - align) / (size_t) height)
+        return false;
+    size_t bytes = stride * (size_t) height + align;
+    if (bytes > 8 * 1024 * 1024)
+        return false;
+    if (bytes > render_priv->composite_scratch_size) {
+        size_t cap = ass_align(256 * 1024, bytes);
+        void *buf = ass_aligned_alloc(align, cap, false);
+        if (!buf)
+            return false;
+        ass_aligned_free(render_priv->composite_scratch);
+        render_priv->composite_scratch = buf;
+        render_priv->composite_scratch_size = cap;
+    }
+    memset(render_priv->composite_scratch, 0, bytes);
+    bm->left = (int32_t) left;
+    bm->top = (int32_t) top;
+    bm->w = (int32_t) width;
+    bm->h = (int32_t) height;
+    bm->stride = (ptrdiff_t) stride;
+    bm->buffer = render_priv->composite_scratch;
+    return true;
+}
+
 static bool alloc_composite_bitmap(const BitmapEngine *engine, Bitmap *bm,
                                     ASS_Rect rect, int border,
                                     const CompositeHashKey *key)
@@ -3283,34 +3393,63 @@ size_t ass_composite_construct(void *key, void *value, void *priv)
     if (!bord && n_bm == 1 && !k->viewport_align) {
         // Gaussian blur unpacks the source before allocating its output. Read
         // immutable cached bitmaps directly when no pre-blur cropping is needed.
-        if (gaussian && blur_fill && !k->viewport_align)
+        if (gaussian && blur_fill)
             fill_blurred = ass_gaussian_blur(render_priv, &v->bm, last->bm, r2x, r2y);
         if (!fill_blurred)
             ass_copy_bitmap(&render_priv->engine, &v->bm, last->bm);
         v->bm.left += last->pos.x;
         v->bm.top  += last->pos.y;
+    } else if (n_bm && gaussian && blur_fill && !k->viewport_align) {
+        Bitmap scratch = {0};
+        if (alloc_composite_scratch(render_priv, &scratch, rect, bord)) {
+            for (int i = 0; i < k->bitmap_count; i++)
+                add_composite_bitmap(&render_priv->engine, &scratch,
+                                     bitmaps[i].bm, bitmaps[i].pos);
+            fill_blurred = ass_gaussian_blur(render_priv, &v->bm, &scratch, r2x, r2y);
+            if (!fill_blurred)
+                ass_copy_bitmap(&render_priv->engine, &v->bm, &scratch);
+        } else if (alloc_composite_bitmap(&render_priv->engine, &v->bm, rect, bord, k)) {
+            for (int i = 0; i < k->bitmap_count; i++)
+                add_composite_bitmap(&render_priv->engine, &v->bm,
+                                     bitmaps[i].bm, bitmaps[i].pos);
+        }
     } else if (n_bm && alloc_composite_bitmap(&render_priv->engine, &v->bm, rect, bord, k)) {
         for (int i = 0; i < k->bitmap_count; i++)
             add_composite_bitmap(&render_priv->engine, &v->bm,
                                   bitmaps[i].bm, bitmaps[i].pos);
     }
     if (!bord && n_bm_o == 1 && !k->viewport_align) {
-        if (gaussian && !k->viewport_align)
+        if (gaussian)
             outline_blurred = ass_gaussian_blur(render_priv, &v->bm_o, last_o->bm_o, r2x, r2y);
         if (!outline_blurred)
             ass_copy_bitmap(&render_priv->engine, &v->bm_o, last_o->bm_o);
         v->bm_o.left += last_o->pos_o.x;
         v->bm_o.top  += last_o->pos_o.y;
+    } else if (n_bm_o && gaussian && !k->viewport_align) {
+        Bitmap scratch = {0};
+        if (alloc_composite_scratch(render_priv, &scratch, rect_o, bord)) {
+            for (int i = 0; i < k->bitmap_count; i++)
+                add_composite_bitmap(&render_priv->engine, &scratch,
+                                     bitmaps[i].bm_o, bitmaps[i].pos_o);
+            outline_blurred = ass_gaussian_blur(render_priv, &v->bm_o, &scratch, r2x, r2y);
+            if (!outline_blurred)
+                ass_copy_bitmap(&render_priv->engine, &v->bm_o, &scratch);
+        } else if (alloc_composite_bitmap(&render_priv->engine, &v->bm_o, rect_o, bord, k)) {
+            for (int i = 0; i < k->bitmap_count; i++)
+                add_composite_bitmap(&render_priv->engine, &v->bm_o,
+                                     bitmaps[i].bm_o, bitmaps[i].pos_o);
+        }
     } else if (n_bm_o && alloc_composite_bitmap(&render_priv->engine, &v->bm_o, rect_o, bord, k)) {
         for (int i = 0; i < k->bitmap_count; i++)
             add_composite_bitmap(&render_priv->engine, &v->bm_o,
                                   bitmaps[i].bm_o, bitmaps[i].pos_o);
     }
 
-    if (blur_fill && !fill_blurred)
-        ass_synth_blur(render_priv, &v->bm, k->filter.be, r2x, r2y);
-    if (!outline_blurred)
-        ass_synth_blur(render_priv, &v->bm_o, k->filter.be, r2x, r2y);
+    if (blur_fill)
+        ass_synth_blur(render_priv, &v->bm, k->filter.be,
+                       fill_blurred ? 0 : r2x, fill_blurred ? 0 : r2y);
+    ass_synth_blur(render_priv, &v->bm_o, k->filter.be,
+                   outline_blurred ? 0 : r2x, outline_blurred ? 0 : r2y);
 
     if (!(flags & FILTER_FILL_IN_BORDER) && !(flags & FILTER_FILL_IN_SHADOW))
         ass_fix_outline(&v->bm, &v->bm_o);
@@ -3647,6 +3786,35 @@ struct event_construct {
     bool rendered, ok;
 };
 
+static void update_timed_plateau_hint(ASS_Renderer *render_priv, ASS_Event *event,
+                                      const RenderContext *state)
+{
+    ASS_RenderPriv *known = event->render_priv;
+    if (!known) {
+        known = event->render_priv = calloc(1, sizeof(ASS_RenderPriv));
+        if (!known)
+            return;
+        known->render_id = render_priv->render_id;
+    }
+    known->timed_text = event->Text;
+    known->timed_look = render_priv->look_generation;
+    long long rel = render_priv->time - event->Start;
+    if (state->plateau_unbounded) {
+        known->plateau_from = INT64_MAX;
+        known->plateau_until = INT64_MAX;
+    } else if (!state->plateau_valid) {
+        known->plateau_from = FFMAX(rel + 1, state->plateau_active_end);
+        known->plateau_until = -1;
+    } else if (rel >= state->plateau_from && rel < state->plateau_until &&
+               state->plateau_until - rel >= EVENT_CACHE_MIN_MS) {
+        known->plateau_from = state->plateau_from;
+        known->plateau_until = state->plateau_until;
+    } else {
+        known->plateau_from = FFMAX(rel + 1, state->plateau_until);
+        known->plateau_until = -1;
+    }
+}
+
 size_t ass_event_construct(void *key, void *value, void *priv)
 {
     EventHashKey *k = key;
@@ -3658,8 +3826,20 @@ size_t ass_event_construct(void *key, void *value, void *priv)
     c->rendered = true;
     *v = (EventHashValue) { .timed = c->state->timed, .rendered = c->ok };
     size_t size = sizeof(*v) + k->effect.len + k->text.len;
-    if (!c->ok || v->timed)
+    if (!c->ok)
         return size;
+
+    if (v->timed) {
+        long long rel = c->state->renderer->time - c->event->Start;
+        if (!c->state->plateau_valid || c->state->plateau_unbounded ||
+            rel < c->state->plateau_from || rel >= c->state->plateau_until ||
+            c->state->plateau_until - rel < EVENT_CACHE_MIN_MS)
+            return size;
+        v->plateau = true;
+        v->duration = c->event->Duration;
+        v->valid_from = c->state->plateau_from;
+        v->valid_until = c->state->plateau_until;
+    }
 
     v->imgs = c->images.imgs;
     ass_frame_ref(v->imgs);
@@ -3731,12 +3911,29 @@ ass_render_event(RenderContext *state, ASS_Event *event,
 {
     ASS_Renderer *render_priv = state->renderer;
     ASS_RenderPriv *known = event->render_priv;
-    size_t text_len = 0;
-    if (!event->Text || event->Duration < EVENT_CACHE_MIN_MS ||
-        (known && known->timed_text == event->Text &&
-         known->timed_look == render_priv->look_generation) ||
-        event_has_timed_hint(event, &text_len))
+    if (!event->Text || event->Duration < EVENT_CACHE_MIN_MS)
         return render_event(state, event, event_images);
+
+    long long rel = render_priv->time - event->Start;
+    size_t text_len = 0;
+    if (known && known->timed_text == event->Text &&
+        known->timed_look == render_priv->look_generation) {
+        if (rel < known->plateau_from)
+            return render_event(state, event, event_images);
+        if (known->plateau_until < 0 || rel >= known->plateau_until) {
+            bool ok = render_event(state, event, event_images);
+            if (state->timed)
+                update_timed_plateau_hint(render_priv, event, state);
+            return ok;
+        }
+        // Inside a known static plateau: fall through to event_cache lookup.
+        text_len = strlen(event->Text);
+    } else if (event_has_timed_hint(event, &text_len)) {
+        bool ok = render_event(state, event, event_images);
+        if (state->timed)
+            update_timed_plateau_hint(render_priv, event, state);
+        return ok;
+    }
 
     const char *effect = event->Effect ? event->Effect : "";
     EventHashKey key = {
@@ -3753,21 +3950,21 @@ ass_render_event(RenderContext *state, ASS_Event *event,
     if (!v)
         return render_event(state, event, event_images);
     if (v->timed) {
-        if (!known) {
-            known = event->render_priv = calloc(1, sizeof(ASS_RenderPriv));
-            if (known)
-                known->render_id = render_priv->render_id;
+        if (c.rendered) {
+            update_timed_plateau_hint(render_priv, event, state);
+            if (!v->plateau) {
+                if (!c.ok)
+                    return false;
+                *event_images = c.images;
+                return true;
+            }
+        } else if (!v->plateau || v->duration != event->Duration ||
+                   rel < v->valid_from || rel >= v->valid_until) {
+            bool ok = render_event(state, event, event_images);
+            if (state->timed)
+                update_timed_plateau_hint(render_priv, event, state);
+            return ok;
         }
-        if (known) {
-            known->timed_text = event->Text;
-            known->timed_look = render_priv->look_generation;
-        }
-        if (!c.rendered)
-            return render_event(state, event, event_images);
-        if (!c.ok)
-            return false;
-        *event_images = c.images;
-        return true;
     }
     if (!v->rendered)
         return false;

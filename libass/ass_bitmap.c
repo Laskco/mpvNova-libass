@@ -85,7 +85,9 @@ void ass_synth_blur(ASS_Renderer *renderer, Bitmap *bm,
     // Apply box blur (multiple passes, if requested)
     unsigned align = 1 << engine->align_order;
     size_t size = sizeof(uint16_t) * bm->stride * 2;
-    uint16_t *tmp = ass_aligned_alloc(align, size, false);
+    bool use_scratch = size <= renderer->blur_scratch_size;
+    uint16_t *tmp = use_scratch ? (uint16_t *) renderer->blur_scratch :
+        ass_aligned_alloc(align, size, false);
     if (!tmp)
         return;
 
@@ -101,7 +103,8 @@ void ass_synth_blur(ASS_Renderer *renderer, Bitmap *bm,
         be_blur_post(buf, stride, w, h);
     }
     engine->be_blur(buf, stride, w, h, tmp);
-    ass_aligned_free(tmp);
+    if (!use_scratch)
+        ass_aligned_free(tmp);
 }
 
 bool ass_alloc_bitmap(const BitmapEngine *engine, Bitmap *bm,
