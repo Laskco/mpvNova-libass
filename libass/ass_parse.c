@@ -111,7 +111,18 @@ void ass_update_font(RenderContext *state)
         val = 0;                // normal
     desc.italic = val;
 
+    if (state->last_font &&
+        state->last_font->desc.bold == desc.bold &&
+        state->last_font->desc.italic == desc.italic &&
+        state->last_font->desc.vertical == desc.vertical &&
+        ass_string_equal(state->last_font->desc.family, desc.family)) {
+        state->font = state->last_font;
+        return;
+    }
+
     state->font = ass_font_new(state->renderer, &desc);
+    if (state->font)
+        state->last_font = state->font;
 }
 
 /**
@@ -282,6 +293,75 @@ static ASS_Style *lookup_style_strict(ASS_Track *track, char *name, size_t len)
             "[%p]: Warning: no style named '%.*s' found",
             track, (int) len, name);
     return NULL;
+}
+
+// Conservative allowlist: returns true only when every override tag in [s, end)
+// cannot change alpha, fade, font selection, border style, or reset style.
+static bool t_body_is_alpha_neutral(const char *s, const char *end)
+{
+    while (s < end) {
+        while (s < end && *s != '\\')
+            s++;
+        if (s >= end)
+            break;
+        s++;
+        while (s < end && (*s == ' ' || *s == '\t'))
+            s++;
+        if (s >= end)
+            break;
+        const char *t = s;
+        while (s < end && *s != '\\' && *s != '(')
+            s++;
+        size_t rem = (size_t) (s - t);
+        bool ok = false;
+        switch (*t) {
+        case 'f':
+            ok = (rem >= 4 && (!memcmp(t, "fscx", 4) || !memcmp(t, "fscy", 4))) ||
+                 (rem >= 3 && (!memcmp(t, "fsc", 3) || !memcmp(t, "fsp", 3) ||
+                               !memcmp(t, "frx", 3) || !memcmp(t, "fry", 3) ||
+                               !memcmp(t, "frz", 3) || !memcmp(t, "fax", 3) ||
+                               !memcmp(t, "fay", 3))) ||
+                 (rem >= 2 && (!memcmp(t, "fs", 2) || !memcmp(t, "fr", 2)));
+            break;
+        case 'b':
+            ok = (rem >= 4 && (!memcmp(t, "blur", 4) || !memcmp(t, "bord", 4))) ||
+                 (rem >= 2 && !memcmp(t, "be", 2));
+            break;
+        case 'x':
+            ok = rem >= 5 && (!memcmp(t, "xbord", 5) || !memcmp(t, "xshad", 5));
+            break;
+        case 'y':
+            ok = rem >= 5 && (!memcmp(t, "ybord", 5) || !memcmp(t, "yshad", 5));
+            break;
+        case 's':
+            ok = rem >= 4 && !memcmp(t, "shad", 4);
+            break;
+        case 'c':
+            ok = (rem >= 4 && !memcmp(t, "clip", 4)) || rem == 1 ||
+                 (rem >= 2 && (t[1] == '&' || t[1] == 'H' || t[1] == ' '));
+            break;
+        case 'i':
+            ok = rem >= 5 && !memcmp(t, "iclip", 5);
+            break;
+        case '1':
+        case '2':
+        case '3':
+        case '4':
+            ok = rem >= 2 && t[1] == 'c';
+            break;
+        default:
+            break;
+        }
+        if (!ok)
+            return false;
+        if (s < end && *s == '(') {
+            const char *paren = memchr(s, ')', (size_t) (end - s));
+            if (!paren)
+                return false;
+            s = paren + 1;
+        }
+    }
+    return true;
 }
 
 /**
@@ -517,31 +597,44 @@ char *ass_parse_tags(RenderContext *state, char *p, char *end, double pwr,
                     if (t1 <= t2 && t2 <= t3 && t3 <= t4) {
                         if (rel < t1) {
                             state->plateau_until = FFMIN(state->plateau_until, (long long) t1);
+                            state->alpha_plateau_until = FFMIN(state->alpha_plateau_until, (long long) t1);
                         } else if (rel < t2) {
                             if (a1 != a2) {
                                 state->plateau_valid = false;
                                 state->plateau_active_end = FFMAX(state->plateau_active_end, (long long) t2);
+                                state->alpha_plateau_valid = false;
+                                state->alpha_active_end = FFMAX(state->alpha_active_end, (long long) t2);
                             } else {
                                 state->plateau_from = FFMAX(state->plateau_from, (long long) t1);
                                 state->plateau_until = FFMIN(state->plateau_until, (long long) t2);
+                                state->alpha_plateau_from = FFMAX(state->alpha_plateau_from, (long long) t1);
+                                state->alpha_plateau_until = FFMIN(state->alpha_plateau_until, (long long) t2);
                             }
                         } else if (rel < t3) {
                             state->plateau_from = FFMAX(state->plateau_from, (long long) t2);
                             state->plateau_until = FFMIN(state->plateau_until, (long long) t3);
+                            state->alpha_plateau_from = FFMAX(state->alpha_plateau_from, (long long) t2);
+                            state->alpha_plateau_until = FFMIN(state->alpha_plateau_until, (long long) t3);
                         } else if (rel < t4) {
                             if (a2 != a3) {
                                 state->plateau_valid = false;
                                 state->plateau_active_end = FFMAX(state->plateau_active_end, (long long) t4);
+                                state->alpha_plateau_valid = false;
+                                state->alpha_active_end = FFMAX(state->alpha_active_end, (long long) t4);
                             } else {
                                 state->plateau_from = FFMAX(state->plateau_from, (long long) t3);
                                 state->plateau_until = FFMIN(state->plateau_until, (long long) t4);
+                                state->alpha_plateau_from = FFMAX(state->alpha_plateau_from, (long long) t3);
+                                state->alpha_plateau_until = FFMIN(state->alpha_plateau_until, (long long) t4);
                             }
                         } else {
                             state->plateau_from = FFMAX(state->plateau_from, (long long) t4);
+                            state->alpha_plateau_from = FFMAX(state->alpha_plateau_from, (long long) t4);
                         }
                     } else {
                         state->plateau_valid = false;
                         state->plateau_unbounded = true;
+                        state->alpha_plateau_valid = false;
                     }
                 }
             } else if (tag("fax")) {
@@ -824,20 +917,35 @@ char *ass_parse_tags(RenderContext *state, char *p, char *end, double pwr,
                 state->detect_collisions = 0;
                 if (t2 == 0)
                     t2 = state->event->Duration;
+                unsigned alpha_skip = render_priv->experimental_edges ? 0xFE : 0xFF;
+                bool alpha_neutral = !has_backslash_arg ||
+                    (state->alpha_plateau_valid &&
+                     _a(state->c[0]) >= alpha_skip && _a(state->c[2]) >= alpha_skip &&
+                     _a(state->c[3]) >= alpha_skip &&
+                     cnt >= 0 && cnt <= 3 &&
+                     t_body_is_alpha_neutral(args[cnt].start, args[cnt].end));
                 delta_t = (uint32_t) t2 - t1;
                 t = render_priv->time - state->event->Start;        // FIXME: move to render_context
                 if (t < t1) {
                     k = 0.;
                     state->plateau_until = FFMIN(state->plateau_until, (long long) t1);
+                    if (!alpha_neutral)
+                        state->alpha_plateau_until = FFMIN(state->alpha_plateau_until, (long long) t1);
                 } else if (t >= t2) {
                     k = 1.;
                     state->plateau_from = FFMAX(state->plateau_from, (long long) FFMAX(t1, t2));
+                    if (!alpha_neutral)
+                        state->alpha_plateau_from = FFMAX(state->alpha_plateau_from, (long long) FFMAX(t1, t2));
                 } else {
                     assert(delta_t != 0.);
                     double ratio = (double) (int32_t) ((uint32_t) t - t1) / delta_t;
                     k = (accel == 1.0) ? ratio : pow(ratio, accel);
                     state->plateau_valid = false;
                     state->plateau_active_end = FFMAX(state->plateau_active_end, (long long) t2);
+                    if (!alpha_neutral) {
+                        state->alpha_plateau_valid = false;
+                        state->alpha_active_end = FFMAX(state->alpha_active_end, (long long) t2);
+                    }
                 }
                 if (nested)
                     pwr = k;

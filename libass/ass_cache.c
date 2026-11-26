@@ -480,6 +480,38 @@ Cache *ass_cache_create(const CacheDesc *desc)
     return cache;
 }
 
+// Look up an existing value without constructing or taking ownership of key.
+void *ass_cache_find(Cache *cache, void *key)
+{
+    const CacheDesc *desc = cache->desc;
+    size_t key_offs = CACHE_ITEM_SIZE + align_cache(desc->value_size);
+    ass_hashcode hash = desc->hash_func(key, ASS_HASH_INIT);
+    hash ^= hash >> 32;
+    hash ^= hash >> 16;
+    unsigned bucket = (unsigned) hash & (cache->buckets - 1);
+    CacheItem *item = cache->map[bucket];
+    while (item) {
+        if (desc->compare_func(key, (char *) item + key_offs)) {
+            assert(item->size);
+            item->frame = cache->frame;
+            if (!item->queue_prev || item->queue_next) {
+                if (item->queue_prev) {
+                    item->queue_next->queue_prev = item->queue_prev;
+                    *item->queue_prev = item->queue_next;
+                } else
+                    item->ref_count++;
+                *cache->queue_last = item;
+                item->queue_prev = cache->queue_last;
+                cache->queue_last = &item->queue_next;
+                item->queue_next = NULL;
+            }
+            return (char *) item + CACHE_ITEM_SIZE;
+        }
+        item = item->next;
+    }
+    return NULL;
+}
+
 // Retrieve a value corresponding to a particular cache key,
 // creating one if it does not already exist.
 // The returned item is guaranteed to be valid until the next ass_cache_cut call;

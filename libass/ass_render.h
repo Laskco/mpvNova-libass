@@ -224,15 +224,21 @@ struct render_context {
     ASS_Style *style;
 
     ASS_Font *font;
+    ASS_Font *last_font;
     double font_size;
     int parsed_tags;
     int flags;                  // decoration flags (underline/strike-through)
     bool timed;                 // the event looks different at other times
     bool plateau_valid;         // current timestamp lies on a static plateau
     bool plateau_unbounded;     // karaoke/scroll/banner: never cache plateau
+    bool alpha_plateau_valid;   // alpha/visibility stays constant on [alpha_plateau_from, alpha_plateau_until)
+    bool rendered_transparent;  // event skipped solely due to full transparency (primary font only)
     long long plateau_from;     // inclusive event-relative ms of current plateau
     long long plateau_until;    // exclusive event-relative ms of current plateau
     long long plateau_active_end; // latest end ms of currently active animations
+    long long alpha_plateau_from;
+    long long alpha_plateau_until;
+    long long alpha_active_end;
 
     int alignment;              // alignment overrides go here; if zero, style value will be used
     int justify;                // justify instructions
@@ -399,6 +405,7 @@ struct ass_renderer {
     unsigned blur_method_next;
     uint64_t last_event_render_ns;
     ClipMemoEntry clip_memo[CLIP_MEMO_SIZE];
+    ClipMemoEntry composite_clip_memo[CLIP_MEMO_SIZE];
 };
 
 typedef struct render_priv {
@@ -410,6 +417,8 @@ typedef struct render_priv {
     uint32_t timed_look;
     long long plateau_from;
     long long plateau_until;    // < 0 means re-probe once rel >= plateau_from
+    long long transparent_from;
+    long long transparent_until; // > transparent_from when 100% transparent on [from, until)
 } RenderPriv;
 
 typedef struct {

@@ -170,6 +170,7 @@ static void set_fonts_from(ASS_Renderer *priv, const char *default_font,
     ass_reconfigure(priv);
 
     ass_cache_empty(priv->cache.font_cache);
+    priv->state.last_font = NULL;
     ass_cache_empty(priv->cache.metrics_cache);
     ass_cache_empty(priv->cache.shape_cache);
 

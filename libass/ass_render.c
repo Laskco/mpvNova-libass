@@ -1108,10 +1108,11 @@ static ASS_Image *render_text(RenderContext *state)
     ASS_Image **tail = &head;
     unsigned n_bitmaps = state->text_info.n_bitmaps;
     CombinedBitmapInfo *bitmaps = state->text_info.combined_bitmaps;
+    unsigned alpha_skip = state->renderer->experimental_edges ? 0xFE : 0xFF;
 
     for (unsigned i = 0; i < n_bitmaps; i++) {
         CombinedBitmapInfo *info = &bitmaps[i];
-        if (!info->bm_s || state->border_style == 4)
+        if (!info->bm_s || state->border_style == 4 || _a(info->c[3]) >= alpha_skip)
             continue;
 
         tail =
@@ -1121,7 +1122,7 @@ static ASS_Image *render_text(RenderContext *state)
 
     for (unsigned i = 0; i < n_bitmaps; i++) {
         CombinedBitmapInfo *info = &bitmaps[i];
-        if (!info->bm_o)
+        if (!info->bm_o || _a(info->c[2]) >= alpha_skip)
             continue;
 
         if ((info->effect_type == EF_KARAOKE_KO)
@@ -1141,25 +1142,27 @@ static ASS_Image *render_text(RenderContext *state)
 
         if ((info->effect_type == EF_KARAOKE)
                 || (info->effect_type == EF_KARAOKE_KO)) {
-            if (info->effect_timing > 0)
-                tail =
-                    render_glyph(state, info->bm, info->x, info->y,
-                                 info->c[0], 0, 1000000, tail,
-                                 IMAGE_TYPE_CHARACTER, info->image);
-            else
-                tail =
-                    render_glyph(state, info->bm, info->x, info->y,
-                                 info->c[1], 0, 1000000, tail,
-                                 IMAGE_TYPE_CHARACTER, info->image);
+            uint32_t clr = info->effect_timing > 0 ? info->c[0] : info->c[1];
+            if (_a(clr) >= alpha_skip)
+                continue;
+            tail =
+                render_glyph(state, info->bm, info->x, info->y,
+                             clr, 0, 1000000, tail,
+                             IMAGE_TYPE_CHARACTER, info->image);
         } else if (info->effect_type == EF_KARAOKE_KF) {
+            if (_a(info->c[0]) >= alpha_skip && _a(info->c[1]) >= alpha_skip)
+                continue;
             tail =
                 render_glyph(state, info->bm, info->x, info->y, info->c[0],
                              info->c[1], info->effect_timing, tail,
                              IMAGE_TYPE_CHARACTER, info->image);
-        } else
+        } else {
+            if (_a(info->c[0]) >= alpha_skip)
+                continue;
             tail =
                 render_glyph(state, info->bm, info->x, info->y, info->c[0],
                              0, 1000000, tail, IMAGE_TYPE_CHARACTER, info->image);
+        }
     }
 
     *tail = 0;
@@ -1409,9 +1412,14 @@ init_render_context(RenderContext *state, ASS_Event *event)
     state->timed = false;
     state->plateau_valid = true;
     state->plateau_unbounded = false;
+    state->alpha_plateau_valid = true;
+    state->rendered_transparent = false;
     state->plateau_from = 0;
     state->plateau_until = event->Duration;
     state->plateau_active_end = 0;
+    state->alpha_plateau_from = 0;
+    state->alpha_plateau_until = event->Duration;
+    state->alpha_active_end = 0;
 
     state->wrap_style = render_priv->track->WrapStyle;
 
@@ -1438,6 +1446,7 @@ init_render_context(RenderContext *state, ASS_Event *event)
     if (state->timed) {
         state->plateau_valid = false;
         state->plateau_unbounded = true;
+        state->alpha_plateau_valid = false;
     }
     state->explicit = state->evt_type != EVENT_NORMAL ||
                       ass_event_has_hard_overrides(event->Text);
@@ -1683,6 +1692,40 @@ static double restore_blur(int qblur);
 // uncropped bitmap is cached once and masked by blend_vector_clip
 // (pixel-identical to stock). Including pos, blur, and last_time != r->time
 // prevents sibling events or repeated glyphs on the same frame from colliding.
+static bool get_vector_clip_bounds(RenderContext *state,
+                                   double *cmin_x, double *cmin_y,
+                                   double *cmax_x, double *cmax_y)
+{
+    if (!state->clip_drawing_text.str || state->clip_drawing_mode)
+        return false;
+    OutlineHashKey ol_key;
+    ol_key.type = OUTLINE_DRAWING;
+    ol_key.u.drawing.text = state->clip_drawing_text;
+    OutlineHashValue *ol = ass_cache_get(state->renderer->cache.outline_cache,
+                                         &ol_key, state->renderer);
+    if (!ol || !ol->valid)
+        return false;
+    int32_t scale_base = lshiftwrapi(1, state->clip_drawing_scale - 1);
+    double w = scale_base > 0 ? (1.0 / scale_base) : 0;
+    double sx = state->screen_scale_x * w / 64.0;
+    double sy = state->screen_scale_y * w / 64.0;
+    if (!(sx > 0 && sy > 0 && isfinite(sx) && isfinite(sy)))
+        return false;
+    double x0 = ol->cbox.x_min * sx + state->renderer->settings.left_margin;
+    double y0 = ol->cbox.y_min * sy + state->renderer->settings.top_margin;
+    double x1 = ol->cbox.x_max * sx + state->renderer->settings.left_margin;
+    double y1 = ol->cbox.y_max * sy + state->renderer->settings.top_margin;
+    if (!isfinite(x0) || !isfinite(y0) || !isfinite(x1) || !isfinite(y1) ||
+        x0 < INT32_MIN / 2 || y0 < INT32_MIN / 2 ||
+        x1 > INT32_MAX / 2 || y1 > INT32_MAX / 2)
+        return false;
+    *cmin_x = x0;
+    *cmin_y = y0;
+    *cmax_x = x1;
+    *cmax_y = y1;
+    return true;
+}
+
 static bool clip_window_moving(const RenderContext *state, const BitmapHashKey *k,
                                ASS_Vector pos, const FilterDesc *filter,
                                int64_t x0, int64_t y0, int64_t x1, int64_t y1)
@@ -1731,46 +1774,30 @@ static void set_bitmap_clip(RenderContext *state, GlyphInfo *info,
     key->clip_align = 0;
     key->clip_min = key->clip_max = (ASS_Vector) {0, 0};
 #ifndef ASS_DISABLE_CLIP_CULLING
+    ASS_Renderer *r = state->renderer;
     // Collision shifts, inverse clipping, backgrounds and shadows need their
     // own dependency bounds. Keep their established rendering path unchanged.
     if (!state->clip_drawing_text.str || state->clip_drawing_mode ||
         state->clip_mode || state->detect_collisions ||
         state->evt_type != EVENT_POSITIONED ||
-        info->shadow_x || info->shadow_y || info->border_style != 1 ||
+        (filter->flags & FILTER_NONZERO_SHADOW) || info->border_style != 1 ||
         info->be > 16)
         return;
     // Cropping individual glyphs can move a multi-glyph composite's blur
     // sampling origin. Keep that path unchanged, including shaped clusters.
-    if (!state->renderer->experimental_edges &&
+    if (!r->experimental_edges &&
         (state->text_info.length != 1 || state->text_info.glyphs[0].next))
         return;
 
-    OutlineHashKey ol_key;
-    ol_key.type = OUTLINE_DRAWING;
-    ol_key.u.drawing.text = state->clip_drawing_text;
-    OutlineHashValue *ol = ass_cache_get(state->renderer->cache.outline_cache, &ol_key, state->renderer);
-    if (!ol || !ol->valid)
-        return;
-    int32_t scale_base = lshiftwrapi(1, state->clip_drawing_scale - 1);
-    double w = scale_base > 0 ? (1.0 / scale_base) : 0;
-    double sx = state->screen_scale_x * w / 64.0;
-    double sy = state->screen_scale_y * w / 64.0;
-    if (!(sx > 0 && sy > 0 && isfinite(sx) && isfinite(sy)))
-        return;
-    double cmin_x = ol->cbox.x_min * sx + state->renderer->settings.left_margin;
-    double cmin_y = ol->cbox.y_min * sy + state->renderer->settings.top_margin;
-    double cmax_x = ol->cbox.x_max * sx + state->renderer->settings.left_margin;
-    double cmax_y = ol->cbox.y_max * sy + state->renderer->settings.top_margin;
-    if (!isfinite(cmin_x) || !isfinite(cmin_y) || !isfinite(cmax_x) || !isfinite(cmax_y) ||
-        cmin_x < INT32_MIN / 2 || cmin_y < INT32_MIN / 2 ||
-        cmax_x > INT32_MAX / 2 || cmax_y > INT32_MAX / 2)
+    double cmin_x, cmin_y, cmax_x, cmax_y;
+    if (!get_vector_clip_bounds(state, &cmin_x, &cmin_y, &cmax_x, &cmax_y))
         return;
 
     int pad_x = 0, pad_y = 0, align_x = 1, align_y = 1;
     double r2x = restore_blur(filter->blur_x);
     double r2y = restore_blur(filter->blur_y);
     if (r2x > 0.001 || r2y > 0.001) {
-        int blur_mode = state->renderer->experimental_edges;
+        int blur_mode = r->experimental_edges;
         ass_gaussian_blur_bounds(r2x, blur_mode, &pad_x, &align_x);
         ass_gaussian_blur_bounds(r2y, blur_mode, &pad_y, &align_y);
     }
@@ -2975,6 +3002,51 @@ static double restore_blur(int qblur)
     return sigma * sigma;
 }
 
+struct composite_construct_ctx {
+    ASS_Renderer *renderer;
+    const CompositeHashValue *base;
+};
+
+static bool composite_clip_moving(ASS_Renderer *r, const CombinedBitmapInfo *info,
+                                  int64_t x0, int64_t y0, int64_t x1, int64_t y1)
+{
+    const BitmapRef *bitmaps = info->bitmaps ? info->bitmaps : &info->inline_bitmap;
+    const BitmapRef *first = &bitmaps[0];
+    const BitmapRef *last = &bitmaps[info->bitmap_count - 1];
+    uint64_t h = UINT64_C(1469598103934665603);
+    const uint64_t words[6] = {
+        (uint64_t) info->bitmap_count,
+        (uint64_t) (uintptr_t) first->bm ^ ((uint64_t) (uintptr_t) first->bm_o << 1),
+        (uint64_t) (uintptr_t) last->bm ^ ((uint64_t) (uintptr_t) last->bm_o << 1),
+        ((uint64_t) (uint32_t) info->filter.blur_x << 32) | (uint32_t) info->filter.blur_y,
+        (uint64_t) (uint32_t) info->filter.be,
+        ((uint64_t) (uint32_t) info->x << 32) | (uint32_t) info->y,
+    };
+    for (int i = 0; i < 6; i++) {
+        h ^= words[i];
+        h *= UINT64_C(1099511628211);
+        h ^= h >> 29;
+    }
+    if (!h)
+        h = 1;
+    ClipMemoEntry *m = &r->composite_clip_memo[(h ^ (h >> 32)) & (CLIP_MEMO_SIZE - 1)];
+    if (m->hash != h) {
+        m->hash = h;
+        m->x0 = x0;
+        m->y0 = y0;
+        m->x1 = x1;
+        m->y1 = y1;
+        m->last_time = r->time;
+        m->moving = false;
+        return false;
+    }
+    if (!m->moving &&
+        (m->x0 != x0 || m->y0 != y0 || m->x1 != x1 || m->y1 != y1))
+        m->moving = true;
+    m->last_time = r->time;
+    return m->moving;
+}
+
 // Convert glyphs to bitmaps, combine them, apply blur, generate shadows.
 static void set_composite_viewport(RenderContext *state, CombinedBitmapInfo *info,
                                     CompositeHashKey *key)
@@ -2994,8 +3066,8 @@ static void set_composite_viewport(RenderContext *state, CombinedBitmapInfo *inf
     int blur_mode = renderer->experimental_edges;
     ass_gaussian_blur_bounds(r2x, blur_mode, &px, &ax);
     ass_gaussian_blur_bounds(r2y, blur_mode, &py, &ay);
-    int64_t pad_x = px + info->filter.be + 4 + llabs((int64_t)info->filter.shadow.x) / 64;
-    int64_t pad_y = py + info->filter.be + 4 + llabs((int64_t)info->filter.shadow.y) / 64;
+    int64_t pad_x = px + info->filter.be + 4 + (llabs((int64_t)info->filter.shadow.x) + 63) / 64;
+    int64_t pad_y = py + info->filter.be + 4 + (llabs((int64_t)info->filter.shadow.y) + 63) / 64;
     int64_t vis_x0 = 0;
     int64_t vis_y0 = 0;
     int64_t vis_x1 = renderer->settings.frame_width;
@@ -3006,21 +3078,14 @@ static void set_composite_viewport(RenderContext *state, CombinedBitmapInfo *inf
         vis_x1 = FFMIN(vis_x1, (int64_t) state->clip_x1);
         vis_y1 = FFMIN(vis_y1, (int64_t) state->clip_y1);
     }
-    int64_t x0 = vis_x0 - info->x - pad_x;
-    int64_t y0 = vis_y0 - info->y - pad_y;
-    int64_t x1 = vis_x1 - info->x + pad_x;
-    int64_t y1 = vis_y1 - info->y + pad_y;
-    bool conservative = !renderer->experimental_edges;
-    if (conservative) {
-        // Quantize outward to retain cache reuse while preserving the blur halo.
-        const int64_t viewport_mask = -INT64_C(128);
-        x0 &= viewport_mask;
-        y0 &= viewport_mask;
-        x1 = (x1 + 127) & viewport_mask;
-        y1 = (y1 + 127) & viewport_mask;
+    double vx0, vy0, vx1, vy1;
+    bool has_vector_clip = get_vector_clip_bounds(state, &vx0, &vy0, &vx1, &vy1);
+    if (has_vector_clip) {
+        vis_x0 = FFMAX(vis_x0, (int64_t) floor(vx0));
+        vis_y0 = FFMAX(vis_y0, (int64_t) floor(vy0));
+        vis_x1 = FFMIN(vis_x1, (int64_t) ceil(vx1));
+        vis_y1 = FFMIN(vis_y1, (int64_t) ceil(vy1));
     }
-    if (x0 < INT32_MIN || y0 < INT32_MIN || x1 > INT32_MAX || y1 > INT32_MAX)
-        return;
     int64_t bx0 = INT64_MAX, by0 = INT64_MAX;
     int64_t bx1 = INT64_MIN, by1 = INT64_MIN;
     const BitmapRef *bitmaps = info->bitmaps ? info->bitmaps : &info->inline_bitmap;
@@ -3040,14 +3105,37 @@ static void set_composite_viewport(RenderContext *state, CombinedBitmapInfo *inf
     }
     if (bx1 <= bx0 || by1 <= by0)
         return;
+    double area = (double)(bx1 - bx0) * (by1 - by0);
+    int64_t x0 = vis_x0 - info->x - pad_x;
+    int64_t y0 = vis_y0 - info->y - pad_y;
+    int64_t x1 = vis_x1 - info->x + pad_x;
+    int64_t y1 = vis_y1 - info->y + pad_y;
+    bool conservative = !renderer->experimental_edges;
+    if (conservative) {
+        // Quantize outward to retain cache reuse while preserving the blur halo.
+        int64_t q = area >= 1024 * 1024 ? 128 : 64;
+        x0 &= -q;
+        y0 &= -q;
+        x1 = (x1 + q - 1) & -q;
+        y1 = (y1 + q - 1) & -q;
+    }
+    if (x0 < INT32_MIN || y0 < INT32_MIN || x1 > INT32_MAX || y1 > INT32_MAX)
+        return;
     int viewport_align = FFMAX(1 << renderer->engine.align_order, FFMAX(ax, ay));
     int64_t crop_guard = conservative ? viewport_align - 1 + info->filter.be : 0;
-    double area = (double)(bx1 - bx0) * (by1 - by0);
     double visible = (double)FFMAX(0, FFMIN(bx1, x1 + crop_guard) - FFMAX(bx0, x0 - crop_guard)) *
         FFMAX(0, FFMIN(by1, y1 + crop_guard) - FFMAX(by0, y0 - crop_guard));
-    // Preserve position-independent cache reuse for small or mostly visible runs.
-    bool worthwhile = area - visible >= FFMAX(256 * 1024, area / 4);
-    if (area >= 1024 * 1024 && worthwhile) {
+    // Preserve position-independent cache reuse for shared/wiping runs, while
+    // cropping huge off-screen runs and vector-clipped blurred runs tightly.
+    bool giant_worthwhile = area >= 1024 * 1024 &&
+        area - visible >= FFMAX(256 * 1024, area / 4);
+    bool has_blur = r2x > 0.001 || r2y > 0.001 || info->filter.be > 0;
+    bool clipped_worthwhile = has_blur &&
+        ((visible == 0 && area >= 4096) ||
+         (has_vector_clip && area >= 16 * 1024 &&
+          visible <= area / 2 && area - visible >= 12 * 1024)) &&
+        !composite_clip_moving(renderer, info, x0, y0, x1, y1);
+    if (giant_worthwhile || clipped_worthwhile) {
         key->viewport = (ASS_Rect){x0, y0, x1, y1};
         key->viewport_align = viewport_align;
     }
@@ -3077,7 +3165,11 @@ static void render_and_combine_glyphs(RenderContext *state,
                 flags |= FILTER_BORDER_STYLE_3;
             if (info->border_x || info->border_y)
                 flags |= FILTER_NONZERO_BORDER;
-            if (info->shadow_x || info->shadow_y)
+            uint32_t shad_c = info->c[3];
+            ass_apply_fade(&shad_c, info->fade);
+            bool shadow_visible = _a(shad_c) != 0xFF ||
+                info->border_style == 3 || info->border_style == 4;
+            if ((info->shadow_x || info->shadow_y) && shadow_visible)
                 flags |= FILTER_NONZERO_SHADOW;
             if (flags & FILTER_NONZERO_SHADOW &&
                 (info->effect_type == EF_KARAOKE_KF ||
@@ -3213,7 +3305,37 @@ static void render_and_combine_glyphs(RenderContext *state,
             key.bitmaps = info->bitmaps;
         }
         set_composite_viewport(state, info, &key);
-        CompositeHashValue *val = ass_cache_get(render_priv->cache.composite_cache, &key, render_priv);
+        CompositeHashValue *val = ass_cache_find(render_priv->cache.composite_cache, &key);
+        if (val) {
+            free(info->bitmaps);
+        } else {
+            struct composite_construct_ctx ctx = { render_priv, NULL };
+            int fl = key.filter.flags;
+            if ((fl & FILTER_NONZERO_SHADOW) && !(fl & FILTER_BORDER_STYLE_3) &&
+                (restore_blur(key.filter.blur_x) >= 1.5 ||
+                 restore_blur(key.filter.blur_y) >= 1.5)) {
+                CompositeHashKey base_key = key;
+                base_key.filter.flags = fl & ~(FILTER_NONZERO_SHADOW | FILTER_FILL_IN_SHADOW);
+                if (fl & FILTER_FILL_IN_SHADOW)
+                    base_key.filter.flags |= FILTER_FILL_IN_BORDER;
+                base_key.filter.shadow = (ASS_Vector) {0, 0};
+                bool base_ok = true;
+                if (key.bitmaps) {
+                    base_key.bitmaps = malloc(key.bitmap_count * sizeof(BitmapRef));
+                    if (base_key.bitmaps)
+                        memcpy(base_key.bitmaps, key.bitmaps,
+                               key.bitmap_count * sizeof(BitmapRef));
+                    else
+                        base_ok = false;
+                }
+                if (base_ok) {
+                    struct composite_construct_ctx base_ctx = { render_priv, NULL };
+                    ctx.base = ass_cache_get(render_priv->cache.composite_cache,
+                                             &base_key, &base_ctx);
+                }
+            }
+            val = ass_cache_get(render_priv->cache.composite_cache, &key, &ctx);
+        }
         if (!val)
             continue;
 
@@ -3356,11 +3478,38 @@ static void add_composite_bitmap(const BitmapEngine *engine, Bitmap *dst,
 
 size_t ass_composite_construct(void *key, void *value, void *priv)
 {
-    ASS_Renderer *render_priv = priv;
+    struct composite_construct_ctx *ctx = priv;
+    ASS_Renderer *render_priv = ctx->renderer;
     FLE_START;
     CompositeHashKey *k = key;
     CompositeHashValue *v = value;
     memset(v, 0, sizeof(*v));
+
+    if (ctx->base) {
+        const CompositeHashValue *base = ctx->base;
+        int flags = k->filter.flags;
+        ass_copy_bitmap(&render_priv->engine, &v->bm, &base->bm);
+        ass_copy_bitmap(&render_priv->engine, &v->bm_o, &base->bm_o);
+        if (flags & FILTER_NONZERO_SHADOW) {
+            if (flags & FILTER_NONZERO_BORDER) {
+                ass_copy_bitmap(&render_priv->engine, &v->bm_s, &v->bm_o);
+                if ((flags & FILTER_FILL_IN_BORDER) && !(flags & FILTER_FILL_IN_SHADOW))
+                    ass_fix_outline(&v->bm, &v->bm_s);
+            } else {
+                ass_copy_bitmap(&render_priv->engine, &v->bm_s, &v->bm);
+            }
+            v->bm_s.left += k->filter.shadow.x >> 6;
+            v->bm_s.top  += k->filter.shadow.y >> 6;
+            ass_shift_bitmap(&v->bm_s, k->filter.shadow.x & SUBPIXEL_MASK,
+                             k->filter.shadow.y & SUBPIXEL_MASK);
+        }
+        if ((flags & FILTER_FILL_IN_SHADOW) && !(flags & FILTER_FILL_IN_BORDER))
+            ass_fix_outline(&v->bm, &v->bm_o);
+        FLE_PHASE(7);
+        return sizeof(CompositeHashKey) + sizeof(CompositeHashValue) +
+            (k->bitmaps ? k->bitmap_count * sizeof(BitmapRef) : 0) +
+            bitmap_size(&v->bm) + bitmap_size(&v->bm_o) + bitmap_size(&v->bm_s);
+    }
 
     ASS_Rect rect, rect_o;
     rectangle_reset(&rect);
@@ -3519,24 +3668,56 @@ static void add_background(RenderContext *state, EventImages *event_images)
     }
 }
 
-static bool event_is_transparent(RenderContext *state)
+static bool event_is_transparent(RenderContext *state, bool *can_cache_out)
 {
     // Unpositioned events still need layout for collision avoidance. Style 4
     // also paints a separate background using the final render-context color.
     if (state->detect_collisions || !(state->evt_type & EVENT_POSITIONED) ||
         state->border_style == 4)
         return false;
+    bool has_karaoke = false;
+    for (int i = 0; i < state->text_info.length; i++) {
+        if (state->text_info.glyphs[i].effect_type != EF_NONE) {
+            has_karaoke = true;
+            break;
+        }
+    }
+    unsigned alpha_skip = state->renderer->experimental_edges ? 0xFE : 0xFF;
+    bool all_primary = true;
+    bool all_alphas_transparent = true;
     for (int i = 0; i < state->text_info.length; i++) {
         GlyphInfo *info = state->text_info.glyphs + i;
         if (info->border_style == 4)
             return false;
-        for (int j = 0; j < 4; j++) {
-            uint32_t color = info->c[j];
-            ass_apply_fade(&color, info->fade);
-            if ((color & 255) != 255)
+        if (!info->drawing_text.str && info->face_index != 0)
+            all_primary = false;
+        uint32_t c0 = info->c[0];
+        ass_apply_fade(&c0, info->fade);
+        if (_a(c0) < alpha_skip)
+            return false;
+        if (has_karaoke) {
+            uint32_t c1 = info->c[1];
+            ass_apply_fade(&c1, info->fade);
+            if (_a(c1) < alpha_skip)
+                return false;
+        }
+        uint32_t c2 = info->c[2];
+        ass_apply_fade(&c2, info->fade);
+        if (_a(c2) < alpha_skip) {
+            all_alphas_transparent = false;
+            if (info->border_x || info->border_y || info->border_style == 3)
+                return false;
+        }
+        uint32_t c3 = info->c[3];
+        ass_apply_fade(&c3, info->fade);
+        if (_a(c3) < alpha_skip) {
+            all_alphas_transparent = false;
+            if (info->shadow_x || info->shadow_y)
                 return false;
         }
     }
+    if (can_cache_out)
+        *can_cache_out = all_primary && all_alphas_transparent && !has_karaoke;
     return true;
 }
 
@@ -3582,7 +3763,9 @@ render_event(RenderContext *state, ASS_Event *event,
     ass_shaper_find_runs(state->shaper, render_priv, text_info->glyphs,
             text_info->length);
     // Font fallback has ordered, persistent side effects, even for invisible text.
-    if (event_is_transparent(state)) {
+    bool all_primary = false;
+    if (event_is_transparent(state, &all_primary)) {
+        state->rendered_transparent = all_primary;
         free_render_context(state);
         return false;
     }
@@ -3798,7 +3981,16 @@ static void update_timed_plateau_hint(ASS_Renderer *render_priv, ASS_Event *even
     }
     known->timed_text = event->Text;
     known->timed_look = render_priv->look_generation;
+    known->transparent_from = 0;
+    known->transparent_until = 0;
     long long rel = render_priv->time - event->Start;
+    if (state->rendered_transparent && state->alpha_plateau_valid &&
+        !state->plateau_unbounded && rel >= state->alpha_plateau_from &&
+        rel < state->alpha_plateau_until &&
+        state->alpha_plateau_until - rel >= EVENT_CACHE_MIN_MS) {
+        known->transparent_from = state->alpha_plateau_from;
+        known->transparent_until = state->alpha_plateau_until;
+    }
     if (state->plateau_unbounded) {
         known->plateau_from = INT64_MAX;
         known->plateau_until = INT64_MAX;
@@ -3916,10 +4108,18 @@ ass_render_event(RenderContext *state, ASS_Event *event,
 
     long long rel = render_priv->time - event->Start;
     size_t text_len = 0;
+    long long key_from = 0, key_until = 0;
     if (known && known->timed_text == event->Text &&
         known->timed_look == render_priv->look_generation) {
-        if (rel < known->plateau_from)
-            return render_event(state, event, event_images);
+        if (known->transparent_until > known->transparent_from &&
+            rel >= known->transparent_from && rel < known->transparent_until)
+            return false;
+        if (rel < known->plateau_from) {
+            bool ok = render_event(state, event, event_images);
+            if (!ok && state->rendered_transparent && state->timed)
+                update_timed_plateau_hint(render_priv, event, state);
+            return ok;
+        }
         if (known->plateau_until < 0 || rel >= known->plateau_until) {
             bool ok = render_event(state, event, event_images);
             if (state->timed)
@@ -3928,6 +4128,8 @@ ass_render_event(RenderContext *state, ASS_Event *event,
         }
         // Inside a known static plateau: fall through to event_cache lookup.
         text_len = strlen(event->Text);
+        key_from = known->plateau_from;
+        key_until = known->plateau_until;
     } else if (event_has_timed_hint(event, &text_len)) {
         bool ok = render_event(state, event, event_images);
         if (state->timed)
@@ -3942,6 +4144,8 @@ ass_render_event(RenderContext *state, ASS_Event *event,
         .margin_l = event->MarginL,
         .margin_r = event->MarginR,
         .margin_v = event->MarginV,
+        .plateau_from = key_from,
+        .plateau_until = key_until,
         .effect = { effect, strlen(effect) },
         .text = { event->Text, text_len },
     };
@@ -4234,6 +4438,7 @@ ass_start_frame(ASS_Renderer *render_priv, ASS_Track *track,
 
     render_priv->track = track;
     render_priv->time = now;
+    render_priv->state.last_font = NULL;
 
     ass_lazy_track_init(render_priv->library, render_priv->track);
 
@@ -5223,10 +5428,18 @@ static ASS_RenderPriv *get_render_priv(ASS_Renderer *render_priv,
     if (render_priv->render_id != event->render_priv->render_id) {
         const char *timed_text = event->render_priv->timed_text;
         uint32_t timed_look = event->render_priv->timed_look;
+        long long plateau_from = event->render_priv->plateau_from;
+        long long plateau_until = event->render_priv->plateau_until;
+        long long transparent_from = event->render_priv->transparent_from;
+        long long transparent_until = event->render_priv->transparent_until;
         memset(event->render_priv, 0, sizeof(ASS_RenderPriv));
         event->render_priv->render_id = render_priv->render_id;
         event->render_priv->timed_text = timed_text;
         event->render_priv->timed_look = timed_look;
+        event->render_priv->plateau_from = plateau_from;
+        event->render_priv->plateau_until = plateau_until;
+        event->render_priv->transparent_from = transparent_from;
+        event->render_priv->transparent_until = transparent_until;
     }
 
     return event->render_priv;
@@ -5534,11 +5747,12 @@ ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
         fix_collisions(priv, last, priv->eimg + cnt - last);
 
     // concat lists, removing fully transparent bitmaps
+    unsigned alpha_skip = priv->experimental_edges ? 0xFE : 0xFF;
     ASS_Image **tail = &priv->images_root;
     for (int i = 0; i < cnt; i++) {
         ASS_Image *cur = priv->eimg[i].imgs;
         while (cur) {
-            if (_a(cur->color) == 0xFF) {
+            if (_a(cur->color) >= alpha_skip) {
                 cur = ass_free_image(cur);
                 continue;
             }

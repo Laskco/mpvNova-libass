@@ -135,6 +135,7 @@ typedef struct
 } CacheDesc;
 
 Cache *ass_cache_create(const CacheDesc *desc);
+void *ass_cache_find(Cache *cache, void *key);
 void *ass_cache_get(Cache *cache, void *key, void *priv);
 void *ass_cache_key(void *value);
 void ass_cache_inc_ref(void *value);

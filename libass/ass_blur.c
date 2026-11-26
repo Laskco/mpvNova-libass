@@ -150,8 +150,10 @@ static double find_method_geometry(BlurMethod *blur, double r2, int blur_mode)
 {
     double frac = frexp(sqrt(0.11569 * r2 + 0.20591047), &blur->level);
     if (blur_mode >= 2) {
-        if (blur->level < 6 && r2 * pow(0.25, blur->level + 1) >= 0.85)
-            blur->level++;
+        if (blur->level == 0 && r2 >= 2.0)
+            blur->level = 1;
+        else if (blur->level == 1 && r2 * 0.0625 >= 0.85)
+            blur->level = 2;
         blur->radius = 4;
         return pow(0.25, blur->level);
     }
@@ -879,9 +881,13 @@ bool ass_gaussian_blur(ASS_Renderer *renderer, Bitmap *bm, const Bitmap *src,
                        double r2x, double r2y)
 {
     const BitmapEngine *engine = &renderer->engine;
-    if (renderer->experimental_edges >= 2 &&
-        r2x >= 0.25 && r2x <= 1.75 && r2y >= 0.25 && r2y <= 1.75 &&
-        fabs(r2x - r2y) <= 0.35 && src->w > 1 && src->h > 1) {
+    if (((renderer->experimental_edges >= 2 &&
+          r2x >= 0.25 && r2x <= 1.75 && r2y >= 0.25 && r2y <= 1.75 &&
+          fabs(r2x - r2y) <= 0.35) ||
+         (renderer->experimental_edges == 1 &&
+          r2x >= 0.35 && r2x <= 0.78 && r2y >= 0.35 && r2y <= 0.78 &&
+          fabs(r2x - r2y) <= 0.15)) &&
+        src->w > 1 && src->h > 1) {
         int passes = (int) (r2x + r2y + 0.5);
         passes = FFMINMAX(passes, 1, 3);
         uint32_t out_w = src->w + 2 * (uint32_t) passes;
