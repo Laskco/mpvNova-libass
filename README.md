@@ -1,53 +1,62 @@
 # mpvNova-libass
 
-A fork of [libass](https://github.com/libass/libass) with subtitle-rendering improvements for Android devices. Used by [mpvNova](https://github.com/Laskco/mpvNova).
+A fork of [libass](https://github.com/libass/libass) with subtitle-rendering improvements for Android devices. Used by [mpvNova](https://github.com/Laskco/mpvNova) and [Nuvio](https://github.com/NuvioMedia/NuvioTV).
+
+<p align="center">
+  <a href="https://github.com/Laskco/mpvNova"><img src="https://raw.githubusercontent.com/Laskco/mpvNova/main/fastlane/metadata/android/en-US/images/tvBanner.png" width="48%" alt="mpvNova" /></a>
+  <a href="https://github.com/NuvioMedia/NuvioTV"><img src="https://raw.githubusercontent.com/NuvioMedia/NuvioTV/main/app/src/main/res/drawable-nodpi/tv_banner.png" width="48%" alt="Nuvio" /></a>
+</p>
 
 ## Changes
 
-- Multi-threaded subtitle event rendering.
-- Less processing of large off-screen effects.
-- Better reuse of cached subtitle bitmaps.
-- Faster contour processing on 32-bit ARM.
+- Multi-threaded subtitle event rendering and sliced blur execution.
+- Transparent-plateau and static-plateau event caching to skip redundant frame work.
+- Faster vector-clip compositing, shadow reuse, small-blur fast paths, and less processing of large off-screen effects.
+- Per-glyph cached outline LOD and contour simplification for Performance (`1`) and Ultra (`2`) edge modes.
+- Age-based stale cache trimming above a warm floor to keep RAM bounded after heavy openings.
 - Upstream parser and memory-safety fixes.
 
 ## Before and After
 
-FLE openings played locally, with the original ASS tracks and fonts. The table
-compares the native libraries from mpvNova **2026-10-19** (stock libass 0.17.5)
-and **2026-11-15** (this fork) in the same test app. Both builds were speed
-compiled. Stats were on; frame drops were counted with recording off.
+Full-length openings played locally with original ASS tracks and embedded fonts (`vo=gpu-next`, `video-sync=audio`, `interpolation=no`, `sub-ass-override=no`). Every build was speed compiled (`cmd package compile -m speed`).
 
-| Device / mode | Opening | Stock drops | Current drops | Reduction | Video |
-| --- | --- | ---: | ---: | ---: | --- |
-| NVIDIA Shield TV Pro 2019 / G-Next Copy | Wistoria S01E02 (HEVC) | 573 | 0 | **100%** | [Watch](https://files.catbox.moe/o00uqm.mp4) |
-| NVIDIA Shield TV Pro 2019 / G-Next Copy | The Apothecary Diaries S02E02 | 585 | 18 | **96.9%** | [Watch](https://files.catbox.moe/egjdny.mp4) |
-| Onn 4K Pro / `gpu` Direct | Wistoria S01E02 (HEVC) | 1,005 | 161 | **84.0%** | [Watch](https://files.catbox.moe/2xkb3d.mp4) |
-| Onn 4K Pro / `gpu` Direct | The Apothecary Diaries S02E02 | 1,340 | 481 | **64.1%** | [Watch](https://files.catbox.moe/lx2rqs.mp4) |
+- **Stock:** `mpv-android` 2026-09-17 (upstream libass 0.17.5; `mediacodec-copy` on Shield since upstream lacks the `libplacebo` update for Direct, `mediacodec` Direct on Onn).
+- **2026-11-22:** mpvNova 2026-11-22 (`b620927`, Direct).
+- **Current:** mpvNova 2026-11-26 (`6a7c6c9`, Direct).
 
-Videos were captured separately, so their counters can differ from the table.
-These are playback comparisons, not a libass-only benchmark. In a separate run
-of the current release on the Shield, G-Next Direct recorded **1** output drop
-on the Apothecary opening.
+Values in **Mode 0/1/2** columns correspond to **Exact / Performance / Ultra**. **Saved** compares Current Mode 1 against Stock.
 
-<details>
-<summary>Earlier Onn 4K Pro ARM32 comparison</summary>
+### Dropped Frames
 
-This test compared two optimized builds, not stock libass against the fork.
+| Device | Opening | Stock | 2026-11-22 (Mode 0/1/2) | Current (Mode 0/1/2) | Saved |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Shield TV Pro 2019 | [FLE] Apothecary S02E02 | 572 | **0**&nbsp;/&nbsp;**0**&nbsp;/&nbsp;**0** | **0**&nbsp;/&nbsp;**0**&nbsp;/&nbsp;**0** | **100%** |
+| Shield TV Pro 2019 | [FLE] Wistoria S01E02 | 559 | **0**&nbsp;/&nbsp;**0**&nbsp;/&nbsp;**0** | **0**&nbsp;/&nbsp;**0**&nbsp;/&nbsp;**0** | **100%** |
+| Shield TV Pro 2019 | [Kawatare] Fate/strange Fake S01E02 | 509 | **0**&nbsp;/&nbsp;**0**&nbsp;/&nbsp;**0** | **0**&nbsp;/&nbsp;**0**&nbsp;/&nbsp;**0** | **100%** |
+| Onn 4K Pro | [FLE] Apothecary S02E02 | 1,355 | 301&nbsp;/&nbsp;166&nbsp;/&nbsp;120 | 287&nbsp;/&nbsp;**0**&nbsp;/&nbsp;**1** | **100%** |
+| Onn 4K Pro | [FLE] Wistoria S01E02 | 969 | 228&nbsp;/&nbsp;3&nbsp;/&nbsp;0 | 218&nbsp;/&nbsp;**0**&nbsp;/&nbsp;**0** | **100%** |
+| Onn 4K Pro | [Kawatare] Fate/strange Fake S01E02 | 1,373 | 235&nbsp;/&nbsp;206&nbsp;/&nbsp;19 | 76&nbsp;/&nbsp;**0**&nbsp;/&nbsp;**0** | **100%** |
 
-| Renderer | Before: dropped frames | After: dropped frames | Reduction |
-| --- | ---: | ---: | ---: |
-| `gpu-next` | 635 | 483 | **23.9%** |
-| `gpu` | 733 | 602 | **17.9%** |
+### Peak A/V Drift (`max |avsync|`)
 
-Average subtitle render time also fell from **36.93 ms to 29.49 ms**: **20.2% less time**, or **25.3% higher render throughput**. That's subtitle rendering, not video FPS.
+| Device | Opening | Stock | 2026-11-22 (Mode 0/1/2) | Current (Mode 0/1/2) |
+| --- | --- | ---: | ---: | ---: |
+| Shield TV Pro 2019 | [FLE] Apothecary S02E02 | 0.119s | 0.001s&nbsp;/&nbsp;0.001s&nbsp;/&nbsp;0.001s | **0.001s**&nbsp;/&nbsp;**0.002s**&nbsp;/&nbsp;**0.001s** |
+| Shield TV Pro 2019 | [FLE] Wistoria S01E02 | 0.239s | 0.001s&nbsp;/&nbsp;0.000s&nbsp;/&nbsp;0.000s | **0.002s**&nbsp;/&nbsp;**0.000s**&nbsp;/&nbsp;**0.000s** |
+| Shield TV Pro 2019 | [Kawatare] Fate/strange Fake S01E02 | 0.146s | 0.022s&nbsp;/&nbsp;0.009s&nbsp;/&nbsp;0.017s | **0.020s**&nbsp;/&nbsp;**0.011s**&nbsp;/&nbsp;**0.022s** |
+| Onn 4K Pro | [FLE] Apothecary S02E02 | 0.515s | 0.141s&nbsp;/&nbsp;0.109s&nbsp;/&nbsp;0.085s | 0.117s&nbsp;/&nbsp;**0.003s**&nbsp;/&nbsp;**0.003s** |
+| Onn 4K Pro | [FLE] Wistoria S01E02 | 0.433s | 0.096s&nbsp;/&nbsp;0.033s&nbsp;/&nbsp;0.029s | 0.097s&nbsp;/&nbsp;**0.003s**&nbsp;/&nbsp;**0.012s** |
+| Onn 4K Pro | [Kawatare] Fate/strange Fake S01E02 | 0.295s | 0.089s&nbsp;/&nbsp;0.089s&nbsp;/&nbsp;0.084s | 0.072s&nbsp;/&nbsp;**0.036s**&nbsp;/&nbsp;**0.030s** |
 
-</details>
+All files were tested locally, so network streaming will have different results due to additional network, TLS, and buffering overhead. These are full playback comparisons, not a libass-only benchmark. Even in **Mode 0 (Exact)** with zero visual approximation, current `master` cuts drops by **78.8%** on [FLE] Apothecary (`1,355 -> 287`), **77.5%** on [FLE] Wistoria (`969 -> 218`), and **94.5%** on [Kawatare] Fate (`1,373 -> 76`) on the Onn 4K Pro, and hits **0 drops** across all three openings on the Shield TV Pro 2019.
 
 ## Using It in mpvNova
 
-Get the app from [mpvNova releases](https://github.com/Laskco/mpvNova/releases/latest). **ASS performance rendering** is under **Settings > Advanced** and is on by default. Reopen playback after changing it.
+Get the app from [mpvNova releases](https://github.com/Laskco/mpvNova/releases/latest). **ASS rendering mode** is under **Settings > Advanced** and defaults to **Performance (`1`)**. Reopen playback after changing it.
 
-Performance mode keeps subtitle styles and animations, but can slightly change rendered edges.
+- **Exact (`0`):** Pixel-identical output (full rasterizer precision, full subpixel positioning, exact Gaussian blur selection, and exact `0xFF` alpha only) with all lossless speedups (multi-threading, plateau caching, vector-clip bounds, shadow reuse, NEON SIMD, and stale cache trimming).
+- **Performance (`1`):** Keeps subtitle styles and animations intact with subtle approximations for smooth playback on lower-power Android TV hardware: `2x` curve tolerance, per-glyph outline LOD and contour clipping, half-pixel (`0.5 px`) glyph snapping, a narrow small-blur fast path, and skipping nearly invisible `1/255` (`0xFE`) fade tails.
+- **Ultra (`2`):** Stronger approximations for extreme particle and vector-drawing scenes: `4x` curve tolerance, stronger outline LOD, whole-pixel (`1 px`) glyph and vector-clip snapping, and a wider small-blur fast path.
 
 ## Building
 
@@ -60,10 +69,17 @@ mpvNova uses a pinned library revision, so changes here need to be rebuilt into 
 | Option | Purpose |
 | --- | --- |
 | `ASS_EVENT_THREADS` | Compile-time define for multi-threaded rendering. |
-| `LIBASS_EXPERIMENTAL_EDGES=1` | Enables performance mode. |
+| `LIBASS_EXPERIMENTAL_EDGES=0\|1\|2` | Selects Exact (`0`), Performance (`1`), or Ultra (`2`) rendering mode. |
 | `LIBASS_RENDER_THREADS=1..4` | Sets the requested render-thread count; `1` selects serial rendering. |
 
 The last two are environment variables, set before creating the renderer. Threaded rendering requires a build with `ASS_EVENT_THREADS` enabled.
+
+### Companion `mpv` Subtitle Patches
+
+When integrating this fork with `mpv`, `mpvNova` also applies two optional `mpv`-side subtitle patches in [`buildscripts/patches`](https://github.com/Laskco/mpvNova/tree/main/buildscripts/patches):
+
+- [`mpv-ass-fade-upload.patch`](https://github.com/Laskco/mpvNova/blob/main/buildscripts/patches/mpv-ass-fade-upload.patch): reuses the packed subtitle atlas instead of re-uploading unchanged pixels during fade, color, and position animations.
+- [`mpv-sub-atlas-shrink.patch`](https://github.com/Laskco/mpvNova/blob/main/buildscripts/patches/mpv-sub-atlas-shrink.patch): shrinks oversized CPU and GPU subtitle atlases back down after heavy openings finish.
 
 ## Issues
 
