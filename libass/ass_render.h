@@ -52,6 +52,10 @@
 #define CACHE_RETURN_LIMIT 8    // the default grows once they pass 1/this of it
 #define EVENT_CACHE_FRAMES 2    // a rendered event goes once this many frames in a row don't show it
 #define EVENT_CACHE_MIN_MS 50   // a shorter event is one frame of frame-by-frame typesetting
+#define STALE_CACHE_FRAMES 120  // evict unused bitmap/composite/outline entries after ~5s at 24fps
+#define BITMAP_CACHE_WARM_FLOOR (16 * MEGABYTE)
+#define COMPOSITE_CACHE_WARM_FLOOR (8 * MEGABYTE)
+#define OUTLINE_CACHE_WARM_FLOOR 2048
 
 #define PARSED_FADE (1<<0)
 #define PARSED_A    (1<<1)

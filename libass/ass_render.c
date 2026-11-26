@@ -4240,6 +4240,10 @@ static void effective_cache_budgets(ASS_Renderer *priv, CacheStore *cache,
     *composite_out = composite_max;
 }
 
+#ifdef ASS_EVENT_THREADS
+static size_t event_pool_cache_lanes(const ASS_Renderer *priv);
+#endif
+
 /**
  * \brief Check cache limits and reset cache if they are exceeded
  */
@@ -4247,11 +4251,25 @@ static void check_cache_limits(ASS_Renderer *priv, CacheStore *cache)
 {
     size_t bitmap_max, composite_max;
     effective_cache_budgets(priv, cache, 0, true, &bitmap_max, &composite_max);
+    size_t bitmap_floor = BITMAP_CACHE_WARM_FLOOR;
+    size_t composite_floor = COMPOSITE_CACHE_WARM_FLOOR;
+    size_t outline_floor = OUTLINE_CACHE_WARM_FLOOR;
+#ifdef ASS_EVENT_THREADS
+    size_t lanes = event_pool_cache_lanes(priv);
+    if (lanes > 1) {
+        bitmap_floor /= lanes;
+        composite_floor /= lanes;
+        outline_floor /= lanes;
+    }
+#endif
     // An event that stopped showing would keep its composites from being evicted.
     ass_cache_cut_unused(cache->event_cache, EVENT_CACHE_FRAMES);
-    ass_cache_cut(cache->composite_cache, composite_max);
-    ass_cache_cut(cache->bitmap_cache, bitmap_max);
-    ass_cache_cut(cache->outline_cache, cache->glyph_max);
+    ass_cache_cut_stale(cache->composite_cache, composite_max, composite_floor,
+                        STALE_CACHE_FRAMES);
+    ass_cache_cut_stale(cache->bitmap_cache, bitmap_max, bitmap_floor,
+                        STALE_CACHE_FRAMES);
+    ass_cache_cut_stale(cache->outline_cache, cache->glyph_max, outline_floor,
+                        STALE_CACHE_FRAMES);
     ass_cache_cut(cache->shape_cache, cache->glyph_max ? SHAPE_CACHE_MAX_SIZE : 0);
 }
 
@@ -4546,6 +4564,15 @@ struct ass_event_pool {
     const ASS_Track *cost_track;
     EventCostHint cost_hints[256];
 };
+
+static size_t event_pool_cache_lanes(const ASS_Renderer *priv)
+{
+    if (priv->is_event_worker)
+        return 4;
+    if (priv->event_pool && priv->event_pool->cache_split)
+        return (size_t) priv->event_pool->count + 1;
+    return 1;
+}
 
 static void set_pool_cache_limits(struct ass_event_pool *pool, size_t glyphs,
                                   size_t bitmaps, size_t composites)

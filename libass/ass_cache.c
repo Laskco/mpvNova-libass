@@ -670,7 +670,7 @@ void ass_cache_dec_ref(void *value)
     destroy_item(item->desc, item);
 }
 
-static void evict_queue_first(Cache *cache)
+static void evict_queue_first(Cache *cache, bool track_eviction)
 {
     CacheItem *item = cache->queue_first;
     assert(item->size);
@@ -686,7 +686,7 @@ static void evict_queue_first(Cache *cache)
     *item->prev = item->next;
 
     cache->cache_size -= item->size + (item->size == 1 ? 0 : CACHE_ITEM_SIZE);
-    if (cache->evicted)
+    if (track_eviction && cache->evicted)
         cache->evicted[item->hash & cache->evicted_mask] = item->hash;
     destroy_item(cache->desc, item);
 }
@@ -697,7 +697,7 @@ void ass_cache_cut(Cache *cache, size_t max_size)
         do {
             if (!cache->queue_first)
                 break;
-            evict_queue_first(cache);
+            evict_queue_first(cache, true);
         } while (cache->cache_size > max_size);
         if (cache->queue_first)
             cache->queue_first->queue_prev = &cache->queue_first;
@@ -710,11 +710,41 @@ void ass_cache_cut(Cache *cache, size_t max_size)
 void ass_cache_cut_unused(Cache *cache, unsigned frames)
 {
     while (cache->queue_first && cache->frame - cache->queue_first->frame >= frames)
-        evict_queue_first(cache);
+        evict_queue_first(cache, false);
     if (cache->queue_first)
         cache->queue_first->queue_prev = &cache->queue_first;
     else
         cache->queue_last = &cache->queue_first;
+    cache->frame++;
+}
+
+void ass_cache_cut_stale(Cache *cache, size_t max_size, size_t warm_floor,
+                         unsigned frames)
+{
+    bool evicted = false;
+    if (cache->cache_size > max_size) {
+        do {
+            if (!cache->queue_first)
+                break;
+            evict_queue_first(cache, true);
+            evicted = true;
+        } while (cache->cache_size > max_size);
+    }
+    if (warm_floor > max_size)
+        warm_floor = max_size;
+    if (frames && cache->cache_size > warm_floor) {
+        while (cache->queue_first && cache->cache_size > warm_floor &&
+               cache->frame - cache->queue_first->frame >= frames) {
+            evict_queue_first(cache, false);
+            evicted = true;
+        }
+    }
+    if (evicted) {
+        if (cache->queue_first)
+            cache->queue_first->queue_prev = &cache->queue_first;
+        else
+            cache->queue_last = &cache->queue_first;
+    }
     cache->frame++;
 }
 
