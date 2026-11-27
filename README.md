@@ -74,12 +74,11 @@ mpvNova uses a pinned library revision, so changes here need to be rebuilt into 
 
 The last two are environment variables, set before creating the renderer. Threaded rendering requires a build with `ASS_EVENT_THREADS` enabled.
 
-### Companion `mpv` Subtitle Patches
+### Companion `mpv` Subtitle Patch
 
-When integrating this fork with `mpv`, `mpvNova` also applies two optional `mpv`-side subtitle patches in [`buildscripts/patches`](https://github.com/Laskco/mpvNova/tree/main/buildscripts/patches):
+When integrating this fork with `mpv`, `mpvNova` also applies an optional `mpv`-side subtitle patch in [`buildscripts/patches`](https://github.com/Laskco/mpvNova/tree/main/buildscripts/patches):
 
 - [`mpv-ass-fade-upload.patch`](https://github.com/Laskco/mpvNova/blob/main/buildscripts/patches/mpv-ass-fade-upload.patch): reuses the packed subtitle atlas instead of re-uploading unchanged pixels during fade, color, and position animations.
-- [`mpv-sub-atlas-shrink.patch`](https://github.com/Laskco/mpvNova/blob/main/buildscripts/patches/mpv-sub-atlas-shrink.patch): shrinks oversized CPU and GPU subtitle atlases back down after heavy openings finish.
 
 ## Issues
 
